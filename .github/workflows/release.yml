@@ -9,9 +9,9 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-    paths: ['WorkLogTray/**', 'dist/**', '.github/workflows/release.yml']
+    paths: ['WorkLogTray/**', 'dist/**', 'LICENSE', '.github/workflows/release.yml']
   pull_request:
-    paths: ['WorkLogTray/**', 'dist/**', '.github/workflows/release.yml']
+    paths: ['WorkLogTray/**', 'dist/**', 'LICENSE', '.github/workflows/release.yml']
   workflow_dispatch:
 
 permissions:
@@ -84,6 +84,7 @@ jobs:
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item WorkLogTray/WorkLog.exe $dir
           Copy-Item "dist/インストール手順.txt" $dir
+          Copy-Item LICENSE (Join-Path $dir 'LICENSE.txt')
           Compress-Archive -Path $dir -DestinationPath "WorkLog-${{ steps.ver.outputs.ver }}.zip"
           Get-FileHash "WorkLog-${{ steps.ver.outputs.ver }}.zip" -Algorithm SHA256 | Format-List
 

@@ -27,6 +27,20 @@ PC の前面ウィンドウを低負荷で記録し、Claude Code（Pro プラ�
 - 日報を作るときは、その要約を Claude Code 経由で Anthropic の AI に送ります（伏せ字の設定ができます）
 - AI が書いた日報は間違うことがあります。提出する前に必ず確かめてください
 
+## ライセンス
+
+[MIT No Attribution（MIT-0）](LICENSE) © 2026 sarumogu2013-glitch
+
+- 使う・直す・再配布する・売るのは自由です。著作権表示を残す義務もありません
+- **無保証です。** 使ったことで生じた損害について、作者は責任を負いません
+
+### ほかのソフトウェア・名前について
+
+- **Claude Code**: このソフトは、PC に入っている Claude Code（Anthropic）を呼び出して使うだけで、同梱も再配布もしていません。Claude Code を使うときは、[Anthropic の利用規約](https://www.anthropic.com/legal) に従ってください。このソフトを再配布するときも、Claude Code を同梱しないでください
+- **商標**: 「Claude」「Anthropic」は Anthropic の商標です。このソフトは Anthropic の公式ソフトウェアではなく、Anthropic が推奨・保証するものでもありません
+- **アイコン**: アイコンの「報」の字は、IPA ゴシック（[IPA フォントライセンス v1.0](https://moji.or.jp/ipafont/license/)）で描いた画像です。フォント自体は含んでいません
+- **.NET Framework / Windows**: Windows に標準で入っているものを使います。同梱していません
+
 ## 開発
 
 - ソース: `WorkLogTray/WorkLog.cs`（C# 5・WinForms）。アイコン: `WorkLogTray/WorkLog.ico`

@@ -5,6 +5,7 @@ PC の前面ウィンドウを記録し、Claude Code で日報を自動で作�
 ★ このソフトは AI（Anthropic の Claude / Claude Code）が作成したソフトウェアです。
   人の手による網羅的なレビューやテストは受けていません。無保証です。自己責任でお使いください。
   AI が書いた日報は間違うことがあります。提出する前に必ず確かめてください。
+  ライセンス: MIT No Attribution（MIT-0）。同じフォルダの LICENSE.txt をご覧ください。
 
 対象: Windows 10 / 11（.NET Framework 4.8。Windows に標準で入っています）
 

@@ -1,0 +1,61 @@
+# v から始まるタグ（例: v0.9.0）を push すると、Windows で WorkLog.exe をビルドし、
+# インストール用 zip を作って GitHub のリリースに載せる。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'リリースするタグ（例: v0.9.0）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Build WorkLog.exe
+        shell: pwsh
+        run: |
+          ./WorkLogTray/build.ps1
+          if (-not (Test-Path WorkLogTray/WorkLog.exe)) { throw 'WorkLog.exe was not built' }
+
+      - name: Check version
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = '${{ github.event.inputs.tag || github.ref_name }}'
+          $ver = (Get-Item WorkLogTray/WorkLog.exe).VersionInfo.FileVersion
+          if ("v$ver" -ne $tag) { throw "タグ $tag と Core.Version $ver が合っていません" }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "ver=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Make zip
+        shell: pwsh
+        run: |
+          $dir = "out/WorkLogTray"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item WorkLogTray/WorkLog.exe $dir
+          Copy-Item "dist/インストール手順.txt" $dir
+          Compress-Archive -Path $dir -DestinationPath "WorkLog-${{ steps.ver.outputs.ver }}.zip"
+          Get-FileHash "WorkLog-${{ steps.ver.outputs.ver }}.zip" -Algorithm SHA256 | Format-List
+
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.ver.outputs.tag }}'
+          $zip = "WorkLog-${{ steps.ver.outputs.ver }}.zip"
+          $notes = "WorkLog ${{ steps.ver.outputs.ver }}`n`n$zip を展開し、中の「インストール手順.txt」をご覧ください。"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) { gh release upload $tag $zip --clobber }
+          else { gh release create $tag $zip --title "WorkLog ${{ steps.ver.outputs.ver }}" --notes $notes }

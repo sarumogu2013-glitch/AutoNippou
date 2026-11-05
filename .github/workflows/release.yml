@@ -2,12 +2,15 @@
 # - main への push: Core.Version の版（v0.9.0 など）のリリースがまだなければ、
 #   その commit にタグを付けてリリースを作る。もうあれば何もしない（版を上げたときだけリリースされる）
 # - v から始まるタグの push / 手動実行: そのタグのリリースを作る（あれば zip を差し替える）
+# - PR: ビルドと自動アップデートの動作確認だけ（リリースしない。zip は Actions の成果物に残す）
 name: release
 
 on:
   push:
     branches: [main]
     tags: ['v*']
+    paths: ['WorkLogTray/**', 'dist/**', '.github/workflows/release.yml']
+  pull_request:
     paths: ['WorkLogTray/**', 'dist/**', '.github/workflows/release.yml']
   workflow_dispatch:
 
@@ -38,6 +41,42 @@ jobs:
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "ver=$ver" >> $env:GITHUB_OUTPUT
 
+      # 自動アップデートの確認: テスト用の保存先で、今の版のふり（最新なので何もしない）と、
+      # 古い版のふり（GitHub の最新リリースを落として exe を入れ替え、起動し直す）を実際に動かす
+      - name: Test auto update
+        shell: pwsh
+        run: |
+          $t = Join-Path $env:RUNNER_TEMP 'updtest'
+          $app = Join-Path $t 'app'; $data = Join-Path $t 'data'
+          New-Item -ItemType Directory -Force $app, $data | Out-Null
+          Copy-Item WorkLogTray/WorkLog.exe $app
+          $exe = Join-Path $app 'WorkLog.exe'
+          $log = Join-Path $data 'update.log'
+          $env:WORKLOG_TEST = $data
+          # -Wait は起動し直した exe（子）の終了まで待つので使わず、本人の終了だけを待つ
+          function Run([string[]]$a) {
+            $p = Start-Process $exe -ArgumentList $a -PassThru
+            $null = $p.Handle
+            if (-not $p.WaitForExit(180000)) { throw "終わらない: $a" }
+            return $p.ExitCode
+          }
+          $code = Run @('--check-update')
+          if ($code -ne 0) { Get-Content $log; throw "今の版で更新ありになった（$code）" }
+          $env:WORKLOG_FAKE_VERSION = '0.0.1'
+          $code = Run @('--check-update', '--apply')
+          if ($code -ne 10) { Get-Content $log; throw "古い版のふりで更新できなかった（$code）" }
+          $latest = ([regex]::Matches((Get-Content $log -Raw), '最新 ([0-9.]+)') | Select-Object -Last 1).Groups[1].Value
+          Start-Sleep -Seconds 15
+          Get-Content $log
+          $v = (Get-Item $exe).VersionInfo.FileVersion
+          if ($v -ne $latest) { throw "exe が入れ替わっていない（$v / 最新 $latest）" }
+          if ([version]$latest -ge [version]'0.10.0') {
+            if (-not (Select-String -Path $log -Pattern '起動しました（更新）' -Quiet)) { throw '更新後の起動を確かめられない' }
+            if (Test-Path "$exe.old") { throw '前の exe が残っている' }
+          }
+          Get-Process WorkLog -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$app*" } | Stop-Process -Force
+          Write-Host "OK: 0.0.1 → $v に入れ替わった"
+
       - name: Make zip
         shell: pwsh
         run: |
@@ -48,14 +87,25 @@ jobs:
           Compress-Archive -Path $dir -DestinationPath "WorkLog-${{ steps.ver.outputs.ver }}.zip"
           Get-FileHash "WorkLog-${{ steps.ver.outputs.ver }}.zip" -Algorithm SHA256 | Format-List
 
+      - name: Upload zip (PR)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: WorkLog-${{ steps.ver.outputs.ver }}
+          path: WorkLog-${{ steps.ver.outputs.ver }}.zip
+
       - name: Create release
+        if: github.event_name != 'pull_request'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = '${{ steps.ver.outputs.tag }}'
           $zip = "WorkLog-${{ steps.ver.outputs.ver }}.zip"
-          $notes = "WorkLog ${{ steps.ver.outputs.ver }}`n`n$zip を展開し、中の「インストール手順.txt」をご覧ください。"
+          $notes = "WorkLog ${{ steps.ver.outputs.ver }}`n`n" +
+            "> [!IMPORTANT]`n> このソフトは AI（Anthropic の Claude / Claude Code）が作成したソフトウェアです。無保証です。`n`n" +
+            "- 初めて入れるとき: $zip を展開し、中の「インストール手順.txt」をご覧ください`n" +
+            "- 0.10.0 以降を使っているとき: 自動で更新されます（日報画面のメニュー「ヘルプ → 更新を確認」ですぐ確かめられます）"
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             if ('${{ github.ref_type }}' -eq 'branch' -and '${{ github.event_name }}' -eq 'push') {

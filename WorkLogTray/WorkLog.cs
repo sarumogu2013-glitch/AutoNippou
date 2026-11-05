@@ -9,6 +9,8 @@
 //   --settings           常駐して「設定」も開く
 //   --report yyyy-MM-dd  その日の日報を作り直して終了（画面なし）
 //   --auto               未作成の日報をまとめて作って終了（画面なし）
+//   --updated <pid>      自動アップデートで起動された（前の版の終了を待ってから常駐する）
+//   --check-update [--apply]  テスト中（WORKLOG_TEST）だけ: 更新を確かめて落とす（--apply で入れ替えも）。0=最新 10=更新あり 2=失敗
 // 動作確認用の環境変数: WORKLOG_TEST=保存先フォルダ（二重起動防止を本番と分け、スタートアップ登録を無効にする）
 using System;
 using System.Collections;
@@ -41,8 +43,9 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.9.0";   // 主.機能.修正
+        public const string Version = "0.10.0";   // 主.機能.修正
         public const string History =
+            "0.10.0（2026-11-05）自動アップデート（GitHub のリリースに新しい版が出たら、日報画面を閉じているときに入れ替えて起動し直す。設定で「知らせるだけ」にもできる。メニュー「ヘルプ → 更新を確認」）。exe にアイコン。トレイのメニューと初めての起動でスタートアップに登録・解除\n" +
             "0.9.0（2026-10-30）作り直すときは、今の日報と作り直した案を Opus で比べて合成する。休憩（12:00〜13:00）の行を日報に残す（日報画面のチェックで外せる）。" +
             "本文の下の「手で追記」で時刻と内容を入れて追記。出勤・退勤（退勤中は記録と AI を止めて待機。17:30 を過ぎて操作がなければ退勤、8:00 を過ぎて操作があれば出勤）\n" +
             "0.8.1（2026-10-30）追記のたびに作業が1時間ごとに分かれないよう、続いている工程は終わりの時刻を延ばす（区切るのは休憩と離席だけ）\n" +
@@ -110,6 +113,7 @@ namespace WorkLog
         public int AppendMinutes = 60;  // 今日の日報をこの分数ごとに追記する（0 で ReportTime にまとめて作る）
         public TimeSpan WorkStart = new TimeSpan(8, 0, 0);   // 退勤中でも、この時刻を過ぎて操作があれば出勤とみなす
         public int OffIdleMinutes = 30;  // ReportTime を過ぎて、操作がこの分数なかったら退勤とみなす（0 で自動で退勤しない）
+        public bool AutoUpdate = true;   // 新しい版が出たら自動で入れ替える（false は知らせるだけ）
 
         public bool HasBreak { get { return BreakEnd > BreakStart; } }
         public string BreakText { get { return BreakStart.ToString(@"hh\:mm") + "〜" + BreakEnd.ToString(@"hh\:mm"); } }
@@ -140,6 +144,7 @@ namespace WorkLog
             add("離席から戻ったときに何をしていたか聞く（1=聞く 0=日報画面の離席メモに書くだけ）", "AfkAsk", AfkAsk ? "1" : "0");
             add("退勤中（待機）でも、この時刻を過ぎて操作があれば出勤とみなす", "WorkStart", WorkStart.ToString(@"hh\:mm"));
             add("ReportTime を過ぎて、操作がこの分数なかったら退勤とみなす（0 で自動で退勤しない）", "OffIdleMinutes", OffIdleMinutes.ToString());
+            add("新しい版が出たら自動で更新する（1=自動で更新 0=知らせるだけ）", "AutoUpdate", AutoUpdate ? "1" : "0");
             return b.ToString();
         }
 
@@ -223,6 +228,7 @@ namespace WorkLog
                         case "AppendMinutes": s.AppendMinutes = int.Parse(v); break;
                         case "WorkStart": s.WorkStart = TimeSpan.Parse(v); break;
                         case "OffIdleMinutes": s.OffIdleMinutes = int.Parse(v); break;
+                        case "AutoUpdate": s.AutoUpdate = v == "1" || v.ToLower() == "true"; break;
                         case "Break":
                             if (v.Length == 0) s.BreakStart = s.BreakEnd = TimeSpan.Zero;
                             else { string[] b = v.Split('-'); s.BreakStart = TimeSpan.Parse(b[0].Trim()); s.BreakEnd = TimeSpan.Parse(b[1].Trim()); }
@@ -1362,6 +1368,172 @@ namespace WorkLog
     }
 
     // トレイ常駐の本体
+    // 自動アップデート: GitHub の最新リリースを見て、新しい版があれば zip を落とし、exe を入れ替えて起動し直す
+    // 動いている exe は消せないが名前は変えられるので、WorkLog.exe → WorkLog.exe.old にして新しい exe を置く（.old は次の起動で消す）
+    static class Updater
+    {
+        public const string Repo = "sarumogu2013-glitch/AutoNippou";
+        public const string Page = "https://github.com/" + Repo + "/releases/latest";
+        public class Release { public string Tag, Version, Notes, Url, ZipName, ZipUrl, Digest; }
+
+        static string Dir { get { return Path.Combine(Core.Dir, "update"); } }
+
+        // 今の版。テスト中（WORKLOG_TEST）だけ WORKLOG_FAKE_VERSION で古い版のふりができる（更新の動作確認用）
+        public static string Current
+        {
+            get
+            {
+                string f = Core.Test ? Environment.GetEnvironmentVariable("WORKLOG_FAKE_VERSION") : null;
+                return string.IsNullOrEmpty(f) ? Core.Version : f;
+            }
+        }
+
+        // update.log に1行ずつ残す
+        public static void Log(string msg)
+        {
+            try
+            {
+                File.AppendAllText(Path.Combine(Core.Dir, "update.log"),
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + msg + "\r\n", new UTF8Encoding(true));
+            }
+            catch { }
+        }
+
+        static Version Parse(string v)
+        {
+            Version r;
+            return Version.TryParse((v ?? "").Trim().TrimStart('v', 'V'), out r) ? r : null;
+        }
+
+        public static bool IsNewer(string latest, string current)
+        {
+            Version a = Parse(latest), b = Parse(current);
+            return a != null && b != null && a > b;
+        }
+
+        static System.Net.HttpWebRequest Request(string url)
+        {
+            System.Net.ServicePointManager.SecurityProtocol |= System.Net.SecurityProtocolType.Tls12;
+            var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+            req.UserAgent = "WorkLog/" + Core.Version;
+            req.Timeout = 30000;
+            req.ReadWriteTimeout = 120000;
+            return req;
+        }
+
+        static string Str(IDictionary<string, object> d, string k)
+        {
+            object v;
+            return d != null && d.TryGetValue(k, out v) && v != null ? v.ToString() : "";
+        }
+
+        // 最新のリリースを調べる（インストール用 zip がないリリースは例外）
+        public static Release Latest()
+        {
+            System.Net.HttpWebRequest req = Request("https://api.github.com/repos/" + Repo + "/releases/latest");
+            req.Accept = "application/vnd.github+json";
+            string json;
+            using (var res = req.GetResponse())
+            using (var r = new StreamReader(res.GetResponseStream(), Encoding.UTF8))
+                json = r.ReadToEnd();
+            var d = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Deserialize<Dictionary<string, object>>(json);
+            var rel = new Release { Tag = Str(d, "tag_name"), Notes = Str(d, "body"), Url = Str(d, "html_url") };
+            rel.Version = rel.Tag.TrimStart('v', 'V');
+            if (Parse(rel.Version) == null) throw new Exception("最新のリリースの版が読めません: " + rel.Tag);
+            object assets;
+            if (d.TryGetValue("assets", out assets) && assets is IEnumerable)
+                foreach (object o in (IEnumerable)assets)
+                {
+                    var a = o as IDictionary<string, object>;
+                    string name = Str(a, "name");
+                    if (!Regex.IsMatch(name, @"^WorkLog-[0-9.]+\.zip$", RegexOptions.IgnoreCase)) continue;
+                    rel.ZipName = name;
+                    rel.ZipUrl = Str(a, "browser_download_url");
+                    rel.Digest = Str(a, "digest");
+                    break;
+                }
+            if (rel.ZipUrl == null) throw new Exception(rel.Tag + " にインストール用 zip がありません");
+            return rel;
+        }
+
+        // zip を落として確かめ（SHA-256・中の exe の版）、新しい exe の場所を返す
+        public static string Download(Release rel)
+        {
+            Directory.CreateDirectory(Dir);
+            foreach (string f in Directory.GetFiles(Dir)) { try { File.Delete(f); } catch { } }
+            string zip = Path.Combine(Dir, rel.ZipName);
+            using (var res = Request(rel.ZipUrl).GetResponse())
+            using (Stream s = res.GetResponseStream())
+            using (FileStream f = File.Create(zip))
+                s.CopyTo(f);
+            if (rel.Digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase))
+            {
+                string hash;
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                using (FileStream f = File.OpenRead(zip))
+                    hash = BitConverter.ToString(sha.ComputeHash(f)).Replace("-", "");
+                if (!hash.Equals(rel.Digest.Substring(7), StringComparison.OrdinalIgnoreCase))
+                    throw new Exception("ダウンロードした zip が壊れています（SHA-256 が合いません）");
+            }
+            string exe = Path.Combine(Dir, "WorkLog.new.exe");
+            using (System.IO.Compression.ZipArchive a = System.IO.Compression.ZipFile.OpenRead(zip))
+            {
+                System.IO.Compression.ZipArchiveEntry e = a.Entries.FirstOrDefault(x => x.Name.Equals("WorkLog.exe", StringComparison.OrdinalIgnoreCase));
+                if (e == null) throw new Exception("zip の中に WorkLog.exe がありません");
+                System.IO.Compression.ZipFileExtensions.ExtractToFile(e, exe, true);
+            }
+            string v = FileVersionInfo.GetVersionInfo(exe).FileVersion;
+            if (Parse(v) == null || Parse(v) != Parse(rel.Version))
+                throw new Exception("zip の中の exe の版（" + v + "）がリリース（" + rel.Version + "）と違います");
+            return exe;
+        }
+
+        // exe を入れ替えて新しい exe を起動する（呼んだ側はこのあとすぐ終わる）。うまくいかなければ元に戻して例外
+        public static void Apply(string newExe)
+        {
+            string exe = Application.ExecutablePath, old = exe + ".old";
+            if (File.Exists(old)) File.Delete(old);
+            File.Move(exe, old);
+            try
+            {
+                File.Copy(newExe, exe);
+                Process.Start(new ProcessStartInfo(exe, "--updated " + Process.GetCurrentProcess().Id)
+                    { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(exe) });
+            }
+            catch
+            {
+                try { if (File.Exists(exe)) File.Delete(exe); File.Move(old, exe); } catch { }
+                throw;
+            }
+        }
+
+        // 更新で起動されたとき: 前の版が終わるのを待ってから、前の exe と落とした zip を消す
+        public static void AfterUpdate(int pid)
+        {
+            try { using (Process p = Process.GetProcessById(pid)) p.WaitForExit(30000); }
+            catch { }   // もう終わっている
+            string old = Application.ExecutablePath + ".old";
+            for (int i = 0; i < 10 && File.Exists(old); i++)
+            {
+                try { File.Delete(old); }
+                catch { Thread.Sleep(500); }
+            }
+            try { if (Directory.Exists(Dir)) Directory.Delete(Dir, true); } catch { }
+            Log(Core.Version + " を起動しました（更新）");
+        }
+
+        // ふだんの起動: 前の更新の残りがあれば消す
+        public static void Cleanup()
+        {
+            try
+            {
+                string old = Application.ExecutablePath + ".old";
+                if (File.Exists(old)) File.Delete(old);
+            }
+            catch { }
+        }
+    }
+
     class TrayApp : ApplicationContext
     {
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -1384,9 +1556,15 @@ namespace WorkLog
         Action balloonClick;
         bool off;          // 退勤中（待機）
         DateTime offAt;    // 退勤した時刻
-        ToolStripMenuItem dutyItem;
+        ToolStripMenuItem dutyItem, startupItem;
+        DateTime lastUpdateCheck = DateTime.MinValue;
+        bool checking;                     // 更新を確かめている・落としている最中
+        Updater.Release pendingRelease;    // 落とし終えて入れ替え待ちの版
+        string pendingExe;
+        bool applyNow;                     // 手で「更新する」と言われた（日報画面が開いていても入れ替える）
+        string failedVersion, notifiedVersion;
 
-        public TrayApp(bool show)
+        public TrayApp(bool show, bool updated, bool firstRun)
         {
             // トレイには、画面を開かずに済ませたいものだけを置く（ほかは日報画面のメニューバー）
             var menu = new ContextMenuStrip();
@@ -1397,7 +1575,12 @@ namespace WorkLog
             dutyItem = new ToolStripMenuItem("退勤", null, (o, e) => ToggleDuty());
             menu.Items.Add(dutyItem);
             menu.Items.Add(new ToolStripSeparator());
+            startupItem = new ToolStripMenuItem("Windows 起動時に自動で起動する", null, (o, e) => ToggleStartup()) { Enabled = !Core.Test };
+            menu.Items.Add(startupItem);
+            menu.Items.Add("更新を確認", null, (o, e) => CheckUpdate(true));
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("終了", null, (o, e) => Quit());
+            menu.Opening += (o, e) => { try { startupItem.Checked = StartupPath() != null; } catch { } };
 
             tray.Icon = icon;
             tray.Text = "作業ログ";
@@ -1418,6 +1601,172 @@ namespace WorkLog
             afkTimer.Start();
             if (show) ShowForm(null);
             CheckAi();
+            if (updated) Balloon("作業ログを " + Core.Version + " に更新しました", "変わったところは日報画面のメニュー「ヘルプ → バージョン情報」で見られます", ToolTipIcon.Info, () => ShowForm(null));
+            if (firstRun && !Core.Test) AskStartup();
+        }
+
+        // 初めての起動: スタートアップに登録するか聞く（あとからトレイのメニューか設定のタブ「起動」で変えられる）
+        void AskStartup()
+        {
+            try
+            {
+                if (StartupPath() != null) return;
+                if (MessageBox.Show("作業ログを Windows 起動時に自動で起動しますか？\n（作業の記録は、起動しているあいだだけ取れます）\n\n" +
+                        "あとからトレイのアイコンを右クリック →「Windows 起動時に自動で起動する」で変えられます。",
+                        "作業ログ", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                SetStartup(true);
+                Balloon("自動で起動するように登録しました", "登録した場所: " + Application.ExecutablePath, ToolTipIcon.Info, null);
+            }
+            catch (Exception ex) { Core.Error("スタートアップ", ex.Message); }
+        }
+
+        void ToggleStartup()
+        {
+            if (Core.Test) return;
+            try
+            {
+                bool on = StartupPath() == null;
+                SetStartup(on);
+                Balloon(on ? "自動で起動するように登録しました" : "自動で起動しないようにしました",
+                    on ? "登録した場所: " + Application.ExecutablePath : "Windows を起動しても作業ログは起動しません（記録も取りません）", ToolTipIcon.Info, null);
+            }
+            catch (Exception ex)
+            {
+                Core.Error("スタートアップ", ex.Message);
+                Balloon("自動起動を変えられませんでした", ex.Message, ToolTipIcon.Warning, null);
+            }
+        }
+
+        // 自動アップデート: 起動の5分後と、そのあと12時間ごとに確かめる。落とした新しい版は、日報を作っていなくて
+        // 画面を開いていないとき（記録の1分ごとに確かめる）に入れ替えて起動し直す
+        void UpdateTick()
+        {
+            if (pendingExe != null) { TryApply(); return; }
+            DateTime now = DateTime.Now;
+            if (Core.Test || checking || now < started.AddMinutes(5) || now - lastUpdateCheck < TimeSpan.FromHours(12)) return;
+            lastUpdateCheck = now;
+            CheckUpdate(false);
+        }
+
+        // manual: メニューの「更新を確認」（結果を必ず知らせる）
+        public void CheckUpdate(bool manual)
+        {
+            if (checking) { if (manual) Balloon("更新", "更新を確かめている最中です", ToolTipIcon.Info, null); return; }
+            if (pendingExe != null) { if (manual) { applyNow = true; TryApply(); } return; }
+            checking = true;
+            bool auto = Settings.Get().AutoUpdate;
+            var t = new Thread(() =>
+            {
+                Updater.Release rel = null;
+                string exe = null;
+                Exception err = null;
+                try
+                {
+                    rel = Updater.Latest();
+                    if (Updater.IsNewer(rel.Version, Updater.Current) && auto && !manual && rel.Version != failedVersion)
+                        exe = Updater.Download(rel);
+                }
+                catch (Exception ex) { err = ex; }
+                ui.Post(_ => CheckDone(rel, exe, err, manual), null);
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        void CheckDone(Updater.Release rel, string exe, Exception err, bool manual)
+        {
+            checking = false;
+            if (err != null)
+            {
+                Updater.Log("確かめられませんでした: " + err.Message);
+                if (manual) MessageBox.Show("新しい版があるか確かめられませんでした。\n" + err.Message, "更新を確認", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            bool newer = Updater.IsNewer(rel.Version, Updater.Current);
+            Updater.Log("確認: 最新 " + rel.Version + " / 今 " + Updater.Current + (newer ? "（新しい版あり）" : ""));
+            if (!newer)
+            {
+                if (manual) MessageBox.Show("最新の版です（" + Updater.Current + "）。", "更新を確認", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (manual) { ConfirmUpdate(rel); return; }
+            if (exe != null)
+            {
+                Updater.Log(rel.Version + " を落としました。日報画面を閉じているときに入れ替えます");
+                pendingRelease = rel;
+                pendingExe = exe;
+                TryApply();
+                return;
+            }
+            if (rel.Version == failedVersion || rel.Version == notifiedVersion) return;
+            notifiedVersion = rel.Version;
+            Balloon("作業ログの新しい版 " + rel.Version + " があります", "クリックすると更新します", ToolTipIcon.Info, () => ConfirmUpdate(rel));
+        }
+
+        void ConfirmUpdate(Updater.Release rel)
+        {
+            string notes = (rel.Notes ?? "").Trim();
+            if (notes.Length > 600) notes = notes.Substring(0, 600) + "…";
+            if (MessageBox.Show("新しい版 " + rel.Version + " があります（今は " + Updater.Current + "）。\n\n" + (notes.Length > 0 ? notes + "\n\n" : "") +
+                    "今すぐ更新しますか？\n作業ログが数秒止まって起動し直します。記録・日報・設定はそのまま引き継がれます。",
+                    "更新を確認", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            checking = true;
+            var t = new Thread(() =>
+            {
+                string exe = null;
+                Exception err = null;
+                try { exe = Updater.Download(rel); }
+                catch (Exception ex) { err = ex; }
+                ui.Post(_ =>
+                {
+                    checking = false;
+                    if (err != null)
+                    {
+                        Updater.Log(rel.Version + " を落とせませんでした: " + err.Message);
+                        MessageBox.Show("新しい版を落とせませんでした。\n" + err.Message, "更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+                    pendingRelease = rel;
+                    pendingExe = exe;
+                    applyNow = true;
+                    TryApply();
+                }, null);
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        bool Shown(Form f) { return f != null && !f.IsDisposed && f.Visible; }
+
+        void TryApply()
+        {
+            if (pendingExe == null) return;
+            if (busy)
+            {
+                if (applyNow) Balloon("更新", "日報を作り終えたら更新します", ToolTipIcon.Info, null);
+                return;   // 次の記録のときにまた試す
+            }
+            if (!applyNow && (Shown(form) || Shown(askForm) || Shown(settingsForm) || Shown(aiForm))) return;
+            Updater.Release rel = pendingRelease;
+            string exe = pendingExe;
+            pendingRelease = null;
+            pendingExe = null;
+            applyNow = false;
+            try
+            {
+                if (form != null && !form.IsDisposed) form.SaveIfDirty();
+                Updater.Apply(exe);
+                Updater.Log(Core.Version + " → " + rel.Version + " に入れ替えました（起動し直します）");
+            }
+            catch (Exception ex)
+            {
+                failedVersion = rel.Version;
+                Updater.Log(rel.Version + " に入れ替えられませんでした: " + ex.Message);
+                Balloon("作業ログを更新できませんでした", ex.Message + "\nクリックするとリリースのページを開きます（zip から手で置き換えられます）",
+                    ToolTipIcon.Warning, () => { try { Process.Start(rel.Url); } catch { } });
+                return;
+            }
+            Shutdown();
         }
 
         // 一晩つけっぱなしなどは離席として扱わない
@@ -1596,6 +1945,7 @@ namespace WorkLog
             string st = "作業ログ " + RecordStatus();
             tray.Text = st.Length > 63 ? st.Substring(0, 63) : st;
             if (form != null && !form.IsDisposed && form.Visible) form.SetRecordStatus(RecordStatus());
+            UpdateTick();
 
             // 起動直後はネットワークを待つ。日付が変わったとき・仕上げの時刻を過ぎたとき（知らせる）と、AppendMinutes ごと（静かに追記）
             Settings s = Settings.Get();
@@ -1703,6 +2053,12 @@ namespace WorkLog
         public void Quit()
         {
             if (MessageBox.Show("終了すると作業の記録が止まります。終了しますか？", "作業ログ", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            Shutdown();
+        }
+
+        // 聞かずに終わる（更新で起動し直すときも）
+        void Shutdown()
+        {
             if (form != null && !form.IsDisposed) { form.SaveIfDirty(); form.Dispose(); }
             if (aiForm != null && !aiForm.IsDisposed) aiForm.Dispose();
             if (settingsForm != null && !settingsForm.IsDisposed) settingsForm.Dispose();
@@ -1985,6 +2341,9 @@ namespace WorkLog
             mError = Item(tools, "エラーの記録を開く(&E)", () => Process.Start("notepad.exe", "\"" + Path.Combine(Core.Dir, "error.log") + "\""));
             tools.DropDownOpening += (o, e) => mError.Enabled = File.Exists(Path.Combine(Core.Dir, "error.log"));
             ToolStripMenuItem help = TopMenu(menu, "ヘルプ(&H)");
+            Item(help, "更新を確認(&U)…", () => app.CheckUpdate(true));
+            Item(help, "リリースのページを開く(&R)", () => Process.Start(Updater.Page));
+            help.DropDownItems.Add(new ToolStripSeparator());
             Item(help, "バージョン情報(&A)", ShowAbout);
             MainMenuStrip = menu;
             // Dock は後から追加したものが外側になる
@@ -2288,7 +2647,8 @@ namespace WorkLog
         void ShowAbout()
         {
             MessageBox.Show(this,
-                "作業ログ・日報　バージョン " + Core.Version + (Core.Test ? "（テスト）" : "") + "\n\n" +
+                "作業ログ・日報　バージョン " + Core.Version + (Core.Test ? "（テスト）" : "") + "\n" +
+                "このソフトは AI（Anthropic の Claude）が作成しました。無保証です。\n\n" +
                 "実行ファイル: " + Application.ExecutablePath + "\n" +
                 "保存先: " + Core.Dir + "\n\n" +
                 "更新履歴:\n" + Core.History,
@@ -2787,6 +3147,7 @@ namespace WorkLog
         readonly NumericUpDown idle = Num(30, 3600), minMinutes = Num(0, 60), minDay = Num(0, 600), redo = Num(1, 600), catchUp = Num(1, 60), keep = Num(7, 3650);
         readonly CheckBox openWindow = new CheckBox { Text = "日報ができたら日報画面を開く（外すと通知だけ）", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
         readonly CheckBox startup = new CheckBox { Text = "Windows 起動時に自動で起動する", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
+        readonly CheckBox autoUpdate = new CheckBox { Text = "新しい版が出たら自動で更新する（外すと知らせるだけ）", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
         readonly CheckBox afkAsk = new CheckBox { Text = "離席から戻ったときに、何をしていたか聞く（外すと日報画面の「離席メモ」に書くだけ）", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
         readonly NumericUpDown afkMinutes = Num(0, 240), appendMinutes = Num(0, 480), offIdle = Num(0, 600);
         readonly DateTimePicker workStart = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 90 };
@@ -2870,7 +3231,11 @@ namespace WorkLog
             t = Page(tabs, "起動", 1);
             Add(t, Auto(), startup);
             Add(t, Auto(), Hint(Core.Test ? "テスト中は登録できません" : "登録する場所: " + Application.ExecutablePath +
-                                             "\r\nexe を別の場所へ動かしたら、いったん外してから付け直してください"));
+                                             "\r\nexe を別の場所へ動かしたら、いったん外してから付け直してください" +
+                                             "\r\nトレイのアイコンを右クリックしたメニューでも登録・解除できます"));
+            Add(t, Auto(), autoUpdate);
+            Add(t, Auto(), Hint("12時間ごとに GitHub のリリースを確かめます。新しい版は、日報画面を閉じているときに入れ替えて起動し直します" +
+                                "\r\n（記録・日報・設定はそのまま）。いつでも日報画面のメニュー「ヘルプ → 更新を確認」で確かめられます"));
 
             foreach (string m in Models) { model.Items.Add(m); fixModel.Items.Add(m); }
             mask.Columns.Add("proc", "プロセス名（例: OUTLOOK）");
@@ -2966,6 +3331,7 @@ namespace WorkLog
             fixModel.Text = s.FixModel;
             claudePath.Text = s.ClaudePath;
             startup.Checked = TrayApp.StartupPath() != null;
+            autoUpdate.Checked = s.AutoUpdate;
         }
 
         static List<string> Split(TextBox box)
@@ -3013,6 +3379,7 @@ namespace WorkLog
                 AppendMinutes = (int)appendMinutes.Value,
                 WorkStart = new TimeSpan(workStart.Value.Hour, workStart.Value.Minute, 0),
                 OffIdleMinutes = (int)offIdle.Value,
+                AutoUpdate = autoUpdate.Checked,
                 BreakStart = breakOn.Checked ? breakStart.Value.TimeOfDay - TimeSpan.FromSeconds(breakStart.Value.Second) : TimeSpan.Zero,
                 BreakEnd = breakOn.Checked ? breakEnd.Value.TimeOfDay - TimeSpan.FromSeconds(breakEnd.Value.Second) : TimeSpan.Zero
             };
@@ -3215,6 +3582,27 @@ namespace WorkLog
                 catch (Exception ex) { Core.Error("日報", ex.ToString()); return 2; }
             }
 
+            // テスト用: 更新を確かめて落とす（--apply で入れ替えて新しい exe を起動する）
+            if (args.Length >= 1 && args[0] == "--check-update" && Core.Test)
+            {
+                try
+                {
+                    Updater.Release rel = Updater.Latest();
+                    Updater.Log("確認（--check-update）: 最新 " + rel.Version + " / 今 " + Updater.Current);
+                    if (!Updater.IsNewer(rel.Version, Updater.Current)) return 0;
+                    string exe = Updater.Download(rel);
+                    if (args.Contains("--apply")) Updater.Apply(exe);
+                    return 10;
+                }
+                catch (Exception ex) { Updater.Log("失敗（--check-update）: " + ex); return 2; }
+            }
+
+            // 自動アップデートで起動されたときは、前の版が終わるのを待つ
+            int at = Array.IndexOf(args, "--updated"), oldPid = 0;
+            bool updated = at >= 0 && at + 1 < args.Length && int.TryParse(args[at + 1], out oldPid);
+            if (updated) Updater.AfterUpdate(oldPid); else Updater.Cleanup();
+            bool firstRun = !File.Exists(Settings.FilePath);
+
             // 二重起動のときは、動いている方の日報画面を開いて終わる
             bool created;
             using (var mutex = new Mutex(true, "WorkLogTray" + Core.Suffix, out created))
@@ -3228,7 +3616,7 @@ namespace WorkLog
                 Application.ThreadException += (o, e) => Core.Error("画面", e.Exception.ToString());
                 AppDomain.CurrentDomain.UnhandledException += (o, e) => Core.Error("異常終了", e.ExceptionObject.ToString());
 
-                var app = new TrayApp(args.Contains("--show"));
+                var app = new TrayApp(args.Contains("--show"), updated, firstRun);
                 if (args.Contains("--ai")) app.ShowAiForm();
                 if (args.Contains("--settings")) app.ShowSettingsForm();
                 if (args.Contains("--test-afk") && Core.Test) app.TestAfk();

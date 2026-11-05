@@ -1,15 +1,15 @@
-# v から始まるタグ（例: v0.9.0）を push すると、Windows で WorkLog.exe をビルドし、
-# インストール用 zip を作って GitHub のリリースに載せる。
+# Windows で WorkLog.exe をビルドし、インストール用 zip を作って GitHub のリリースに載せる。
+# - main（と作業ブランチ）への push: Core.Version の版（v0.9.0 など）のリリースがまだなければ、
+#   その commit にタグを付けてリリースを作る。もうあれば何もしない（版を上げたときだけリリースされる）
+# - v から始まるタグの push / 手動実行: そのタグのリリースを作る（あれば zip を差し替える）
 name: release
 
 on:
   push:
+    branches: [main, claude/fervent-hypatia-16gcki]
     tags: ['v*']
+    paths: ['WorkLogTray/**', 'dist/**', '.github/workflows/release.yml']
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'リリースするタグ（例: v0.9.0）'
-        required: true
 
 permissions:
   contents: write
@@ -19,8 +19,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Build WorkLog.exe
         shell: pwsh
@@ -32,9 +30,11 @@ jobs:
         id: ver
         shell: pwsh
         run: |
-          $tag = '${{ github.event.inputs.tag || github.ref_name }}'
           $ver = (Get-Item WorkLogTray/WorkLog.exe).VersionInfo.FileVersion
-          if ("v$ver" -ne $tag) { throw "タグ $tag と Core.Version $ver が合っていません" }
+          $tag = "v$ver"
+          if ('${{ github.ref_type }}' -eq 'tag' -and '${{ github.ref_name }}' -ne $tag) {
+            throw "タグ ${{ github.ref_name }} と Core.Version $ver が合っていません"
+          }
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "ver=$ver" >> $env:GITHUB_OUTPUT
 
@@ -56,6 +56,12 @@ jobs:
           $tag = '${{ steps.ver.outputs.tag }}'
           $zip = "WorkLog-${{ steps.ver.outputs.ver }}.zip"
           $notes = "WorkLog ${{ steps.ver.outputs.ver }}`n`n$zip を展開し、中の「インストール手順.txt」をご覧ください。"
-          gh release view $tag 2>$null
-          if ($LASTEXITCODE -eq 0) { gh release upload $tag $zip --clobber }
-          else { gh release create $tag $zip --title "WorkLog ${{ steps.ver.outputs.ver }}" --notes $notes }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            if ('${{ github.ref_type }}' -eq 'branch' -and '${{ github.event_name }}' -eq 'push') {
+              Write-Host "$tag のリリースはもうあるので何もしません（版を上げるとリリースされます）"
+            } else { gh release upload $tag $zip --clobber }
+          } else {
+            gh release create $tag $zip --target '${{ github.sha }}' --title "WorkLog ${{ steps.ver.outputs.ver }}" --notes $notes
+          }
+          $global:LASTEXITCODE = $LASTEXITCODE

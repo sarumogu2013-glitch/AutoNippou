@@ -1,0 +1,67 @@
+# Windows で WorkLog.exe をビルドし、インストール用 zip を作って GitHub のリリースに載せる。
+# - main への push: Core.Version の版（v0.9.0 など）のリリースがまだなければ、
+#   その commit にタグを付けてリリースを作る。もうあれば何もしない（版を上げたときだけリリースされる）
+# - v から始まるタグの push / 手動実行: そのタグのリリースを作る（あれば zip を差し替える）
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths: ['WorkLogTray/**', 'dist/**', '.github/workflows/release.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build WorkLog.exe
+        shell: pwsh
+        run: |
+          ./WorkLogTray/build.ps1
+          if (-not (Test-Path WorkLogTray/WorkLog.exe)) { throw 'WorkLog.exe was not built' }
+
+      - name: Check version
+        id: ver
+        shell: pwsh
+        run: |
+          $ver = (Get-Item WorkLogTray/WorkLog.exe).VersionInfo.FileVersion
+          $tag = "v$ver"
+          if ('${{ github.ref_type }}' -eq 'tag' -and '${{ github.ref_name }}' -ne $tag) {
+            throw "タグ ${{ github.ref_name }} と Core.Version $ver が合っていません"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "ver=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Make zip
+        shell: pwsh
+        run: |
+          $dir = "out/WorkLogTray"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item WorkLogTray/WorkLog.exe $dir
+          Copy-Item "dist/インストール手順.txt" $dir
+          Compress-Archive -Path $dir -DestinationPath "WorkLog-${{ steps.ver.outputs.ver }}.zip"
+          Get-FileHash "WorkLog-${{ steps.ver.outputs.ver }}.zip" -Algorithm SHA256 | Format-List
+
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.ver.outputs.tag }}'
+          $zip = "WorkLog-${{ steps.ver.outputs.ver }}.zip"
+          $notes = "WorkLog ${{ steps.ver.outputs.ver }}`n`n$zip を展開し、中の「インストール手順.txt」をご覧ください。"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            if ('${{ github.ref_type }}' -eq 'branch' -and '${{ github.event_name }}' -eq 'push') {
+              Write-Host "$tag のリリースはもうあるので何もしません（版を上げるとリリースされます）"
+            } else { gh release upload $tag $zip --clobber }
+          } else {
+            gh release create $tag $zip --target '${{ github.sha }}' --title "WorkLog ${{ steps.ver.outputs.ver }}" --notes $notes
+          }
+          $global:LASTEXITCODE = $LASTEXITCODE

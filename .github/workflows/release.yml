@@ -1,12 +1,12 @@
 # Windows で WorkLog.exe をビルドし、インストール用 zip を作って GitHub のリリースに載せる。
-# - main（と作業ブランチ）への push: Core.Version の版（v0.9.0 など）のリリースがまだなければ、
+# - main への push: Core.Version の版（v0.9.0 など）のリリースがまだなければ、
 #   その commit にタグを付けてリリースを作る。もうあれば何もしない（版を上げたときだけリリースされる）
 # - v から始まるタグの push / 手動実行: そのタグのリリースを作る（あれば zip を差し替える）
 name: release
 
 on:
   push:
-    branches: [main, claude/fervent-hypatia-16gcki]
+    branches: [main]
     tags: ['v*']
     paths: ['WorkLogTray/**', 'dist/**', '.github/workflows/release.yml']
   workflow_dispatch:

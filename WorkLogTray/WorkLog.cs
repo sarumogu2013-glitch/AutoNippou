@@ -10,6 +10,7 @@
 //   --report yyyy-MM-dd  その日の日報を作り直して終了（画面なし）
 //   --auto               未作成の日報をまとめて作って終了（画面なし）
 //   --updated <pid>      自動アップデートで起動された（前の版の終了を待ってから常駐する）
+//   --screenshot-about <png>  テスト中だけ: バージョン情報の画面を画像にして終わる
 //   --check-update [--apply]  テスト中（WORKLOG_TEST）だけ: 更新を確かめて落とす（--apply で入れ替えも）。0=最新 10=更新あり 2=失敗
 // 動作確認用の環境変数: WORKLOG_TEST=保存先フォルダ（二重起動防止を本番と分け、スタートアップ登録を無効にする）
 using System;
@@ -43,20 +44,8 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.10.0";   // 主.機能.修正
-        public const string History =
-            "0.10.0（2026-11-05）自動アップデート（GitHub のリリースに新しい版が出たら、日報画面を閉じているときに入れ替えて起動し直す。設定で「知らせるだけ」にもできる。メニュー「ヘルプ → 更新を確認」）。exe にアイコン。トレイのメニューと初めての起動でスタートアップに登録・解除\n" +
-            "0.9.0（2026-10-30）作り直すときは、今の日報と作り直した案を Opus で比べて合成する。休憩（12:00〜13:00）の行を日報に残す（日報画面のチェックで外せる）。" +
-            "本文の下の「手で追記」で時刻と内容を入れて追記。出勤・退勤（退勤中は記録と AI を止めて待機。17:30 を過ぎて操作がなければ退勤、8:00 を過ぎて操作があれば出勤）\n" +
-            "0.8.1（2026-10-30）追記のたびに作業が1時間ごとに分かれないよう、続いている工程は終わりの時刻を延ばす（区切るのは休憩と離席だけ）\n" +
-            "0.8.0（2026-10-30）日報を逐次追記する（今日の分は1時間ごと。手で直した行は変えない）。離席メモはすぐ日報に足す。休憩時間（12:00〜13:00）を日報に入れない\n" +
-            "0.7.0（2026-10-30）作業の行に通し番号 [1] [2] … を付ける。「AIで直す」で「3番は…」と指示できる。コピーには番号を入れない\n" +
-            "0.6.0（2026-10-30）離席メモ: 離席から戻ったときに何をしていたか聞く。日報画面の「離席メモ」。日報に時刻つきで入れる\n" +
-            "0.5.0（2026-10-30）「AIで直す」を日報画面の右の欄へ。案は本文に青字で出す。直すときは Opus\n" +
-            "0.4.0（2026-10-30）「AIで直す」を追加。訂正の記録を作り直しにも使う\n" +
-            "0.3.0（2026-10-29）設定画面とメニューバー\n" +
-            "0.2.0（2026-10-29）AI を Claude Code（プランのログイン）で呼ぶ。「AIの接続先」画面\n" +
-            "0.1.0（2026-10-29）PowerShell 版からタスクトレイ常駐の exe に作り替え";        public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
+        public const string Version = "0.10.1";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
         public static readonly string Suffix = Test ? "_test" : "";
@@ -1374,6 +1363,7 @@ namespace WorkLog
     {
         public const string Repo = "sarumogu2013-glitch/AutoNippou";
         public const string Page = "https://github.com/" + Repo + "/releases/latest";
+        public const string Releases = "https://github.com/" + Repo + "/releases";
         public class Release { public string Tag, Version, Notes, Url, ZipName, ZipUrl, Digest; }
 
         static string Dir { get { return Path.Combine(Core.Dir, "update"); } }
@@ -2073,27 +2063,33 @@ namespace WorkLog
 
         static Icon MakeIcon(Color back)
         {
-            using (var bmp = new Bitmap(32, 32))
-            {
-                using (Graphics g = Graphics.FromImage(bmp))
-                using (var path = new GraphicsPath())
-                using (var bg = new SolidBrush(back))
-                using (var f = new Font("Meiryo UI", 20f, FontStyle.Bold, GraphicsUnit.Pixel))
-                using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-                {
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    g.TextRenderingHint = TextRenderingHint.AntiAlias;
-                    int r = 14;
-                    path.AddArc(1, 1, r, r, 180, 90);
-                    path.AddArc(31 - r, 1, r, r, 270, 90);
-                    path.AddArc(31 - r, 31 - r, r, r, 0, 90);
-                    path.AddArc(1, 31 - r, r, r, 90, 90);
-                    path.CloseFigure();
-                    g.FillPath(bg, path);
-                    g.DrawString("報", f, Brushes.White, new RectangleF(0, 1, 32, 32), sf);
-                }
+            using (Bitmap bmp = Logo(32, back))
                 return Icon.FromHandle(bmp.GetHicon());
+        }
+
+        // アイコンの絵（角の丸い四角に白の「報」）。size は 32 を基準に拡大する
+        public static Bitmap Logo(int size, Color back)
+        {
+            var bmp = new Bitmap(size, size);
+            float k = size / 32f;
+            using (Graphics g = Graphics.FromImage(bmp))
+            using (var path = new GraphicsPath())
+            using (var bg = new SolidBrush(back))
+            using (var f = new Font("Meiryo UI", 20f * k, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = TextRenderingHint.AntiAlias;
+                float r = 14 * k, a = 1 * k, b = 31 * k;
+                path.AddArc(a, a, r, r, 180, 90);
+                path.AddArc(b - r, a, r, r, 270, 90);
+                path.AddArc(b - r, b - r, r, r, 0, 90);
+                path.AddArc(a, b - r, r, r, 90, 90);
+                path.CloseFigure();
+                g.FillPath(bg, path);
+                g.DrawString("報", f, Brushes.White, new RectangleF(0, k, size, size), sf);
             }
+            return bmp;
         }
     }
 
@@ -2646,13 +2642,7 @@ namespace WorkLog
 
         void ShowAbout()
         {
-            MessageBox.Show(this,
-                "作業ログ・日報　バージョン " + Core.Version + (Core.Test ? "（テスト）" : "") + "\n" +
-                "このソフトは AI（Anthropic の Claude）が作成しました。無保証です。\n\n" +
-                "実行ファイル: " + Application.ExecutablePath + "\n" +
-                "保存先: " + Core.Dir + "\n\n" +
-                "更新履歴:\n" + Core.History,
-                "バージョン情報", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            using (var f = new AboutForm(Icon)) f.ShowDialog(this);
         }
 
         static ToolStripMenuItem TopMenu(MenuStrip menu, string label)        {
@@ -3138,6 +3128,49 @@ namespace WorkLog
     }
 
     // 設定画面: settings.ini のすべての項目と、Windows 起動時の自動起動
+    // バージョン情報: 名前と版だけを真ん中に出す。変わったところは GitHub のリリース（CHANGELOG.md）で見る
+    class AboutForm : Form
+    {
+        public AboutForm(Icon icon)
+        {
+            Text = "バージョン情報";
+            Icon = icon;
+            AutoScaleDimensions = new SizeF(96f, 96f);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            Font = new Font("Meiryo UI", 10f);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            BackColor = SystemColors.Window;
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            Padding = new Padding(0, 0, 40, 20);
+
+            var t = new TableLayoutPanel { ColumnCount = 1, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Location = new Point(40, 24) };
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            int px;
+            using (Graphics g = CreateGraphics()) px = (int)Math.Round(64 * g.DpiX / 96f);
+            var logo = new PictureBox { Image = TrayApp.Logo(px, Color.FromArgb(30, 111, 217)), SizeMode = PictureBoxSizeMode.AutoSize, Margin = new Padding(3, 3, 3, 12) };
+            var name = new Label { Text = "作業ログ・日報", AutoSize = true, Font = new Font(Font.FontFamily, 15f, FontStyle.Bold) };
+            var ver = new Label { Text = "バージョン " + Core.Version + (Core.Test ? "（テスト）" : ""), AutoSize = true, Margin = new Padding(3, 4, 3, 14) };
+            var ai = new Label { Text = "AI（Anthropic の Claude）が作成したソフトウェアです。無保証です。", AutoSize = true, ForeColor = Color.DimGray };
+            var link = new LinkLabel { Text = "更新履歴（GitHub のリリース）", AutoSize = true, Margin = new Padding(3, 8, 3, 18) };
+            link.LinkClicked += (o, e) => { try { Process.Start(Updater.Releases); } catch (Exception ex) { Core.Error("リンク", ex.Message); } };
+            var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, AutoSize = true, MinimumSize = new Size(96, 0) };
+            foreach (Control c in new Control[] { logo, name, ver, ai, link, ok })
+            {
+                c.Anchor = AnchorStyles.None;   // 列の真ん中に置く
+                t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                t.Controls.Add(c, 0, t.RowCount++);
+            }
+            Controls.Add(t);
+            AcceptButton = ok;
+            CancelButton = ok;
+        }
+    }
+
     class SettingsForm : Form
     {
         static readonly string[] Models = { "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5" };
@@ -3234,6 +3267,10 @@ namespace WorkLog
                                              "\r\nexe を別の場所へ動かしたら、いったん外してから付け直してください" +
                                              "\r\nトレイのアイコンを右クリックしたメニューでも登録・解除できます"));
             Add(t, Auto(), autoUpdate);
+            var folder = new Button { Text = "保存フォルダを開く", AutoSize = true, Margin = new Padding(3, 16, 3, 3) };
+            folder.Click += (o, e) => { try { Process.Start("explorer.exe", "\"" + Core.Dir + "\""); } catch (Exception ex) { Fail("開けませんでした: " + ex.Message); } };
+            Add(t, Auto(), folder);
+            Add(t, Auto(), Hint("作業の記録・日報・設定・エラーの記録を保存しているフォルダです"));
             Add(t, Auto(), Hint("12時間ごとに GitHub のリリースを確かめます。新しい版は、日報画面を閉じているときに入れ替えて起動し直します" +
                                 "\r\n（記録・日報・設定はそのまま）。いつでも日報画面のメニュー「ヘルプ → 更新を確認」で確かめられます"));
 
@@ -3580,6 +3617,25 @@ namespace WorkLog
                     return res.All(r => r.Ok) ? 0 : 1;
                 }
                 catch (Exception ex) { Core.Error("日報", ex.ToString()); return 2; }
+            }
+
+            // テスト用: バージョン情報の画面を画像にして終わる（見た目の確認）
+            if (args.Length >= 2 && args[0] == "--screenshot-about" && Core.Test)
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                using (var f = new AboutForm(SystemIcons.Application))
+                {
+                    f.StartPosition = FormStartPosition.CenterScreen;
+                    f.Show();
+                    Application.DoEvents();
+                    using (var bmp = new Bitmap(f.Width, f.Height))
+                    {
+                        f.DrawToBitmap(bmp, new Rectangle(0, 0, f.Width, f.Height));
+                        bmp.Save(args[1], System.Drawing.Imaging.ImageFormat.Png);
+                    }
+                }
+                return 0;
             }
 
             // テスト用: 更新を確かめて落とす（--apply で入れ替えて新しい exe を起動する）

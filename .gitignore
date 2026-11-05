@@ -1,0 +1,5 @@
+# テスト用の作業フォルダ・利用者のコピー・ビルドしたもの
+_work/
+WorkLogTray - コピー/
+*.exe
+*.code-workspace

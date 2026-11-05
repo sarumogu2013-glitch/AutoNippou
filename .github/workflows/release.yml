@@ -9,9 +9,9 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-    paths: ['WorkLogTray/**', 'dist/**', 'LICENSE', '.github/workflows/release.yml']
+    paths: ['WorkLogTray/**', 'dist/**', 'LICENSE', 'CHANGELOG.md', '.github/**']
   pull_request:
-    paths: ['WorkLogTray/**', 'dist/**', 'LICENSE', '.github/workflows/release.yml']
+    paths: ['WorkLogTray/**', 'dist/**', 'LICENSE', 'CHANGELOG.md', '.github/**']
   workflow_dispatch:
 
 permissions:
@@ -77,6 +77,28 @@ jobs:
           Get-Process WorkLog -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$app*" } | Stop-Process -Force
           Write-Host "OK: 0.0.1 → $v に入れ替わった"
 
+      # バージョン情報の画面を画像にして残す（見た目の確認用）
+      - name: Screenshot about
+        shell: pwsh
+        run: |
+          $env:WORKLOG_TEST = Join-Path $env:RUNNER_TEMP 'shot'
+          $p = Start-Process WorkLogTray/WorkLog.exe -ArgumentList '--screenshot-about', (Join-Path $env:RUNNER_TEMP 'about.png') -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(60000)) { throw '終わらない' }
+          if ($p.ExitCode -ne 0) { throw "失敗（$($p.ExitCode)）" }
+          # 成果物を落とせない環境でも見られるよう、ログにも出す
+          Write-Host ("ABOUT_PNG_BASE64:" + [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $env:RUNNER_TEMP 'about.png'))))
+
+      - name: Upload screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: about-screenshot
+          path: ${{ runner.temp }}/about.png
+
+      - name: Release notes
+        shell: pwsh
+        run: ./.github/scripts/notes.ps1 -Version '${{ steps.ver.outputs.ver }}' -Out notes.md
+
       - name: Make zip
         shell: pwsh
         run: |
@@ -103,16 +125,28 @@ jobs:
         run: |
           $tag = '${{ steps.ver.outputs.tag }}'
           $zip = "WorkLog-${{ steps.ver.outputs.ver }}.zip"
-          $notes = "WorkLog ${{ steps.ver.outputs.ver }}`n`n" +
-            "> [!IMPORTANT]`n> このソフトは AI（Anthropic の Claude / Claude Code）が作成したソフトウェアです。無保証です。`n`n" +
-            "- 初めて入れるとき: $zip を展開し、中の「インストール手順.txt」をご覧ください`n" +
-            "- 0.10.0 以降を使っているとき: 自動で更新されます（日報画面のメニュー「ヘルプ → 更新を確認」ですぐ確かめられます）"
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             if ('${{ github.ref_type }}' -eq 'branch' -and '${{ github.event_name }}' -eq 'push') {
               Write-Host "$tag のリリースはもうあるので何もしません（版を上げるとリリースされます）"
             } else { gh release upload $tag $zip --clobber }
           } else {
-            gh release create $tag $zip --target '${{ github.sha }}' --title "WorkLog ${{ steps.ver.outputs.ver }}" --notes $notes
+            gh release create $tag $zip --target '${{ github.sha }}' --title "WorkLog ${{ steps.ver.outputs.ver }}" --notes-file notes.md
           }
           $global:LASTEXITCODE = $LASTEXITCODE
+
+      # 更新履歴は GitHub のリリースで見るので、CHANGELOG.md に節のある版はリリースノートをそろえる
+      - name: Sync release notes
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          foreach ($tag in (gh release list --limit 100 --json tagName --jq '.[].tagName')) {
+            ./.github/scripts/notes.ps1 -Version $tag.TrimStart('v') -Out "notes-$tag.md" 2>$null
+            if ($LASTEXITCODE -ne 0) { Write-Host "${tag}: CHANGELOG.md に節がないのでそのまま"; continue }
+            gh release edit $tag --notes-file "notes-$tag.md"
+            if ($LASTEXITCODE -ne 0) { throw "$tag のノートを直せませんでした" }
+            Write-Host "${tag}: ノートを CHANGELOG.md に合わせました"
+          }
+          $global:LASTEXITCODE = 0

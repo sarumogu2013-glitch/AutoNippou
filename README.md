@@ -45,6 +45,7 @@ PC の前面ウィンドウを低負荷で記録し、Claude Code（Pro プラ�
 
 - ソース: `WorkLogTray/WorkLog.cs`（C# 5・WinForms）。アイコン: `WorkLogTray/WorkLog.ico`
 - ビルド: `WorkLogTray/build.ps1`（Windows 標準の .NET Framework 4.x の csc.exe。追加インストール不要）
-- リリース: `WorkLog.cs` の `Core.Version` を上げて main にマージすると、GitHub Actions がビルド・自動アップデートの動作確認をして、zip をリリースに載せる（`.github/workflows/release.yml`）
+- 更新履歴: [CHANGELOG.md](CHANGELOG.md)（各版のリリースのノートにもなる）
+- リリース: `WorkLog.cs` の `Core.Version` を上げ、`CHANGELOG.md` にその版の節を書いて main にマージすると、GitHub Actions がビルド・自動アップデートの動作確認をして、zip をリリースに載せる（`.github/workflows/release.yml`）
 - 詳しい仕様・決まり・確認の記録: `引き継ぎ.md`
 - `worklog_*.ps1` は作り替える前の PowerShell 版

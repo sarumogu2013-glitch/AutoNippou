@@ -86,6 +86,8 @@ jobs:
           $null = $p.Handle
           if (-not $p.WaitForExit(60000)) { throw '終わらない' }
           if ($p.ExitCode -ne 0) { throw "失敗（$($p.ExitCode)）" }
+          # 成果物を落とせない環境でも見られるよう、ログにも出す
+          Write-Host ("ABOUT_PNG_BASE64:" + [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $env:RUNNER_TEMP 'about.png'))))
 
       - name: Upload screenshot
         uses: actions/upload-artifact@v4

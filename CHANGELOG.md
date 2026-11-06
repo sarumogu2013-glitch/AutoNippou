@@ -2,6 +2,13 @@
 
 各版のリリース: https://github.com/sarumogu2013-glitch/AutoNippou/releases
 
+## 0.13.2（2026-11-06）
+
+- Claude デスクトップアプリだけの PC で AI（Claude Code）が見つからなかったのを直した
+  - PATH にあるデスクトップアプリ本体（ストア版の起動用の別名 WindowsApps\Claude.exe など）を Claude Code と取り違えないようにした
+  - デスクトップアプリの中を探す場所を増やした（%APPDATA% と %LOCALAPPDATA% の Claude\claude-code・Claude-3p\claude-code、版の下のビルドごとのフォルダ、ストア版の Packages の中）
+- 見つからないときは「AIの接続先」に、探した場所と次にすることを出す
+
 ## 0.13.1（2026-11-06）
 
 - 日報画面の帯の文字が重なって見にくかったのを直した。AI の状態・合計・帯・時刻・凡例を、文字の高さを測って上から順に並べる。時刻は重ならない間隔で間引き、凡例は入りきらなければ折り返す。帯の高さは中身に合わせる

@@ -1,0 +1,30 @@
+name: 要望・不具合
+description: アプリの日報画面の「要望」タブから送られる要望・不具合・質問
+title: "[要望] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        アプリの「要望」タブから開いたときは、書いた内容がもう入っています。確かめて「Create」を押してください。
+        ここに書いた内容は誰でも見られます。社名や日報の中身など、見られて困ることは書かないでください。
+  - type: input
+    id: name
+    attributes:
+      label: 名前（表示名）
+      description: 空でもかまいません
+  - type: input
+    id: kind
+    attributes:
+      label: 種類
+      description: 要望・不具合・質問・その他
+  - type: textarea
+    id: details
+    attributes:
+      label: 内容
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: アプリと Windows の版

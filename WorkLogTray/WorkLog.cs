@@ -11,6 +11,7 @@
 //   --auto               未作成の日報をまとめて作って終了（画面なし）
 //   --updated <pid>      自動アップデートで起動された（前の版の終了を待ってから常駐する）
 //   --screenshot-about <png>  テスト中だけ: バージョン情報の画面を画像にして終わる
+//   --selftest           テスト中だけ: 日報の書式を直す処理を確かめる（0=期待どおり 1=違う）
 //   --check-update [--apply]  テスト中（WORKLOG_TEST）だけ: 更新を確かめて落とす（--apply で入れ替えも）。0=最新 10=更新あり 2=失敗
 // 動作確認用の環境変数: WORKLOG_TEST=保存先フォルダ（二重起動防止を本番と分け、スタートアップ登録を無効にする）
 using System;
@@ -44,7 +45,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.10.1";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.11.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -103,6 +104,7 @@ namespace WorkLog
         public TimeSpan WorkStart = new TimeSpan(8, 0, 0);   // 退勤中でも、この時刻を過ぎて操作があれば出勤とみなす
         public int OffIdleMinutes = 30;  // ReportTime を過ぎて、操作がこの分数なかったら退勤とみなす（0 で自動で退勤しない）
         public bool AutoUpdate = true;   // 新しい版が出たら自動で入れ替える（false は知らせるだけ）
+        public string UserName = "";     // 要望を送るときの名前（日報画面の「要望」タブで入れる）
 
         public bool HasBreak { get { return BreakEnd > BreakStart; } }
         public string BreakText { get { return BreakStart.ToString(@"hh\:mm") + "〜" + BreakEnd.ToString(@"hh\:mm"); } }
@@ -134,6 +136,7 @@ namespace WorkLog
             add("退勤中（待機）でも、この時刻を過ぎて操作があれば出勤とみなす", "WorkStart", WorkStart.ToString(@"hh\:mm"));
             add("ReportTime を過ぎて、操作がこの分数なかったら退勤とみなす（0 で自動で退勤しない）", "OffIdleMinutes", OffIdleMinutes.ToString());
             add("新しい版が出たら自動で更新する（1=自動で更新 0=知らせるだけ）", "AutoUpdate", AutoUpdate ? "1" : "0");
+            add("要望を送るときの名前（日報画面の「要望」タブで入れる）", "UserName", UserName);
             return b.ToString();
         }
 
@@ -151,6 +154,17 @@ namespace WorkLog
                 Core.WriteText(FilePath, s.ToText());
                 cache = null;
             }
+        }
+
+        // 要望の名前だけを書き換える（ほかの項目は settings.ini のまま）
+        public static void SetUserName(string name)
+        {
+            name = (name ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+            Settings s;
+            lock (cacheLock) s = Parse(File.Exists(FilePath) ? Core.ReadText(FilePath) : "");
+            if (s.UserName == name) return;
+            s.UserName = name;
+            Save(s);
         }
 
         public static Settings Get()
@@ -218,6 +232,7 @@ namespace WorkLog
                         case "WorkStart": s.WorkStart = TimeSpan.Parse(v); break;
                         case "OffIdleMinutes": s.OffIdleMinutes = int.Parse(v); break;
                         case "AutoUpdate": s.AutoUpdate = v == "1" || v.ToLower() == "true"; break;
+                        case "UserName": s.UserName = v; break;
                         case "Break":
                             if (v.Length == 0) s.BreakStart = s.BreakEnd = TimeSpan.Zero;
                             else { string[] b = v.Split('-'); s.BreakStart = TimeSpan.Parse(b[0].Trim()); s.BreakEnd = TimeSpan.Parse(b[1].Trim()); }
@@ -753,7 +768,7 @@ namespace WorkLog
             else if (File.Exists(p)) File.Delete(p);
         }
 
-        // 1日分の日報を作る。日報がもうあるとき（手で直した行・離席メモ・手で足した作業）は、作り直した案と Opus で比べて合成する
+        // 1日分の日報を作る。日報がもうあるときは、今ある行を変えずに書式の正しくない行だけ直し、作業ログにしかない作業を足す（Combine）
         public static Result Make(string date, Settings s)
         {
             var r = new Result { Date = date };
@@ -783,7 +798,8 @@ namespace WorkLog
             string header = Header(date, active);
             string path = Core.ReportPath(date);
             string existing = File.Exists(path) ? Core.ReadText(path) : "";
-            bool merge = existing.Contains("■");
+            // 日報がある（AI に失敗したときの案内だけの日は、日報がないものとして作る）
+            bool merge = existing.Contains("■") && !existing.Contains("急ぐときは下の文を Claude に貼ってください");
 
             string body;
             try
@@ -825,42 +841,140 @@ namespace WorkLog
             return r;
         }
 
-        // 今の日報（A）と作り直した案（B）を Opus で合成する。B は old フォルダに残す（A は書き換えるときに Backup で残る）。合成できなければ今の日報はそのまま
+        // ---- 作り直し（日報がもうあるとき）: 今ある行は一字も変えない。書式の正しくない行だけを正しい形に直し、作業ログにしかない作業を足す ----
+
+        static readonly Regex GoodRange = new Regex(@"^・\d{2}:\d{2}〜\d{2}:\d{2} \S");
+        static readonly Regex GoodLight = new Regex(@"^・\d{2}:\d{2} \S");
+        const string Dash = @"(?:〜|~|-|－|ー|―|–|—|から)";
+        static readonly Regex LooseRange = new Regex(@"^(\d{1,2}):(\d{2})\s*" + Dash + @"\s*(\d{1,2}):(\d{2})\s*(?:まで)?\s*[:、,，]?\s*(.+)$");
+        static readonly Regex LooseLight = new Regex(@"^(\d{1,2}):(\d{2})\s*(?:頃|ごろ)?\s*[:、,，]?\s*(.+)$");
+        static readonly Regex TailRange = new Regex(@"^(.+?)\s*[（(]?\s*(\d{1,2}):(\d{2})\s*" + Dash + @"\s*(\d{1,2}):(\d{2})\s*(?:まで)?\s*[)）]?$");
+        static readonly Regex TailLight = new Regex(@"^(.+?)\s*[（(]?\s*(\d{1,2}):(\d{2})\s*(?:頃|ごろ)?\s*[)）]?$");
+
+        static string Hm(string h, string m)
+        {
+            int a = int.Parse(h), b = int.Parse(m);
+            return a < 24 && b < 60 ? a.ToString("00") + ":" + b.ToString("00") : null;
+        }
+
+        // 1行を「・HH:MM〜HH:MM 作業内容」（range）か「・HH:MM 作業内容」の形にする。時刻が読めなければ null
+        // 直すのは書式（全角の数字、「-」「～」、「13時30分」、行頭の記号、時刻と内容のあいだ）だけで、内容の言葉は変えない
+        public static string FixLine(string line, out bool range)
+        {
+            range = false;
+            var sb = new StringBuilder();
+            foreach (char c in Unnumber(line).Trim())
+                sb.Append(c >= '０' && c <= '９' ? (char)('0' + (c - '０')) : c == '：' ? ':' : c == '～' ? '〜' : c == '　' ? ' ' : c);
+            string t = sb.ToString().Trim();
+            t = Regex.Replace(t, @"^[・\-\*•●○◦·‐－]+\s*", "");
+            t = Regex.Replace(t, @"(\d{1,2})時(\d{1,2})分", m => m.Groups[1].Value + ":" + int.Parse(m.Groups[2].Value).ToString("00"));
+            t = Regex.Replace(t, @"(\d{1,2})時半", "$1:30");
+            t = Regex.Replace(t, @"(\d{1,2})時(?![\d間])", "$1:00");
+            string a = null, b = null, what = null;
+            Match x = LooseRange.Match(t);
+            if (x.Success) { a = Hm(x.Groups[1].Value, x.Groups[2].Value); b = Hm(x.Groups[3].Value, x.Groups[4].Value); what = x.Groups[5].Value; }
+            else if ((x = TailRange.Match(t)).Success) { a = Hm(x.Groups[2].Value, x.Groups[3].Value); b = Hm(x.Groups[4].Value, x.Groups[5].Value); what = x.Groups[1].Value; }
+            else if ((x = LooseLight.Match(t)).Success) { a = Hm(x.Groups[1].Value, x.Groups[2].Value); what = x.Groups[3].Value; }
+            else if ((x = TailLight.Match(t)).Success) { a = Hm(x.Groups[2].Value, x.Groups[3].Value); what = x.Groups[1].Value; }
+            if (what == null || a == null) return null;
+            what = what.Trim().TrimStart(':', '、', ',', '，', ' ').Trim();
+            if (what.Length == 0) return null;
+            if (b != null)
+            {
+                if (Clock(b) <= Clock(a)) return null;
+                range = true;
+                return "・" + a + "〜" + b + " " + what;
+            }
+            return "・" + a + " " + what;
+        }
+
+        // 今の日報の本文（番号・見出しの日付行なし）の書式を直す。正しい行はそのまま残し、直した行は時刻の位置へ入れ直す。
+        // プログラムで直せない行（時刻がないなど）は bad に入れ、その場所に印（\u0001番号）を置く
+        public static List<string> FormatFix(List<string> body, List<string> bad, out int fixedCount)
+        {
+            var lines = new List<string>();
+            var moved = new List<KeyValuePair<bool, string>>();
+            string section = null;   // 工程・軽作業・他（知らない見出し）・null（見出しの前）
+            fixedCount = 0;
+            foreach (string raw in body)
+            {
+                string l = raw.Trim();
+                if (l.Length == 0) { lines.Add(""); continue; }
+                if (l.StartsWith("■"))
+                {
+                    string h = l == "■工程" || l == "■軽作業" ? l : l.Contains("軽作業") ? "■軽作業" : l.Contains("工程") ? "■工程" : l;
+                    if (h != l) fixedCount++;
+                    section = h == "■軽作業" ? "軽作業" : h == "■工程" ? "工程" : "他";
+                    lines.Add(h);
+                    continue;
+                }
+                if (section == "他" || l == "・なし" ||
+                    (section == "工程" && GoodRange.IsMatch(l)) || (section == "軽作業" && GoodLight.IsMatch(l))) { lines.Add(l); continue; }
+                bool range;
+                string f = FixLine(l, out range);
+                if (f != null) { moved.Add(new KeyValuePair<bool, string>(!range, f)); fixedCount++; }
+                else { bad.Add(l); lines.Add("\u0001" + bad.Count); }
+            }
+            foreach (var m in moved)
+                if (!lines.Any(x => x == m.Value)) InsertItem(lines, m.Key, m.Value);
+            return lines;
+        }
+
+        static IEnumerable<KeyValuePair<TimeSpan, TimeSpan>> Ranges(List<string> lines)
+        {
+            foreach (string l in lines)
+            {
+                Match m = RangeRe.Match(Unnumber(l).Trim());
+                if (m.Success) yield return new KeyValuePair<TimeSpan, TimeSpan>(Clock(m.Groups[1].Value), Clock(m.Groups[2].Value));
+            }
+        }
+
+        // 足す作業が今の日報と重ならないか（工程は時間が重なる、軽作業は同じ行か10分以内の軽作業がある）
+        static bool Clashes(List<string> lines, string item, bool light)
+        {
+            if (lines.Any(x => Unnumber(x).Trim() == item)) return true;
+            if (light)
+            {
+                TimeSpan t = ItemTime(item);
+                return lines.Select(x => Unnumber(x).Trim()).Where(x => LightRe.IsMatch(x))
+                    .Any(x => Math.Abs((ItemTime(x) - t).TotalMinutes) <= 10);
+            }
+            Match m = RangeRe.Match(item);
+            TimeSpan a = Clock(m.Groups[1].Value), b = Clock(m.Groups[2].Value);
+            return Ranges(lines).Any(r => a < r.Value && r.Key < b);
+        }
+
+        // 今の日報（A）と作り直した案（B）から作り直す。A の行は変えず、書式の正しくない行だけ直して、B にだけある作業を足す。
+        // B は old フォルダに残す（A は書き換えるときに Backup で残る）。うまくいかなければ今の日報はそのまま
         static Result Combine(string date, Settings s, Result r, string existing, string header, string body, List<Row> active)
         {
             string path = Core.ReportPath(date);
             SaveOld(date, "作り直し", header + "\r\n\r\n" + body.Trim() + "\r\n");
-            // 一字も変えずに残してほしい行: 離席メモ・手で足した作業・休憩（今の日報にあるものだけ）
-            var keep = new List<string>(Afk.Load(date).Select(e => e.Line).Where(x => x.Length > 0));
-            keep.AddRange(LoadManual(date).Select(x => x.Value));
-            if (BreakOn(date, s)) keep.Add(BreakLine(s));
-            List<string> now = SplitLines(existing).Select(l => Unnumber(l).Trim()).ToList();
-            keep = keep.Where(k => now.Contains(k)).Distinct().ToList();
+            var bad = new List<string>();
+            int fixedCount;
+            List<string> lines = FormatFix(SplitLines(Unnumber(StripHeader(existing))), bad, out fixedCount);
+            string a = string.Join("\n", lines.Where(l => !l.StartsWith("\u0001"))).Trim();
 
             string prompt =
-                "同じ日の日報が2つあります。2つを比べて、1つの日報に合成してください。\n" +
-                "A: 今の日報。利用者が手で直した行、PC から離れていたときの作業、手で足した作業が入っている\n" +
-                "B: 作業ログから今あらためて作った日報\n\n" +
-                "条件:\n" +
-                "- A の行は利用者が確かめた内容なので、文言を変えずに残す。B にない作業も消さない（PC の外の作業のことがある）\n" +
-                "- B にだけある作業は足す\n" +
-                "- 同じ作業が A と B の両方にあるときは1行にまとめ、文言は A のまま。時刻は、A の時刻が作業ログと明らかに食い違うときだけ作業ログに合わせる\n" +
-                "- 工程の時間が重ならないようにする（重なるときは A を優先し、B の行を省くか時刻を縮める）\n" +
-                (keep.Count > 0 ? "- 次の行は一字も変えずに残す:\n" + string.Concat(keep.Select(k => "  " + k + "\n")) : "") +
-                BreakRule(s, date) +
-                "- 形は「■工程」の下に「・HH:MM〜HH:MM 作業内容」、「■軽作業」の下に「・HH:MM 作業内容」、それぞれ時刻の早い順。行頭の [番号] は付けない\n" +
-                "- 出力は合成した日報の本文だけ（前置き・説明・見出しの日付行は不要）\n\n" +
-                NotesPrompt(date) +
-                "A（今の日報）:\n" + Unnumber(StripHeader(existing)) + "\n\n" +
+                "同じ日の日報が2つあります。A は利用者が確かめた今の日報、B は作業ログから今あらためて作った日報です。\n" +
+                "A の行は変えません。次のものだけを出力してください（前置き・説明は不要）。\n" +
+                (bad.Count > 0
+                    ? "- 「■書式を直した行」: 下の「書式が正しくない行」を、番号ごとに正しい形の1行にしたもの。言葉はできるだけそのまま使い、" +
+                      "時刻が書かれていなければ作業ログから推定する。時間の幅のある作業は「・HH:MM〜HH:MM 作業内容」、短い作業は「・HH:MM 作業内容」\n"
+                    : "") +
+                "- 「■工程」「■軽作業」: B にあって A にない作業だけ。A にある作業（同じ作業・同じ時間帯の作業）は書かない。A の行を書き写さない。" +
+                "A の工程と時間が重ならないようにする。足す作業がなければ「・なし」\n\n" +
+                "出力の形:\n" +
+                (bad.Count > 0 ? "■書式を直した行\n1: ・HH:MM〜HH:MM 作業内容\n2: ・HH:MM 作業内容\n" : "") +
+                "■工程\n・HH:MM〜HH:MM 作業内容\n■軽作業\n・HH:MM 作業内容\n\n" +
+                BreakRule(s, date) + NotesPrompt(date) +
+                (bad.Count > 0 ? "書式が正しくない行:\n" + string.Concat(bad.Select((x, i) => (i + 1) + ": " + x + "\n")) + "\n" : "") +
+                "A（今の日報）:\n" + a + "\n\n" +
                 "B（作り直した日報）:\n" + Unnumber(StripHeader(body)) + "\n\n" +
                 "参考: この日の作業ログ（離席時間は除いています）\n" + LogText(active, s);
 
-            string merged;
-            try
-            {
-                merged = StripHeader(ClaudeCli.Ask(prompt, s, date, "（合成）", s.FixModel));
-                if (!SplitLines(merged).Any(l => l.Trim().StartsWith("■"))) throw new Exception("AI が日報の形で返しませんでした");
-            }
+            string answer;
+            try { answer = ClaudeCli.Ask(prompt, s, date, "（作り直し・追加分）", s.FixModel); }
             catch (NeedLoginException ex)
             {
                 r.Ok = false;
@@ -871,30 +985,77 @@ namespace WorkLog
             catch (Exception ex)
             {
                 r.Ok = false;
-                r.Message = "合成できませんでした: " + ex.Message + "。今の日報はそのままです（作り直した案は old フォルダ）";
-                Core.Error("合成 " + date, ex.Message);
+                r.Message = "作り直せませんでした: " + ex.Message + "。今の日報はそのままです（作り直した案は old フォルダ）";
+                Core.Error("作り直し " + date, ex.Message);
                 return r;
+            }
+
+            var corrections = new Dictionary<int, string>();
+            var added = new List<string>();
+            string sec = null;
+            foreach (string raw in SplitLines(answer))
+            {
+                string l = raw.Trim();
+                if (l.StartsWith("■")) { sec = l.Contains("書式") ? "fix" : l.Contains("工程") || l.Contains("軽作業") ? "add" : null; continue; }
+                Match m = Regex.Match(l, @"^(\d+)\s*[:：.．)）]\s*(.+)$");
+                if (sec == "fix" && m.Success) corrections[int.Parse(m.Groups[1].Value)] = m.Groups[2].Value;
+                else if (sec == "add" && Unnumber(l).Trim().StartsWith("・") && Unnumber(l).Trim() != "・なし") added.Add(l);
+            }
+
+            int aiFixed = 0, addedCount = 0;
+            // 書式を直した行: 印を消して時刻の位置へ入れる。直せなかった行は元のまま、元の場所に残す
+            var fixedItems = new List<KeyValuePair<bool, string>>();
+            for (int i = 0; i < lines.Count; i++)
+            {
+                if (!lines[i].StartsWith("\u0001")) continue;
+                int n = int.Parse(lines[i].Substring(1));
+                string c, f = null;
+                bool range = false;
+                if (corrections.TryGetValue(n, out c)) f = FixLine(c, out range);
+                if (f == null) { lines[i] = bad[n - 1]; continue; }
+                fixedItems.Add(new KeyValuePair<bool, string>(!range, f));
+                lines.RemoveAt(i--);
+            }
+            foreach (var it in fixedItems) { InsertItem(lines, it.Key, it.Value); aiFixed++; }
+            foreach (string l in added)
+            {
+                bool range;
+                string f = FixLine(l, out range);
+                if (f == null || Clashes(lines, f, !range)) continue;
+                InsertItem(lines, !range, f);
+                addedCount++;
             }
 
             lock (reportLock)
             {
                 // AI を待つあいだに手で直された・離席メモが足されたときは、上書きせずに案を old に残す
+                List<string> result = SplitLines(header + "\n\n" + string.Join("\n", lines).Trim());
+                EnsureBreak(result, date, s);
+                string text = Number(string.Join("\n", result).TrimEnd() + "\n");
                 if (!File.Exists(path) || Norm(Core.ReadText(path)) != Norm(existing))
                 {
-                    SaveOld(date, "合成", header + "\r\n\r\n" + merged + "\r\n");
+                    SaveOld(date, "作り直し案", text);
                     r.Ok = false;
-                    r.Message = "合成しているあいだに日報が直されたので、今の日報はそのままです（合成した案は old フォルダ）";
+                    r.Message = "作り直しているあいだに日報が直されたので、今の日報はそのままです（作り直した案は old フォルダ）";
                     return r;
                 }
-                Backup(path);
-                List<string> lines = SplitLines(header + "\n\n" + merged);
-                EnsureBreak(lines, date, s);
-                Core.WriteText(path, Number(string.Join("\n", lines).TrimEnd() + "\n"));
+                if (Norm(text) != Norm(existing))
+                {
+                    Backup(path);
+                    Core.WriteText(path, text);
+                }
             }
             ApplyAllAfk(date);
             SaveState(date, active[active.Count - 1].Time, true);
             r.Ok = true;
-            r.Message = "今の日報と作り直した案を合成しました（合成前の2つは old フォルダ）";
+            int fx = fixedCount + aiFixed;
+            var done = new List<string>();
+            if (fx > 0) done.Add("書式を直した行 " + fx + " 件");
+            if (addedCount > 0) done.Add("作業ログにしかなかった作業 " + addedCount + " 件を追加");
+            if (lines.Any(l => bad.Contains(l))) done.Add("直せなかった行はそのまま");
+            r.Message = fx == 0 && addedCount == 0
+                ? "今の日報はそのままです（書式は正しく、足す作業もありませんでした）"
+                : "今の日報の行は変えずに作り直しました: " + string.Join("、", done) + "（前の日報は old フォルダ）";
             return r;
         }
 
@@ -2093,7 +2254,51 @@ namespace WorkLog
         }
     }
 
-    // 時刻の入力欄。4桁（1430）で 14:30。ホイールか ↑↓ で、左半分（時）なら1時間、右半分（分）なら1分ずつ変わる。空なら時刻なし
+    // 要望・不具合の報告: GitHub の Issue の作成画面を、書いた内容を入れた状態でブラウザに開く
+    // （送るには GitHub のアカウントが要る。アカウントなしで送れる窓口はないので、トークンを exe に入れて代わりに送ることはしない）
+    static class Feedback
+    {
+        static string E(string s) { return Uri.EscapeDataString(s ?? ""); }
+
+        static string FirstLine(string text, int max)
+        {
+            string l = (text ?? "").Replace("\r\n", "\n").Split('\n').Select(x => x.Trim()).FirstOrDefault(x => x.Length > 0) ?? "";
+            return l.Length > max ? l.Substring(0, max) + "…" : l;
+        }
+
+        public static string Env() { return "作業ログ・日報 " + Core.Version + " / " + Environment.OSVersion.VersionString; }
+
+        // 作成画面の URL（.github/ISSUE_TEMPLATE/request.yml の欄に入れる）。長すぎるときは内容を途中で切り、truncated を立てる
+        public static string Url(string kind, string name, string body, bool withEnv, out bool truncated)
+        {
+            string title = "[" + kind + "] " + FirstLine(body, 40);
+            string env = withEnv ? Env() : "";
+            string b = body.Trim();
+            truncated = false;
+            Func<string, string> build = text => "https://github.com/" + Updater.Repo + "/issues/new?template=request.yml" +
+                "&title=" + E(title) + "&name=" + E(name) + "&kind=" + E(kind) + "&details=" + E(text) + "&version=" + E(env);
+            string url = build(b);
+            while (url.Length > 7000 && b.Length > 20)
+            {
+                b = b.Substring(0, b.Length * 3 / 4);
+                truncated = true;
+                url = build(b + "…\n\n（長いので途中までです。続きはクリップボードにあるので貼ってください）");
+            }
+            return url;
+        }
+
+        // 送った内容は保存フォルダの「要望」フォルダにも残す
+        public static void SaveCopy(string kind, string name, string body, bool withEnv)
+        {
+            string dir = Path.Combine(Core.Dir, "要望");
+            Directory.CreateDirectory(dir);
+            Core.WriteText(Path.Combine(dir, DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt"),
+                "種類: " + kind + "\r\n名前: " + name + "\r\n" + (withEnv ? "版: " + Env() + "\r\n" : "") + "\r\n" + body.Trim().Replace("\r\n", "\n").Replace("\n", "\r\n") + "\r\n");
+        }
+    }
+
+    // 時刻の入力欄。4桁（1430）で 14:30。ホイールか ↑↓ で、時の上（左側）なら1時間、分の上（右側）なら1分ずつ変わる。
+    // Shift か Ctrl を押しながらのホイールは、どこでも1時間ずつ。空なら時刻なし
     class TimeBox : TextBox
     {
         static readonly Regex Re = new Regex(@"^(\d{1,2}):?(\d{2})$");
@@ -2165,9 +2370,22 @@ namespace WorkLog
             SelectionStart = Math.Min(caret, TextLength);
         }
 
+        // マウスが「時」の上にあるか（「:」より左）。文字の位置がわからなければ欄の左半分
+        bool OverHour()
+        {
+            int x = PointToClient(Cursor.Position).X;
+            if (TextLength == 5)
+            {
+                Point colon = GetPositionFromCharIndex(2);
+                if (colon.X > 0) return x < colon.X + 2;
+            }
+            return x < ClientSize.Width / 2;
+        }
+
         protected override void OnMouseWheel(MouseEventArgs e)
         {
-            Step(e.Delta > 0 ? 1 : -1, e.X < ClientSize.Width / 2);
+            bool hour = (ModifierKeys & (Keys.Shift | Keys.Control)) != 0 || OverHour();
+            Step(e.Delta > 0 ? 1 : -1, hour);
             var h = e as HandledMouseEventArgs;
             if (h != null) h.Handled = true;
         }
@@ -2176,7 +2394,7 @@ namespace WorkLog
         {
             if (e.KeyCode == Keys.Up || e.KeyCode == Keys.Down)
             {
-                Step(e.KeyCode == Keys.Up ? 1 : -1, Text.Length == 5 && SelectionStart <= 2);
+                Step(e.KeyCode == Keys.Up ? 1 : -1, e.Shift || e.Control || (Text.Length == 5 && SelectionStart <= 2));
                 e.Handled = e.SuppressKeyPress = true;
                 return;
             }
@@ -2220,7 +2438,13 @@ namespace WorkLog
         readonly TextBox notes = new TextBox { Multiline = true, AcceptsReturn = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill };
 
         // 「離席メモ」欄
-        readonly TabPage aiPage = new TabPage("AIで直す"), afkPage = new TabPage("離席メモ");
+        readonly TabPage aiPage = new TabPage("AIで直す"), afkPage = new TabPage("離席メモ"), reqPage = new TabPage("要望");
+        readonly TextBox reqName = new TextBox { Dock = DockStyle.Fill, MaxLength = 50 };
+        readonly ComboBox reqKind = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 140 };
+        readonly TextBox reqText = new TextBox { Multiline = true, AcceptsReturn = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill };
+        readonly CheckBox reqEnv = new CheckBox { Text = "アプリの版と Windows の版を添える", AutoSize = true, Checked = true, Margin = new Padding(3, 6, 3, 2) };
+        readonly Button reqSend = new Button { Text = "GitHub に送る（ブラウザが開きます）", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8, 2, 8, 2), Margin = new Padding(3, 6, 3, 3) };
+        readonly Label reqStatus = new Label { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 3) };
         readonly Label afkHead = new Label { AutoSize = true, Margin = new Padding(3, 6, 3, 4) };
         readonly DataGridView afkGrid = new DataGridView();
         readonly TextBox freeMemo = new TextBox { Multiline = true, AcceptsReturn = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill };
@@ -2371,10 +2595,60 @@ namespace WorkLog
             var tabs = new TabControl { Dock = DockStyle.Right, Width = W + 22 };
             aiPage.Controls.Add(BuildAiPanel());
             afkPage.Controls.Add(BuildAfkPanel());
-            aiPage.BackColor = afkPage.BackColor = PanelBack;
+            reqPage.Controls.Add(BuildRequestPanel());
+            aiPage.BackColor = afkPage.BackColor = reqPage.BackColor = PanelBack;
             tabs.TabPages.Add(aiPage);
             tabs.TabPages.Add(afkPage);
+            tabs.TabPages.Add(reqPage);
             return tabs;
+        }
+
+        // 右の欄のタブ「要望」: 名前・種類・内容を書いて、GitHub の Issue の作成画面を開く
+        Control BuildRequestPanel()
+        {
+            var p = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(4, 2, 2, 2), BackColor = PanelBack };
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            Func<string, Label> lbl = t => new Label { Text = t, AutoSize = true, MaximumSize = new Size(W - 16, 0), Margin = new Padding(3, 8, 3, 2) };
+            var title = new Label { Text = "要望・不具合を送る", AutoSize = true, Font = new Font(Font, FontStyle.Bold), Margin = new Padding(3, 6, 3, 2) };
+            var hint = new Label
+            {
+                AutoSize = true, MaximumSize = new Size(W - 16, 0), ForeColor = Color.DimGray, Margin = new Padding(3, 0, 3, 2),
+                Text = "このソフトの GitHub のページ（Issues）に送ります。ブラウザで作成画面が開くので、内容を確かめて「Create」を押してください。" +
+                       "送るには GitHub のアカウント（無料）が要ります。\n送った内容は誰でも見られます。社名や日報の中身など、見られて困ることは書かないでください。"
+            };
+            foreach (string k in new[] { "要望", "不具合", "質問", "その他" }) reqKind.Items.Add(k);
+            reqKind.SelectedIndex = 0;
+            reqName.Text = Settings.Get().UserName;
+            reqText.TextChanged += (o, e) => reqSend.Enabled = reqText.Text.Trim().Length > 0;
+            reqSend.Enabled = false;
+            reqSend.Font = new Font(Font, FontStyle.Bold);
+            reqSend.Click += (o, e) => SendRequest();
+            reqStatus.MaximumSize = new Size(W - 16, 0);
+            Control[] rows = { title, hint, lbl("名前（GitHub に出す表示名。空でもよい）"), reqName, lbl("種類"), reqKind, lbl("内容"), reqText, reqEnv, reqSend, reqStatus };
+            foreach (Control c in rows)
+            {
+                p.RowStyles.Add(c == reqText ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.AutoSize));
+                p.Controls.Add(c, 0, p.RowCount++);
+            }
+            return p;
+        }
+
+        void SendRequest()
+        {
+            string body = reqText.Text.Trim(), name = reqName.Text.Trim(), kind = reqKind.Text;
+            if (body.Length == 0) { reqStatus.Text = "内容を書いてください"; reqText.Focus(); return; }
+            try { Settings.SetUserName(name); } catch (Exception ex) { Core.Error("要望", "名前を保存できません: " + ex.Message); }
+            try { Feedback.SaveCopy(kind, name, body, reqEnv.Checked); } catch (Exception ex) { Core.Error("要望", "写しを保存できません: " + ex.Message); }
+            bool truncated;
+            string url = Feedback.Url(kind, name, body, reqEnv.Checked, out truncated);
+            if (truncated) { try { Clipboard.SetText(body); } catch { } }
+            try { Process.Start(url); }
+            catch (Exception ex) { reqStatus.ForeColor = Color.Firebrick; reqStatus.Text = "ブラウザを開けませんでした: " + ex.Message; return; }
+            reqStatus.ForeColor = Color.DimGray;
+            reqStatus.Text = "ブラウザで GitHub の作成画面を開きました。「Create」を押すと送られます" +
+                             (truncated ? "（長いので途中までを入れました。続きはクリップボードにあります）" : "") +
+                             "。書いた内容は保存フォルダの「要望」フォルダにも残しました";
+            reqText.Text = "";
         }
 
         // 本文の下: 開始・終了の時刻と内容を入れて「追記」。開始だけなら軽作業。右端はその日の休憩
@@ -2402,10 +2676,10 @@ namespace WorkLog
             row.Controls.Add(lbl("終了"));
             row.Controls.Add(endBox);
             row.Controls.Add(now(endBox));
-            Label hint = lbl("4桁かホイールで時刻を変更。開始だけなら軽作業");
+            Label hint = lbl("4桁かホイールで時刻を変更（時の上か Shift+ホイールで1時間、分の上で1分）。開始だけなら軽作業");
             hint.ForeColor = Color.DimGray;
             row.Controls.Add(hint);
-            string boxTip = "4桁で入力（1430 → 14:30）。ホイールか ↑↓ で、左側なら時、右側なら分が変わります";
+            string boxTip = "4桁で入力（1430 → 14:30）。\nホイールか ↑↓ で、時の上（左側）なら1時間、分の上（右側）なら1分ずつ変わります。\nShift か Ctrl を押しながらホイールを回すと、どこでも1時間ずつ変わります";
             tip.SetToolTip(startBox, boxTip);
             tip.SetToolTip(endBox, boxTip);
             tip.SetToolTip(breakCheck, "印を外すと、この日は休憩なし（休憩の時間の操作も日報に入れ、休憩の行を消す）");
@@ -3417,6 +3691,7 @@ namespace WorkLog
                 WorkStart = new TimeSpan(workStart.Value.Hour, workStart.Value.Minute, 0),
                 OffIdleMinutes = (int)offIdle.Value,
                 AutoUpdate = autoUpdate.Checked,
+                UserName = Settings.Get().UserName,
                 BreakStart = breakOn.Checked ? breakStart.Value.TimeOfDay - TimeSpan.FromSeconds(breakStart.Value.Second) : TimeSpan.Zero,
                 BreakEnd = breakOn.Checked ? breakEnd.Value.TimeOfDay - TimeSpan.FromSeconds(breakEnd.Value.Second) : TimeSpan.Zero
             };
@@ -3594,6 +3869,54 @@ namespace WorkLog
         }
     }
 
+    // 動作確認（--selftest）: 作り直しで書式を直す処理を、決めた例で確かめる
+    static class SelfTest
+    {
+        public static int Run()
+        {
+            var log = new StringBuilder();
+            int ng = 0;
+            Action<string, string, string> eq = (what, got, want) =>
+            {
+                bool ok = got == want;
+                if (!ok) ng++;
+                log.Append((ok ? "OK " : "NG ") + what + " => " + (got ?? "(null)") + (ok ? "" : "  期待: " + (want ?? "(null)")) + "\r\n");
+            };
+            var cases = new[]
+            {
+                new[] { "・09:00〜10:30 A工区の数量計算", "・09:00〜10:30 A工区の数量計算" },
+                new[] { "9:00-10:30 B地区の協議資料", "・09:00〜10:30 B地区の協議資料" },
+                new[] { "・１３：００～１４：００ 打合せ", "・13:00〜14:00 打合せ" },
+                new[] { "13時30分 電話対応", "・13:30 電話対応" },
+                new[] { "メール対応 15:10", "・15:10 メール対応" },
+                new[] { "10時半から11時まで 社内会議", "・10:30〜11:00 社内会議" },
+                new[] { "・[3] 16:00 日報の確認", "・16:00 日報の確認" },
+                new[] { "- 8:05 朝礼", "・08:05 朝礼" },
+                new[] { "・現場の写真整理", null },
+                new[] { "1時間ほど資料作成", null },
+                new[] { "・14:00〜13:00 時刻が逆", null },
+            };
+            foreach (string[] c in cases)
+            {
+                bool range;
+                eq("FixLine 「" + c[0] + "」", Reporter.FixLine(c[0], out range), c[1]);
+            }
+            var bad = new List<string>();
+            int n;
+            List<string> fixedLines = Reporter.FormatFix(new List<string>
+            {
+                "■工程", "・09:00〜10:30 A工区の数量計算", "11:00-12:00 B地区の協議資料", "■ 軽作業", "・10:40 メール対応", "・13:00〜13:30 打合せ", "・現場の写真整理"
+            }, bad, out n);
+            eq("FormatFix の行", string.Join(" | ", fixedLines.Select(x => x.Replace("\u0001", "#"))),
+               "■工程 | ・09:00〜10:30 A工区の数量計算 | ・11:00〜12:00 B地区の協議資料 | ・13:00〜13:30 打合せ | ■軽作業 | ・10:40 メール対応 | #1");
+            eq("FormatFix の直した数", n.ToString(), "3");
+            eq("FormatFix の直せない行", string.Join(" | ", bad), "・現場の写真整理");
+            log.Append(ng == 0 ? "すべて期待どおり\r\n" : ng + " 件が期待と違う\r\n");
+            Core.WriteText(Path.Combine(Core.Dir, "selftest.log"), log.ToString());
+            return ng == 0 ? 0 : 1;
+        }
+    }
+
     static class Program
     {
         [STAThread]
@@ -3618,6 +3941,9 @@ namespace WorkLog
                 }
                 catch (Exception ex) { Core.Error("日報", ex.ToString()); return 2; }
             }
+
+            // テスト用: 日報の書式を直す処理を確かめる（0=すべて期待どおり 1=違う）。結果は保存先の selftest.log
+            if (args.Length >= 1 && args[0] == "--selftest" && Core.Test) return SelfTest.Run();
 
             // テスト用: バージョン情報の画面を画像にして終わる（見た目の確認）
             if (args.Length >= 2 && args[0] == "--screenshot-about" && Core.Test)

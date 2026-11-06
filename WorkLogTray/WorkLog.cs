@@ -46,7 +46,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.13.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.13.1";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -2555,6 +2555,7 @@ namespace WorkLog
             sum = "作業 " + DayStatus.Span(n[(int)Slot.Work]) + "　AI 休止 " + DayStatus.Span(rest) +
                   (parts.Count > 0 ? "（" + string.Join("・", parts) + "）" : "") + "　AI 呼び出し " + calls.Count + "回";
             head = today && aiState != null ? aiState() : date + " の記録";
+            FitHeight();
             Invalidate();
         }
 
@@ -2567,80 +2568,142 @@ namespace WorkLog
             return dpi;
         }
 
-        Rectangle Bar { get { int pad = Scale(10); return new Rectangle(pad, Scale(28), Math.Max(10, Width - pad * 2), Scale(14)); } }
+        // 行の並び（上から）: AI の状態 / 合計 / ▼の列と帯 / 時刻 / 凡例。文字の高さを測って重ならないように積む
+        Font boldFont, smallFont;
+        Font Bold { get { return boldFont ?? (boldFont = new Font(Font, FontStyle.Bold)); } }
+        Font Small { get { return smallFont ?? (smallFont = new Font(Font.FontFamily, Font.Size * 0.9f)); } }
+        const TextFormatFlags Flags = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
+
+        int Pad { get { return Scale(10); } }
+        int HeadH { get { return TextRenderer.MeasureText("あ", Bold, Size.Empty, Flags).Height; } }
+        int SmallH { get { return TextRenderer.MeasureText("あ", Small, Size.Empty, Flags).Height; } }
+        int SumTop { get { return Scale(6) + HeadH + Scale(2); } }
+        Rectangle Bar { get { return new Rectangle(Pad, SumTop + SmallH + Scale(4) + Scale(9), Math.Max(10, Width - Pad * 2), Scale(16)); } }
+        int HourTop { get { return Bar.Bottom + Scale(4); } }
+        int LegendTop { get { return HourTop + SmallH + Scale(4); } }
+
+        // 凡例の項目（色の四角と名前）を左から並べ、入りきらなければ次の行へ。各項目の位置を返す
+        List<KeyValuePair<Point, int>> LegendLayout(out int lines)
+        {
+            var pos = new List<KeyValuePair<Point, int>>();
+            int x = Pad, y = LegendTop, box = Scale(11), gap = Scale(14);
+            lines = 1;
+            for (int i = 0; i < LegendItems.Length; i++)
+            {
+                int w = box + Scale(4) + TextRenderer.MeasureText(LegendItems[i].Key, Small, Size.Empty, Flags).Width;
+                if (x + w > Width - Pad && x > Pad) { x = Pad; y += SmallH + Scale(3); lines++; }
+                pos.Add(new KeyValuePair<Point, int>(new Point(x, y), i));
+                x += w + gap;
+            }
+            return pos;
+        }
+
+        static readonly KeyValuePair<string, Color>[] LegendItems =
+        {
+            new KeyValuePair<string, Color>("作業（日報の材料）", DayStatus.Colors[(int)Slot.Work]),
+            new KeyValuePair<string, Color>("無操作", DayStatus.Colors[(int)Slot.Idle]),
+            new KeyValuePair<string, Color>("休憩", DayStatus.Colors[(int)Slot.Break]),
+            new KeyValuePair<string, Color>("離席", DayStatus.Colors[(int)Slot.Afk]),
+            new KeyValuePair<string, Color>("退勤", DayStatus.Colors[(int)Slot.Off]),
+            new KeyValuePair<string, Color>("▼ AI を呼んだ時刻", Color.FromArgb(30, 150, 70)),
+        };
+
+        // 中身に合わせて高さを決める（幅が変わると凡例の折り返しが変わる）
+        void FitHeight()
+        {
+            if (!IsHandleCreated || Width <= 0) return;
+            int lines;
+            LegendLayout(out lines);
+            int h = LegendTop + lines * (SmallH + Scale(3)) + Scale(4);
+            if (Height != h) Height = h;
+        }
+
+        protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); FitHeight(); }
+        protected override void OnResize(EventArgs e) { base.OnResize(e); FitHeight(); }
+        protected override void OnFontChanged(EventArgs e) { boldFont = smallFont = null; base.OnFontChanged(e); FitHeight(); }
 
         float X(int minute) { Rectangle b = Bar; return b.Left + (minute - v0) * (float)b.Width / (v1 - v0); }
+
+        static string Fit(string text, Font f, int width)
+        {
+            if (TextRenderer.MeasureText(text, f, Size.Empty, Flags).Width <= width) return text;
+            while (text.Length > 1 && TextRenderer.MeasureText(text + "…", f, Size.Empty, Flags).Width > width) text = text.Substring(0, text.Length - 1);
+            return text + "…";
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
             Rectangle b = Bar;
-            using (var bold = new Font(Font, FontStyle.Bold))
-            using (var small = new Font(Font.FontFamily, Font.Size * 0.85f))
-            using (var gray = new SolidBrush(Color.FromArgb(90, 90, 90)))
-            {
-                bool pause = head.StartsWith("AI 休止中");
-                using (var hb = new SolidBrush(pause ? Color.FromArgb(200, 110, 20) : Color.FromArgb(30, 90, 170)))
-                    g.DrawString(head, bold, hb, b.Left - Scale(2), Scale(4));
+            int width = Width - Pad * 2;
+            Color gray = Color.FromArgb(80, 80, 80);
+            bool pause = head.StartsWith("AI 休止中");
+            TextRenderer.DrawText(g, Fit(head, Bold, width), Bold, new Point(Pad, Scale(6)),
+                pause ? Color.FromArgb(190, 100, 10) : Color.FromArgb(30, 90, 170), Flags);
+            TextRenderer.DrawText(g, Fit(sum, Small, width), Small, new Point(Pad, SumTop), gray, Flags);
 
-                // 帯: 同じ状態が続くところをまとめて塗る
-                for (int i = v0; i < v1; )
-                {
-                    int j = i;
-                    while (j < v1 && slots[j] == slots[i]) j++;
+            g.SmoothingMode = SmoothingMode.None;
+            using (var bg = new SolidBrush(DayStatus.Colors[0])) g.FillRectangle(bg, b);
+            for (int i = v0; i < v1; )
+            {
+                int j = i;
+                while (j < v1 && slots[j] == slots[i]) j++;
+                if (slots[i] != Slot.None)
                     using (var br = new SolidBrush(DayStatus.Colors[(int)slots[i]]))
                         g.FillRectangle(br, X(i), b.Top, X(j) - X(i) + 0.5f, b.Height);
-                    i = j;
-                }
-                // 今の時刻
-                if (date == DateTime.Today.ToString("yyyy-MM-dd"))
+                i = j;
+            }
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            // 1時間ごとの細い線（帯の上）
+            using (var pen = new Pen(Color.FromArgb(90, 255, 255, 255)))
+                for (int m = v0 + 60; m < v1; m += 60) g.DrawLine(pen, X(m), b.Top, X(m), b.Bottom - 1);
+            // 今の時刻
+            if (date == DateTime.Today.ToString("yyyy-MM-dd"))
+            {
+                float x = X((int)DateTime.Now.TimeOfDay.TotalMinutes);
+                using (var pen = new Pen(Color.FromArgb(210, 40, 40), Scale(2))) g.DrawLine(pen, x, b.Top - Scale(2), x, b.Bottom + Scale(2));
+            }
+            // AI を呼んだ時刻（帯のすぐ上の列。緑は成功、赤は失敗）
+            foreach (KeyValuePair<DateTime, bool> c in calls)
+            {
+                int m = (int)c.Key.TimeOfDay.TotalMinutes;
+                if (m < v0 || m >= v1) continue;
+                float x = X(m), top = b.Top - Scale(9);
+                using (var br = new SolidBrush(c.Value ? Color.FromArgb(30, 150, 70) : Color.FromArgb(210, 40, 40)))
+                    g.FillPolygon(br, new[] { new PointF(x - Scale(4), top), new PointF(x + Scale(4), top), new PointF(x, b.Top - Scale(2)) });
+            }
+            // 時刻: 文字が重ならない間隔（1・2・3・4・6時間ごと）で出す
+            int labelW = TextRenderer.MeasureText("00:00", Small, Size.Empty, Flags).Width + Scale(10);
+            float perHour = b.Width * 60f / (v1 - v0);
+            int step = new[] { 1, 2, 3, 4, 6, 12 }.FirstOrDefault(h => perHour * h >= labelW);
+            if (step == 0) step = 24;
+            using (var pen = new Pen(Color.FromArgb(150, 150, 150)))
+                for (int m = v0; m <= v1; m += 60)
                 {
-                    float x = X((int)DateTime.Now.TimeOfDay.TotalMinutes);
-                    using (var pen = new Pen(Color.FromArgb(200, 40, 40), Scale(2))) g.DrawLine(pen, x, b.Top - Scale(3), x, b.Bottom + Scale(3));
-                }
-                // AI を呼んだ時刻（緑はうまくいった、赤は失敗）
-                foreach (KeyValuePair<DateTime, bool> c in calls)
-                {
-                    int m = (int)c.Key.TimeOfDay.TotalMinutes;
-                    if (m < v0 || m >= v1) continue;
                     float x = X(m);
-                    using (var br = new SolidBrush(c.Value ? Color.FromArgb(30, 150, 70) : Color.FromArgb(210, 40, 40)))
-                        g.FillPolygon(br, new[] { new PointF(x - Scale(4), b.Top - Scale(7)), new PointF(x + Scale(4), b.Top - Scale(7)), new PointF(x, b.Top - 1) });
+                    g.DrawLine(pen, x, b.Bottom, x, b.Bottom + Scale(3));
+                    if ((m / 60) % step != 0) continue;
+                    string t = (m / 60) + ":00";
+                    int tw = TextRenderer.MeasureText(t, Small, Size.Empty, Flags).Width;
+                    int tx = (int)Math.Min(Math.Max(0, x - tw / 2f), Width - tw);
+                    TextRenderer.DrawText(g, t, Small, new Point(tx, HourTop), gray, Flags);
                 }
-                // 1時間ごとの目盛り
-                int step = (v1 - v0) / 60 > 12 ? 120 : 60;
-                using (var pen = new Pen(Color.FromArgb(150, 150, 150)))
-                    for (int m = v0; m <= v1; m += 60)
-                    {
-                        float x = X(m);
-                        g.DrawLine(pen, x, b.Bottom, x, b.Bottom + Scale(3));
-                        if ((m - v0) % step == 0)
-                        {
-                            string t = (m / 60) + ":00";
-                            SizeF ts = g.MeasureString(t, small);
-                            g.DrawString(t, small, gray, Math.Min(Math.Max(0, x - ts.Width / 2), Width - ts.Width), b.Bottom + Scale(3));
-                        }
-                    }
-                // 凡例（右下）
-                float lx = Width - Scale(10);
-                var items = new List<KeyValuePair<string, Color>>();
-                foreach (Slot k in new[] { Slot.Work, Slot.Idle, Slot.Break, Slot.Afk, Slot.Off })
-                    items.Add(new KeyValuePair<string, Color>(DayStatus.Names[(int)k], DayStatus.Colors[(int)k]));
-                items.Add(new KeyValuePair<string, Color>("▼AI", Color.FromArgb(30, 150, 70)));
-                float ly = b.Bottom + Scale(19);
-                g.DrawString(sum, small, gray, b.Left - Scale(2), ly);
-                for (int i = items.Count - 1; i >= 0; i--)
+            // 凡例
+            int lines;
+            foreach (KeyValuePair<Point, int> p in LegendLayout(out lines))
+            {
+                KeyValuePair<string, Color> it = LegendItems[p.Value];
+                int box = Scale(11), ty = p.Key.Y, by = ty + (SmallH - box) / 2;
+                if (it.Key.StartsWith("▼"))
                 {
-                    SizeF ts = g.MeasureString(items[i].Key, small);
-                    lx -= ts.Width;
-                    g.DrawString(items[i].Key, small, gray, lx, ly);
-                    if (!items[i].Key.StartsWith("▼"))
-                    {
-                        lx -= Scale(11);
-                        using (var br = new SolidBrush(items[i].Value)) g.FillRectangle(br, lx, ly + Scale(3), Scale(10), Scale(10));
-                    }
-                    lx -= Scale(10);
+                    using (var br = new SolidBrush(it.Value))
+                        g.FillPolygon(br, new[] { new PointF(p.Key.X, by + Scale(2)), new PointF(p.Key.X + box, by + Scale(2)), new PointF(p.Key.X + box / 2f, by + box) });
+                    TextRenderer.DrawText(g, it.Key.Substring(1).Trim(), Small, new Point(p.Key.X + box + Scale(4), ty), gray, Flags);
+                }
+                else
+                {
+                    using (var br = new SolidBrush(it.Value)) g.FillRectangle(br, p.Key.X, by, box, box);
+                    TextRenderer.DrawText(g, it.Key, Small, new Point(p.Key.X + box + Scale(4), ty), gray, Flags);
                 }
             }
         }
@@ -2651,7 +2714,7 @@ namespace WorkLog
             base.OnMouseMove(e);
             Rectangle b = Bar;
             string t = null;
-            if (e.X >= b.Left && e.X < b.Right && e.Y >= b.Top - Scale(8) && e.Y <= b.Bottom + Scale(4))
+            if (e.X >= b.Left && e.X < b.Right && e.Y >= b.Top - Scale(10) && e.Y <= b.Bottom + Scale(4))
             {
                 int m = v0 + (int)((e.X - b.Left) * (v1 - v0) / (float)b.Width);
                 m = Math.Max(v0, Math.Min(v1 - 1, m));
@@ -2668,7 +2731,11 @@ namespace WorkLog
 
         protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); lastTip = null; tip.Hide(this); }
 
-        protected override void Dispose(bool disposing) { if (disposing) tip.Dispose(); base.Dispose(disposing); }
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { tip.Dispose(); if (boldFont != null) boldFont.Dispose(); if (smallFont != null) smallFont.Dispose(); }
+            base.Dispose(disposing);
+        }
     }
 
     // 時刻の入力欄。4桁（1430）で 14:30。ホイールか ↑↓ で、時の上（左側）なら1時間、分の上（右側）なら1分ずつ変わる。

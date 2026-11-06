@@ -3903,11 +3903,11 @@ namespace WorkLog
             }
             var bad = new List<string>();
             int n;
-            List<string> got = Reporter.FormatFix(new List<string>
+            List<string> fixedLines = Reporter.FormatFix(new List<string>
             {
                 "■工程", "・09:00〜10:30 A工区の数量計算", "11:00-12:00 B地区の協議資料", "■ 軽作業", "・10:40 メール対応", "・13:00〜13:30 打合せ", "・現場の写真整理"
             }, bad, out n);
-            eq("FormatFix の行", string.Join(" | ", got.Select(x => x.Replace("\u0001", "#"))),
+            eq("FormatFix の行", string.Join(" | ", fixedLines.Select(x => x.Replace("\u0001", "#"))),
                "■工程 | ・09:00〜10:30 A工区の数量計算 | ・11:00〜12:00 B地区の協議資料 | ・13:00〜13:30 打合せ | ■軽作業 | ・10:40 メール対応 | #1");
             eq("FormatFix の直した数", n.ToString(), "3");
             eq("FormatFix の直せない行", string.Join(" | ", bad), "・現場の写真整理");

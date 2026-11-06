@@ -46,6 +46,13 @@ jobs:
         run: |
           $env:WORKLOG_TEST = Join-Path $env:RUNNER_TEMP 'selftest'
           New-Item -ItemType Directory -Force $env:WORKLOG_TEST | Out-Null
+          # デスクトップアプリが入れる Claude Code の置き方をまねる（古い版と新しい版。新しい版を選ぶか）
+          foreach ($v in '1.0.5\old1', '2.1.30\0a1b2c') {
+            $d = Join-Path $env:APPDATA "Claude\claude-code\$v"
+            New-Item -ItemType Directory -Force $d | Out-Null
+            Set-Content (Join-Path $d 'claude.exe') 'dummy'
+          }
+          $env:WORKLOG_EXPECT_DESKTOP = Join-Path $env:APPDATA 'Claude\claude-code\2.1.30\0a1b2c\claude.exe'
           $p = Start-Process WorkLogTray/WorkLog.exe -ArgumentList '--selftest' -PassThru
           $null = $p.Handle
           if (-not $p.WaitForExit(60000)) { throw '終わらない' }

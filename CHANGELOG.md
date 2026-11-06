@@ -2,6 +2,11 @@
 
 各版のリリース: https://github.com/sarumogu2013-glitch/AutoNippou/releases
 
+## 0.13.3（2026-11-06）
+
+- 「AIの接続先」に「詳しく探す」: ユーザーのフォルダ（AppData の Local・Roaming など）と Program Files を広く探し、本当に Claude Code か（--version）を確かめてから、見つかったものを使うようにする（設定の「Claude Code の場所」に入れる）。デスクトップアプリ本体は動かさない
+- 「AIの接続先」に「Claude Code の入れ方（公式のページ）」: デスクトップアプリが Claude Code を外から使える形で持っていないときのために、公式の入れ方のページを開く
+
 ## 0.13.2（2026-11-06）
 
 - Claude デスクトップアプリだけの PC で AI（Claude Code）が見つからなかったのを直した

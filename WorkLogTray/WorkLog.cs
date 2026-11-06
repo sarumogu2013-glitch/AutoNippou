@@ -46,7 +46,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.13.2";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.13.3";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -155,6 +155,15 @@ namespace WorkLog
                 Core.WriteText(FilePath, s.ToText());
                 cache = null;
             }
+        }
+
+        // Claude Code の場所だけを書き換える（「AIの接続先」の「詳しく探す」で見つけたとき）
+        public static void SetClaudePath(string path)
+        {
+            Settings s;
+            lock (cacheLock) s = Parse(File.Exists(FilePath) ? Core.ReadText(FilePath) : "");
+            s.ClaudePath = path ?? "";
+            Save(s);
         }
 
         // 要望の名前だけを書き換える（ほかの項目は settings.ini のまま）
@@ -502,14 +511,71 @@ namespace WorkLog
             return found.OrderByDescending(PathVersion).ThenByDescending(f => File.GetLastWriteTime(f)).FirstOrDefault();
         }
 
+        // 詳しく探す: ユーザーのフォルダと Program Files の中の claude.exe を探し、本当に Claude Code か（--version に「Claude Code」と出るか）を確かめる。
+        // デスクトップアプリ本体（Electron のアプリ。resources\app.asar がある）は動かさない。見つかったもの（場所と --version）を返す
+        public static List<KeyValuePair<string, string>> DeepSearch(Action<string> progress)
+        {
+            var roots = new List<string>
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local"),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+            };
+            var skip = new[] { "Temp", "INetCache", "Microsoft", "Google", "Mozilla", "WorkLog", "CrashDumps", "D3DSCache", "pip", "npm-cache" };
+            var files = new List<string>();
+            DateTime until = DateTime.Now.AddSeconds(60);
+            Action<string, int> walk = null;
+            walk = (dir, depth) =>
+            {
+                if (depth > 7 || DateTime.Now > until) return;
+                try
+                {
+                    foreach (string f in Directory.GetFiles(dir, "claude.exe")) files.Add(f);
+                    foreach (string d in Directory.GetDirectories(dir))
+                    {
+                        string name = Path.GetFileName(d);
+                        if (skip.Contains(name, StringComparer.OrdinalIgnoreCase) && depth <= 1) continue;
+                        if ((File.GetAttributes(d) & FileAttributes.ReparsePoint) != 0) continue;
+                        walk(d, depth + 1);
+                    }
+                }
+                catch { }
+            };
+            foreach (string r in roots.Where(x => !string.IsNullOrEmpty(x) && Directory.Exists(x)).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (progress != null) progress("探しています: " + r);
+                walk(r, 0);
+            }
+            // ストア版のデスクトップアプリの中（Packages は大きいので Claude の名前のものだけ、深めに）
+            try
+            {
+                string pkgs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Packages");
+                if (Directory.Exists(pkgs))
+                    foreach (string d in Directory.GetDirectories(pkgs, "*Claude*")) walk(d, -3);
+            }
+            catch { }
+            var found = new List<KeyValuePair<string, string>>();
+            foreach (string f in files.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (IsDesktopApp(f) || File.Exists(Path.Combine(Path.GetDirectoryName(f), "resources", "app.asar"))) continue;
+                if (progress != null) progress("確かめています: " + f);
+                string v;
+                try { v = RunExe(f, "--version", null, 15000).Trim(); } catch { continue; }
+                if (v.IndexOf("Claude Code", StringComparison.OrdinalIgnoreCase) >= 0) found.Add(new KeyValuePair<string, string>(f, v));
+            }
+            return found.OrderByDescending(x => PathVersion(x.Value + "\\" + x.Key)).ToList();
+        }
+
         // 見つからないときの案内（「AIの接続先」に出す）
         public static string NotFoundHelp()
         {
             return "探した場所: PATH（デスクトップアプリ本体の Claude.exe は除く）、%USERPROFILE%\\.local\\bin、" +
                    "Claude デスクトップアプリの中（%APPDATA% と %LOCALAPPDATA% の Claude\\claude-code など。ストア版は Packages の中）\r\n" +
-                   "デスクトップアプリだけのときは、アプリの「Code」を一度開くと Claude Code が入ることがあります。" +
-                   "claude.exe の場所がわかれば、設定のタブ「AI」の「Claude Code の場所」で選んでください。" +
-                   "または Claude Code を単体で入れてください（https://claude.com/claude-code）。";
+                   "下の「詳しく探す」で PC の中をもっと広く探せます。" +
+                   "デスクトップアプリの版によっては Claude Code を外から使える形で持っていないので、そのときは「Claude Code の入れ方（公式のページ）」の手順で入れてください" +
+                   "（ログインは今のプランのアカウントでできます）。";
         }
 
         // どこの Claude Code か（「AIの接続先」に出す）
@@ -4222,6 +4288,7 @@ namespace WorkLog
         readonly TextBox info = new TextBox();
         readonly ListView history = new ListView();
         readonly Button recheck;
+        Button deep;
         readonly Action ready;
 
         public AiForm(Icon icon, Action ready)
@@ -4253,9 +4320,11 @@ namespace WorkLog
                 new[] { "モデル", "150" }, new[] { "トークン", "80" }, new[] { "結果", "400" } })
                 history.Columns.Add(c[0], int.Parse(c[1]), c[0] == "トークン" ? HorizontalAlignment.Right : HorizontalAlignment.Left);
 
-            var bar = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 50, Padding = new Padding(6, 6, 6, 4), WrapContents = false };
+            var bar = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, Padding = new Padding(6, 6, 6, 4), WrapContents = true };
             recheck = AddButton(bar, "再確認", (o, e) => Recheck(true));
             AddButton(bar, "ログイン（ブラウザが開きます）", (o, e) => Login());
+            deep = AddButton(bar, "詳しく探す", (o, e) => Deep());
+            AddButton(bar, "Claude Code の入れ方（公式のページ）", (o, e) => Install());
             AddButton(bar, "履歴ファイルを開く", (o, e) =>
             {
                 string p = Path.Combine(Core.Dir, "ai_calls.log");
@@ -4278,6 +4347,51 @@ namespace WorkLog
             b.Click += click;
             bar.Controls.Add(b);
             return b;
+        }
+
+        // PC の中を広く探して、見つかった Claude Code を使うようにする（設定の ClaudePath に入れる）
+        void Deep()
+        {
+            deep.Enabled = recheck.Enabled = false;
+            info.ForeColor = SystemColors.WindowText;
+            info.Text = "PC の中の Claude Code を探しています（1分ほどかかることがあります）…";
+            var t = new Thread(() =>
+            {
+                List<KeyValuePair<string, string>> found = ClaudeCli.DeepSearch(m => BeginInvoke((Action)(() => info.Text = "PC の中の Claude Code を探しています…\r\n" + m)));
+                BeginInvoke((Action)(() =>
+                {
+                    deep.Enabled = recheck.Enabled = true;
+                    if (found.Count == 0)
+                    {
+                        info.ForeColor = Color.Firebrick;
+                        info.Text = "PC の中に、外から使える Claude Code は見つかりませんでした。\r\n" +
+                                    "このデスクトップアプリは Claude Code を中に持っているだけのようです。「Claude Code の入れ方（公式のページ）」の手順で入れてください" +
+                                    "（入ったら「再確認」→「ログイン」で、今のプランのアカウントでログインします）。";
+                        return;
+                    }
+                    string pick = found[0].Key;
+                    try { Settings.SetClaudePath(pick); }
+                    catch (Exception ex) { info.Text = "見つけましたが、設定に保存できませんでした: " + ex.Message + "\r\n" + pick; return; }
+                    Recheck(true);
+                    MessageBox.Show(this, "Claude Code を見つけたので、これを使うようにしました。\r\n\r\n" + pick + "\r\n" + found[0].Value +
+                        (found.Count > 1 ? "\r\n\r\nほかにも見つかりました:\r\n" + string.Join("\r\n", found.Skip(1).Select(x => x.Key)) : "") +
+                        "\r\n\r\n（設定のタブ「AI」の「Claude Code の場所」に入れました）", "詳しく探す", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }));
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        // Claude Code の入れ方（公式のページ）をブラウザで開く。入れるのは利用者が公式の手順で行う
+        void Install()
+        {
+            try
+            {
+                Process.Start("https://code.claude.com/docs/en/setup");
+                info.Text = "ブラウザで Claude Code の公式の入れ方のページを開きました。Windows の手順で入れたら、この画面の「再確認」を押し、" +
+                            "「ログイン」で今のプラン（Pro / Max）のアカウントでログインしてください。";
+            }
+            catch (Exception ex) { info.Text = "ブラウザを開けませんでした: " + ex.Message + "（https://code.claude.com/docs/en/setup）"; }
         }
 
         // Claude Code の場所・ログイン・環境変数を確かめる（数秒かかるので別スレッドで）

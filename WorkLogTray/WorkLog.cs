@@ -46,7 +46,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.12.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.13.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -127,7 +127,7 @@ namespace WorkLog
             add("これより古いログ・旧版の日報は削除（日）", "KeepDays", KeepDays.ToString());
             add("日報を作るモデル（略称ではなく正式な名前で書く）", "Model", Model);
             add("「AIで直す」で使うモデル（略称ではなく正式な名前で書く）", "FixModel", FixModel);
-            add(@"Claude Code（claude.exe）の場所。空なら PATH と %USERPROFILE%\.local\bin から探す", "ClaudePath", ClaudePath);
+            add(@"Claude Code（claude.exe）の場所。空なら PATH・%USERPROFILE%\.local\bin・Claude デスクトップアプリの中から探す", "ClaudePath", ClaudePath);
             add("集計しないプロセス（カンマ区切り）", "ExcludeProc", string.Join(",", ExcludeProc));
             add("タイトルを伏せるプロセス（プロセス名:置き換える言葉、カンマ区切り）", "MaskProc", string.Join(",", MaskProc.Select(kv => kv.Key + ":" + kv.Value)));
             add("タイトル中で伏せる語（カンマ区切り。例: 〇〇建設,△△様）", "MaskWords", string.Join(",", MaskWords));
@@ -436,7 +436,52 @@ namespace WorkLog
                 catch { }
             }
             string home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "claude.exe");
-            return File.Exists(home) ? home : null;
+            if (File.Exists(home)) return home;
+            return FindDesktop();
+        }
+
+        // Claude デスクトップアプリに入っている Claude Code（%APPDATA%\Claude\claude-code\<版>\claude.exe。ストア版は Packages の中）。版の新しいもの
+        public static string FindDesktop()
+        {
+            var roots = new List<string> { Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Claude", "claude-code") };
+            try
+            {
+                string pkgs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Packages");
+                if (Directory.Exists(pkgs))
+                    foreach (string d in Directory.GetDirectories(pkgs, "Claude*"))
+                        roots.Add(Path.Combine(d, "LocalCache", "Roaming", "Claude", "claude-code"));
+            }
+            catch { }
+            var found = new List<string>();
+            foreach (string r in roots)
+            {
+                try
+                {
+                    if (!Directory.Exists(r)) continue;
+                    if (File.Exists(Path.Combine(r, "claude.exe"))) found.Add(Path.Combine(r, "claude.exe"));
+                    foreach (string d in Directory.GetDirectories(r))
+                    {
+                        string p = Path.Combine(d, "claude.exe");
+                        if (File.Exists(p)) found.Add(p);
+                    }
+                }
+                catch { }
+            }
+            Func<string, Version> ver = p =>
+            {
+                Version v;
+                return Version.TryParse(Path.GetFileName(Path.GetDirectoryName(p)), out v) ? v : new Version(0, 0);
+            };
+            return found.OrderByDescending(ver).ThenByDescending(p => File.GetLastWriteTime(p)).FirstOrDefault();
+        }
+
+        // どこの Claude Code か（「AIの接続先」に出す）
+        public static string Source(string exe)
+        {
+            if (exe == null) return "";
+            string e = exe.Replace('/', '\\');
+            if (e.IndexOf("\\Claude\\claude-code\\", StringComparison.OrdinalIgnoreCase) >= 0) return "Claude デスクトップアプリに入っている Claude Code";
+            return "Claude Code（単体でインストールしたもの）";
         }
 
         static string RunExe(string exe, string args, string stdin, int timeoutMs)
@@ -3870,7 +3915,7 @@ namespace WorkLog
             var browse = new Button { Text = "参照…", AutoSize = true };
             browse.Click += (o, e) => Browse();
             Add(t, Auto(), L("Claude Code の場所"), claudePath, browse);
-            Add(t, Auto(), Hint(@"空のときは PATH と %USERPROFILE%\.local\bin から自動で探します"));
+            Add(t, Auto(), Hint(@"空のときは PATH、%USERPROFILE%\.local\bin、Claude デスクトップアプリの中（%APPDATA%\Claude\claude-code）の順に自動で探します"));
             var ai = new Button { Text = "AIの接続先を確かめる…", AutoSize = true, Margin = new Padding(3, 12, 3, 3) };
             ai.Click += (o, e) => showAi();
             Add(t, Auto(), ai);
@@ -4146,7 +4191,8 @@ namespace WorkLog
                 var sb = new StringBuilder();
                 sb.AppendLine("■ 日報を作るときに使う AI");
                 sb.AppendLine("Claude Code: " + (exe == null ? "見つかりません" : exe + "（" + ClaudeCli.Version(exe) + "）"));
-                sb.AppendLine("　探し方: " + (s.ClaudePath.Length > 0 ? "settings.ini の ClaudePath" : "PATH と %USERPROFILE%\\.local\\bin から自動"));
+                if (exe != null) sb.AppendLine("　種類: " + ClaudeCli.Source(exe));
+                sb.AppendLine("　探し方: " + (s.ClaudePath.Length > 0 ? "settings.ini の ClaudePath" : "PATH・%USERPROFILE%\\.local\\bin・Claude デスクトップアプリの中から自動"));
                 if (a != null)
                 {
                     sb.AppendLine("ログイン: " + (a.LoggedIn ? a.Method : "していません"));

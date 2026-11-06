@@ -102,8 +102,6 @@ jobs:
           $null = $p.Handle
           if (-not $p.WaitForExit(60000)) { throw '終わらない' }
           if ($p.ExitCode -ne 0) { throw "帯の画像を作れなかった（$($p.ExitCode)）" }
-          # 成果物を落とせない環境でも見られるよう、ログにも出す
-          Write-Host ("TIMELINE_PNG_BASE64:" + [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $env:RUNNER_TEMP 'timeline.png'))))
 
       - name: Upload screenshot
         uses: actions/upload-artifact@v4
@@ -112,6 +110,20 @@ jobs:
           path: |
             ${{ runner.temp }}/about.png
             ${{ runner.temp }}/timeline.png
+
+      # PR のときは、画像を ci-screenshots ブランチにも置く（成果物を落とせない環境からも git で見られるように）
+      - name: Publish screenshots (PR)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        shell: pwsh
+        run: |
+          $d = Join-Path $env:RUNNER_TEMP 'shots-repo'
+          New-Item -ItemType Directory -Force $d | Out-Null
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'about.png'), (Join-Path $env:RUNNER_TEMP 'timeline.png') $d
+          Set-Location $d
+          git init -q
+          git add -A
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com commit -q -m "screenshots ${{ github.event.pull_request.head.sha }}"
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:refs/heads/ci-screenshots
 
       - name: Release notes
         shell: pwsh

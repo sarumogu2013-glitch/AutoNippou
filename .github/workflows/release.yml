@@ -41,6 +41,17 @@ jobs:
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "ver=$ver" >> $env:GITHUB_OUTPUT
 
+      - name: Self test
+        shell: pwsh
+        run: |
+          $env:WORKLOG_TEST = Join-Path $env:RUNNER_TEMP 'selftest'
+          New-Item -ItemType Directory -Force $env:WORKLOG_TEST | Out-Null
+          $p = Start-Process WorkLogTray/WorkLog.exe -ArgumentList '--selftest' -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(60000)) { throw '終わらない' }
+          Get-Content (Join-Path $env:WORKLOG_TEST 'selftest.log')
+          if ($p.ExitCode -ne 0) { throw "期待と違う（$($p.ExitCode)）" }
+
       # 自動アップデートの確認: テスト用の保存先で、今の版のふり（最新なので何もしない）と、
       # 古い版のふり（GitHub の最新リリースを落として exe を入れ替え、起動し直す）を実際に動かす
       - name: Test auto update

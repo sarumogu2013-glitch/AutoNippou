@@ -467,10 +467,10 @@ namespace WorkLog
                 }
                 catch { }
             }
-            Func<string, Version> ver = p =>
+            Func<string, System.Version> ver = p =>
             {
-                Version v;
-                return Version.TryParse(Path.GetFileName(Path.GetDirectoryName(p)), out v) ? v : new Version(0, 0);
+                System.Version v;
+                return System.Version.TryParse(Path.GetFileName(Path.GetDirectoryName(p)), out v) ? v : new System.Version(0, 0);
             };
             return found.OrderByDescending(ver).ThenByDescending(p => File.GetLastWriteTime(p)).FirstOrDefault();
         }

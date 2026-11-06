@@ -11,6 +11,7 @@
 //   --auto               未作成の日報をまとめて作って終了（画面なし）
 //   --updated <pid>      自動アップデートで起動された（前の版の終了を待ってから常駐する）
 //   --screenshot-about <png>  テスト中だけ: バージョン情報の画面を画像にして終わる
+//   --screenshot-timeline <png>  テスト中だけ: 日報画面の帯（テスト用の日）を画像にして終わる
 //   --selftest           テスト中だけ: 日報の書式を直す処理を確かめる（0=期待どおり 1=違う）
 //   --check-update [--apply]  テスト中（WORKLOG_TEST）だけ: 更新を確かめて落とす（--apply で入れ替えも）。0=最新 10=更新あり 2=失敗
 // 動作確認用の環境変数: WORKLOG_TEST=保存先フォルダ（二重起動防止を本番と分け、スタートアップ登録を無効にする）
@@ -45,7 +46,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.11.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.12.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -559,6 +560,27 @@ namespace WorkLog
             throw last;
         }
 
+        // その日に AI を呼んだ時刻と、うまくいったか（日報画面の帯に印を付ける）
+        public static List<KeyValuePair<DateTime, bool>> CallsOn(DateTime day)
+        {
+            var list = new List<KeyValuePair<DateTime, bool>>();
+            try
+            {
+                if (!File.Exists(LogPath)) return list;
+                string prefix = day.ToString("yyyy-MM-dd");
+                foreach (string raw in Core.ReadText(LogPath).Split('\n'))
+                {
+                    if (!raw.StartsWith(prefix) && !raw.TrimStart('\uFEFF').StartsWith(prefix)) continue;
+                    string[] c = raw.TrimStart('\uFEFF').TrimEnd('\r').Split('\t');
+                    DateTime t;
+                    if (c.Length >= 8 && DateTime.TryParseExact(c[0], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out t))
+                        list.Add(new KeyValuePair<DateTime, bool>(t, c[7].StartsWith("成功")));
+                }
+            }
+            catch { }
+            return list;
+        }
+
         // ai_calls.log: 日時<TAB>日報の日付<TAB>元のログ<TAB>claude.exe<TAB>ログイン<TAB>モデル<TAB>トークン<TAB>結果
         static void WriteLog(string date, string exe, Auth auth, string models, long tokens, string result)
         {
@@ -606,6 +628,22 @@ namespace WorkLog
         }
 
         // 離席・除外プロセスを除いた記録
+        // 記録の時刻と無操作の秒数（日報画面の帯に出す）
+        public static List<KeyValuePair<DateTime, long>> ReadIdle(string date)
+        {
+            var list = new List<KeyValuePair<DateTime, long>>();
+            string path = Core.CsvPath(date);
+            if (!File.Exists(path)) return list;
+            foreach (string raw in Core.ReadText(path).Split('\n'))
+            {
+                Match m = CsvRe.Match(raw.TrimEnd('\r'));
+                DateTime t;
+                if (m.Success && DateTime.TryParseExact(m.Groups[1].Value, "yyyy-MM-dd HH:mm:ss", Inv, DateTimeStyles.None, out t))
+                    list.Add(new KeyValuePair<DateTime, long>(t, long.Parse(m.Groups[4].Value)));
+            }
+            return list;
+        }
+
         public static List<Row> ReadActive(string date, Settings s)
         {
             string path = Core.CsvPath(date);
@@ -1498,8 +1536,34 @@ namespace WorkLog
 
         public static void Save(bool off, DateTime at)
         {
-            try { Core.WriteText(PathOf, (off ? "off" : "on") + "\t" + at.ToString("yyyy-MM-dd HH:mm:ss") + "\r\n"); }
+            try
+            {
+                string line = (off ? "off" : "on") + "\t" + at.ToString("yyyy-MM-dd HH:mm:ss") + "\r\n";
+                Core.WriteText(PathOf, line);
+                File.AppendAllText(HistoryPath, line, new UTF8Encoding(false));   // 退勤していた時間帯を日報画面の帯に出すため
+            }
             catch (Exception ex) { Core.Error("勤務", ex.Message); }
+        }
+
+        static string HistoryPath { get { return Path.Combine(Core.Dir, "勤務履歴.log"); } }
+
+        // 出勤・退勤の履歴（時刻の順）。true が退勤（0.12.0 から残す）
+        public static List<KeyValuePair<DateTime, bool>> History()
+        {
+            var list = new List<KeyValuePair<DateTime, bool>>();
+            try
+            {
+                if (!File.Exists(HistoryPath)) return list;
+                foreach (string raw in Core.ReadText(HistoryPath).Split('\n'))
+                {
+                    string[] c = raw.Trim().Split('\t');
+                    DateTime t;
+                    if (c.Length >= 2 && DateTime.TryParseExact(c[1], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out t))
+                        list.Add(new KeyValuePair<DateTime, bool>(t, c[0] == "off"));
+                }
+            }
+            catch (Exception ex) { Core.Error("勤務", ex.Message); }
+            return list.OrderBy(x => x.Key).ToList();
         }
 
         // 退勤中に出勤とみなすか: 退勤した日より後の日で、出勤の時刻を過ぎて操作があった
@@ -2106,12 +2170,49 @@ namespace WorkLog
             bool finish = now.TimeOfDay >= s.ReportTime && lastAuto < now.Date + s.ReportTime;
             bool interval = s.AppendMinutes > 0 && now - lastAuto >= TimeSpan.FromMinutes(s.AppendMinutes);
             if (!newDay && !finish && !interval) return;
+            if (!newDay && !finish && Resting(s, now) != null) return;   // 休憩・離席のあいだは追記しない（戻ってから追記する）
             if (newDay) CheckAi();   // 1日1回
             lastAuto = now;
             Run(() => Reporter.Auto(s), false, newDay || finish);
         }
 
         public bool Busy { get { return busy; } }
+
+        // 休憩中・離席中なら、その説明（AI の自動追記を止めている）
+        string Resting(Settings s, DateTime now)
+        {
+            if (s.InBreak(now) && Reporter.BreakOn(now.ToString("yyyy-MM-dd"), s))
+                return "休憩中（" + s.BreakEnd.ToString(@"hh\:mm") + " まで）";
+            uint idle = Logger.IdleSec();
+            if (s.AfkMinutes > 0 && idle >= s.AfkMinutes * 60)
+                return "離席中（" + now.AddSeconds(-idle).ToString("HH:mm") + " から。戻ると再開）";
+            return null;
+        }
+
+        // AI の今の状態（日報画面の帯の上に出す）: 休止中ならその理由、動くなら次にいつ何をするか
+        public string AiState()
+        {
+            Settings s = Settings.Get();
+            DateTime now = DateTime.Now;
+            if (busy) return "AI 実行中（日報を作っています）";
+            if (off) return "AI 休止中: 退勤中（" + offAt.ToString("M/d HH:mm") + " から。出勤すると再開）";
+            string rest = Resting(s, now);
+            if (rest != null) return "AI 休止中: " + rest;
+            DateTime first = started.AddMinutes(2);
+            if (now < first || lastAuto.Date != now.Date) return "次の AI: まもなく（まだ作っていない日報・追記を確かめる）";
+            DateTime finish = now.Date + s.ReportTime;
+            var next = new List<KeyValuePair<DateTime, string>>();
+            if (lastAuto < finish) next.Add(new KeyValuePair<DateTime, string>(finish, "今日の日報を仕上げる"));
+            if (s.AppendMinutes > 0) next.Add(new KeyValuePair<DateTime, string>(lastAuto.AddMinutes(s.AppendMinutes), "今日の日報に追記"));
+            if (next.Count == 0) return "次の AI: 明日（日付が変わったら前の日を仕上げる）";
+            KeyValuePair<DateTime, string> n = next.OrderBy(x => x.Key).First();
+            DateTime at = n.Key;
+            // 休憩中にあたるなら、休憩が終わってから
+            if (Reporter.BreakOn(now.ToString("yyyy-MM-dd"), s) && s.InBreak(at) && at.Date == now.Date) at = now.Date + s.BreakEnd;
+            if (at <= now) return "次の AI: まもなく（" + n.Value + "）";
+            int min = (int)Math.Ceiling((at - now).TotalMinutes);
+            return "次の AI: " + at.ToString("HH:mm") + " " + n.Value + "（あと " + (min >= 60 ? min / 60 + "時間" + (min % 60 > 0 ? min % 60 + "分" : "") : min + "分") + "）";
+        }
 
         public void Generate(string date)
         {
@@ -2297,6 +2398,234 @@ namespace WorkLog
         }
     }
 
+    // 1日の状態（1分ごと）。AI が日報の材料にするのは「作業」だけで、休憩・離席・退勤のあいだは AI を止めている
+    enum Slot { None, Work, Idle, Break, Afk, Off }
+
+    static class DayStatus
+    {
+        public static readonly string[] Names = { "記録なし", "作業", "無操作", "休憩", "離席", "退勤" };
+        public static readonly Color[] Colors =
+        {
+            Color.FromArgb(232, 234, 238), Color.FromArgb(30, 111, 217), Color.FromArgb(160, 196, 238),
+            Color.FromArgb(240, 160, 60), Color.FromArgb(150, 120, 200), Color.FromArgb(95, 99, 108)
+        };
+
+        // 0:00〜24:00 の 1440 分。あとに書いたものほど優先（記録 → 休憩 → 離席 → 退勤）
+        public static Slot[] Build(string date, Settings s)
+        {
+            var a = new Slot[1440];
+            DateTime day = DateTime.ParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture);
+            Action<DateTime, DateTime, Slot> fill = (t0, t1, v) =>
+            {
+                int i0 = Math.Max(0, (int)Math.Floor((t0 - day).TotalMinutes)), i1 = Math.Min(1440, (int)Math.Ceiling((t1 - day).TotalMinutes));
+                for (int i = i0; i < i1; i++) a[i] = v;
+            };
+            foreach (KeyValuePair<DateTime, long> r in Reporter.ReadIdle(date))
+            {
+                int i = (int)(r.Key - day).TotalMinutes;
+                if (i >= 0 && i < 1440) a[i] = r.Value >= s.IdleLimit ? Slot.Idle : Slot.Work;
+            }
+            if (Reporter.BreakOn(date, s)) fill(day + s.BreakStart, day + s.BreakEnd, Slot.Break);
+            foreach (AfkEntry e in Afk.Load(date))
+                fill(e.Start, e.End, e.Skip && e.Memo.StartsWith("休憩") ? Slot.Break : Slot.Afk);
+            // 退勤していた時間帯（勤務履歴.log）。今日なら今まで
+            DateTime end = day.AddDays(1), now = DateTime.Now;
+            if (end > now) end = now;
+            bool offNow = false;
+            DateTime offFrom = day;
+            foreach (KeyValuePair<DateTime, bool> h in Duty.History())
+            {
+                if (h.Key >= end) break;
+                if (h.Key < day) { offNow = h.Value; offFrom = day; continue; }
+                if (h.Value && !offNow) { offNow = true; offFrom = h.Key; }
+                else if (!h.Value && offNow) { fill(offFrom, h.Key, Slot.Off); offNow = false; }
+            }
+            if (offNow && Duty.History().Count > 0) fill(offFrom, end, Slot.Off);
+            return a;
+        }
+
+        public static string Span(int minutes)
+        {
+            return minutes >= 60 ? minutes / 60 + "時間" + (minutes % 60 > 0 ? minutes % 60 + "分" : "") : minutes + "分";
+        }
+    }
+
+    // 日報画面の上の帯: その日の作業・休憩・離席・退勤を色で、AI を呼んだ時刻を印で出す。今日は AI の状態（休止中か、次にいつ動くか）も
+    class DayTimeline : Control
+    {
+        readonly Func<string> aiState;
+        readonly ToolTip tip = new ToolTip();
+        string date;
+        Slot[] slots = new Slot[1440];
+        List<KeyValuePair<DateTime, bool>> calls = new List<KeyValuePair<DateTime, bool>>();
+        int v0 = 8 * 60, v1 = 18 * 60;   // 見せる範囲（分。v0〜v1）
+        string head = "", sum = "", lastTip;
+
+        public DayTimeline(Func<string> aiState)
+        {
+            this.aiState = aiState;
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.ResizeRedraw, true);
+            Dock = DockStyle.Top;
+            Height = 80;   // 画面の拡大率に合わせて、日報画面が大きさを直す
+            BackColor = Color.FromArgb(244, 247, 252);
+        }
+
+        public string Date { get { return date; } }
+
+        public void SetDate(string d)
+        {
+            date = d;
+            Reload();
+        }
+
+        // 記録・離席メモ・休憩・勤務の履歴と AI の呼び出しを読み直す（今日の分は記録のたびに呼ぶ）
+        public void Reload()
+        {
+            if (date == null) return;
+            Settings s = Settings.Get();
+            try
+            {
+                slots = DayStatus.Build(date, s);
+                calls = ClaudeCli.CallsOn(DateTime.ParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture));
+            }
+            catch (Exception ex) { Core.Error("帯", ex.Message); slots = new Slot[1440]; calls.Clear(); }
+            bool today = date == DateTime.Today.ToString("yyyy-MM-dd");
+            int first = Array.FindIndex(slots, x => x == Slot.Work || x == Slot.Idle);
+            int last = Array.FindLastIndex(slots, x => x == Slot.Work || x == Slot.Idle || x == Slot.Afk);
+            int lo = (int)s.WorkStart.TotalMinutes, hi = (int)s.ReportTime.TotalMinutes;
+            if (first >= 0) lo = Math.Min(lo, first);
+            if (last >= 0) hi = Math.Max(hi, last + 1);
+            if (today) hi = Math.Max(hi, (int)DateTime.Now.TimeOfDay.TotalMinutes + 1);
+            v0 = Math.Max(0, lo / 60 * 60);
+            v1 = Math.Min(1440, (hi + 59) / 60 * 60);
+            if (v1 - v0 < 120) v1 = Math.Min(1440, v0 + 120);
+
+            int[] n = new int[6];
+            for (int i = v0; i < v1; i++) n[(int)slots[i]]++;
+            int rest = n[(int)Slot.Break] + n[(int)Slot.Afk] + n[(int)Slot.Off];
+            var parts = new List<string>();
+            foreach (Slot k in new[] { Slot.Break, Slot.Afk, Slot.Off })
+                if (n[(int)k] > 0) parts.Add(DayStatus.Names[(int)k] + " " + DayStatus.Span(n[(int)k]));
+            sum = "作業 " + DayStatus.Span(n[(int)Slot.Work]) + "　AI 休止 " + DayStatus.Span(rest) +
+                  (parts.Count > 0 ? "（" + string.Join("・", parts) + "）" : "") + "　AI 呼び出し " + calls.Count + "回";
+            head = today && aiState != null ? aiState() : date + " の記録";
+            Invalidate();
+        }
+
+        int Scale(int px) { return (int)Math.Round(px * DeviceDpiOf() / 96f); }
+
+        float dpi;
+        float DeviceDpiOf()
+        {
+            if (dpi == 0) using (Graphics g = CreateGraphics()) dpi = g.DpiX;
+            return dpi;
+        }
+
+        Rectangle Bar { get { int pad = Scale(10); return new Rectangle(pad, Scale(28), Math.Max(10, Width - pad * 2), Scale(14)); } }
+
+        float X(int minute) { Rectangle b = Bar; return b.Left + (minute - v0) * (float)b.Width / (v1 - v0); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            Rectangle b = Bar;
+            using (var bold = new Font(Font, FontStyle.Bold))
+            using (var small = new Font(Font.FontFamily, Font.Size * 0.85f))
+            using (var gray = new SolidBrush(Color.FromArgb(90, 90, 90)))
+            {
+                bool pause = head.StartsWith("AI 休止中");
+                using (var hb = new SolidBrush(pause ? Color.FromArgb(200, 110, 20) : Color.FromArgb(30, 90, 170)))
+                    g.DrawString(head, bold, hb, b.Left - Scale(2), Scale(4));
+
+                // 帯: 同じ状態が続くところをまとめて塗る
+                for (int i = v0; i < v1; )
+                {
+                    int j = i;
+                    while (j < v1 && slots[j] == slots[i]) j++;
+                    using (var br = new SolidBrush(DayStatus.Colors[(int)slots[i]]))
+                        g.FillRectangle(br, X(i), b.Top, X(j) - X(i) + 0.5f, b.Height);
+                    i = j;
+                }
+                // 今の時刻
+                if (date == DateTime.Today.ToString("yyyy-MM-dd"))
+                {
+                    float x = X((int)DateTime.Now.TimeOfDay.TotalMinutes);
+                    using (var pen = new Pen(Color.FromArgb(200, 40, 40), Scale(2))) g.DrawLine(pen, x, b.Top - Scale(3), x, b.Bottom + Scale(3));
+                }
+                // AI を呼んだ時刻（緑はうまくいった、赤は失敗）
+                foreach (KeyValuePair<DateTime, bool> c in calls)
+                {
+                    int m = (int)c.Key.TimeOfDay.TotalMinutes;
+                    if (m < v0 || m >= v1) continue;
+                    float x = X(m);
+                    using (var br = new SolidBrush(c.Value ? Color.FromArgb(30, 150, 70) : Color.FromArgb(210, 40, 40)))
+                        g.FillPolygon(br, new[] { new PointF(x - Scale(4), b.Top - Scale(7)), new PointF(x + Scale(4), b.Top - Scale(7)), new PointF(x, b.Top - 1) });
+                }
+                // 1時間ごとの目盛り
+                int step = (v1 - v0) / 60 > 12 ? 120 : 60;
+                using (var pen = new Pen(Color.FromArgb(150, 150, 150)))
+                    for (int m = v0; m <= v1; m += 60)
+                    {
+                        float x = X(m);
+                        g.DrawLine(pen, x, b.Bottom, x, b.Bottom + Scale(3));
+                        if ((m - v0) % step == 0)
+                        {
+                            string t = (m / 60) + ":00";
+                            SizeF ts = g.MeasureString(t, small);
+                            g.DrawString(t, small, gray, Math.Min(Math.Max(0, x - ts.Width / 2), Width - ts.Width), b.Bottom + Scale(3));
+                        }
+                    }
+                // 凡例（右下）
+                float lx = Width - Scale(10);
+                var items = new List<KeyValuePair<string, Color>>();
+                foreach (Slot k in new[] { Slot.Work, Slot.Idle, Slot.Break, Slot.Afk, Slot.Off })
+                    items.Add(new KeyValuePair<string, Color>(DayStatus.Names[(int)k], DayStatus.Colors[(int)k]));
+                items.Add(new KeyValuePair<string, Color>("▼AI", Color.FromArgb(30, 150, 70)));
+                float ly = b.Bottom + Scale(19);
+                g.DrawString(sum, small, gray, b.Left - Scale(2), ly);
+                for (int i = items.Count - 1; i >= 0; i--)
+                {
+                    SizeF ts = g.MeasureString(items[i].Key, small);
+                    lx -= ts.Width;
+                    g.DrawString(items[i].Key, small, gray, lx, ly);
+                    if (!items[i].Key.StartsWith("▼"))
+                    {
+                        lx -= Scale(11);
+                        using (var br = new SolidBrush(items[i].Value)) g.FillRectangle(br, lx, ly + Scale(3), Scale(10), Scale(10));
+                    }
+                    lx -= Scale(10);
+                }
+            }
+        }
+
+        // マウスを載せた時刻の状態を出す
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            Rectangle b = Bar;
+            string t = null;
+            if (e.X >= b.Left && e.X < b.Right && e.Y >= b.Top - Scale(8) && e.Y <= b.Bottom + Scale(4))
+            {
+                int m = v0 + (int)((e.X - b.Left) * (v1 - v0) / (float)b.Width);
+                m = Math.Max(v0, Math.Min(v1 - 1, m));
+                Slot v = slots[m];
+                t = (m / 60).ToString("00") + ":" + (m % 60).ToString("00") + "　" + DayStatus.Names[(int)v] +
+                    (v == Slot.Break || v == Slot.Afk || v == Slot.Off ? "（AI 休止）" : v == Slot.Work ? "（日報の材料）" : "");
+                KeyValuePair<DateTime, bool>[] near = calls.Where(c => Math.Abs((int)c.Key.TimeOfDay.TotalMinutes - m) <= 2).ToArray();
+                if (near.Length > 0) t += "\n" + string.Join("\n", near.Select(c => "AI " + c.Key.ToString("HH:mm") + (c.Value ? " 成功" : " 失敗")));
+            }
+            if (t == lastTip) return;
+            lastTip = t;
+            if (t == null) tip.Hide(this); else tip.Show(t, this, e.X + Scale(12), e.Y + Scale(16));
+        }
+
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); lastTip = null; tip.Hide(this); }
+
+        protected override void Dispose(bool disposing) { if (disposing) tip.Dispose(); base.Dispose(disposing); }
+    }
+
     // 時刻の入力欄。4桁（1430）で 14:30。ホイールか ↑↓ で、時の上（左側）なら1時間、分の上（右側）なら1分ずつ変わる。
     // Shift か Ctrl を押しながらのホイールは、どこでも1時間ずつ。空なら時刻なし
     class TimeBox : TextBox
@@ -2424,6 +2753,7 @@ namespace WorkLog
         readonly RichTextBox text = new RichTextBox { DetectUrls = false, LanguageOption = RichTextBoxLanguageOptions.UIFonts };
         readonly ToolStripStatusLabel message = new ToolStripStatusLabel();
         readonly ToolStripStatusLabel record = new ToolStripStatusLabel();
+        DayTimeline timeline;
         readonly Button copyBullets, copyAll, saveBtn, redoBtn, todayBtn;
         readonly ToolStripMenuItem mSave, mCopyBullets, mCopyAll, mAiFix, mRedo, mToday, mError;
 
@@ -2487,6 +2817,7 @@ namespace WorkLog
         public MainForm(TrayApp app, Icon icon)
         {
             this.app = app;
+            timeline = new DayTimeline(app.AiState);
             Text = "日報" + (Core.Test ? "（テスト）" : "");
             Icon = icon;
             AutoScaleDimensions = new SizeF(96f, 96f);
@@ -2570,6 +2901,7 @@ namespace WorkLog
             var center = new Panel { Dock = DockStyle.Fill };
             center.Controls.Add(text);
             center.Controls.Add(BuildAddBar());
+            center.Controls.Add(timeline);
             Controls.Add(center);
             Controls.Add(BuildRight());
             Controls.Add(list);
@@ -2760,6 +3092,7 @@ namespace WorkLog
 
         public void SetDuty(bool off)
         {
+            timeline.Reload();
             dutyBtn.Text = off ? "出勤" : "退勤";
             mDuty.Text = off ? "出勤する（記録と AI を始める）(&Q)" : "退勤する（日報を仕上げて待機）(&Q)";
         }
@@ -2989,12 +3322,18 @@ namespace WorkLog
         public void SetBusy(bool b)
         {
             busy = b;
+            timeline.Reload();
             if (b) message.Text = BusyText;
             else if (message.Text == BusyText) message.Text = "";
             UpdateButtons();
         }
 
-        public void SetRecordStatus(string s) { record.Text = s; }
+        // 記録のたび（1分ごと）に呼ばれる。今日を開いていれば帯も新しくする
+        public void SetRecordStatus(string s)
+        {
+            record.Text = s;
+            if (timeline.Date == DateTime.Today.ToString("yyyy-MM-dd")) timeline.Reload();
+        }
 
         public void RefreshList(string select)
         {
@@ -3036,6 +3375,7 @@ namespace WorkLog
         {
             SaveIfDirty();
             current = date;
+            timeline.SetDate(date);
             sample = false;
             string path = Core.ReportPath(date);
             hasReport = File.Exists(path);
@@ -3869,9 +4209,30 @@ namespace WorkLog
         }
     }
 
-    // 動作確認（--selftest）: 作り直しで書式を直す処理を、決めた例で確かめる
+    // 動作確認（--selftest）: 作り直しで書式を直す処理と、日報画面の帯を、決めた例で確かめる
     static class SelfTest
     {
+        // テスト用の保存先に、2026-01-05 の記録・離席・勤務の履歴・AI の呼び出しを作る（何度呼んでも同じ）
+        public static string MakeDay()
+        {
+            const string date = "2026-01-05";
+            var csv = new StringBuilder("time,process,title,idle\r\n");
+            for (DateTime t = new DateTime(2026, 1, 5, 8, 30, 0); t < new DateTime(2026, 1, 5, 18, 0, 0); t = t.AddMinutes(1))
+                csv.Append("\"" + t.ToString("yyyy-MM-dd HH:mm:ss") + "\",\"EXCEL\",\"数量計算.xlsx\"," + (t.Hour == 10 && t.Minute < 10 ? 400 : 0) + "\r\n");
+            Core.WriteText(Core.CsvPath(date), csv.ToString());
+            string afk = Path.Combine(Core.Dir, "離席_" + date + ".txt");
+            if (File.Exists(afk)) File.Delete(afk);
+            Afk.Put(new AfkEntry { Start = new DateTime(2026, 1, 5, 15, 0, 0), End = new DateTime(2026, 1, 5, 15, 40, 0), Memo = "現場の立会い" });
+            File.WriteAllText(Path.Combine(Core.Dir, "勤務履歴.log"),
+                "off\t2026-01-05 17:00:00\r\non\t2026-01-06 08:00:00\r\n", new UTF8Encoding(false));
+            File.WriteAllText(Path.Combine(Core.Dir, "ai_calls.log"),
+                "2026-01-05 08:35:00\t2026-01-04\ta.csv\tclaude\tx\tm\t1\t成功\r\n" +
+                "2026-01-05 09:40:00\t2026-01-05\ta.csv\tclaude\tx\tm\t1\t成功（追記）\r\n" +
+                "2026-01-05 13:40:00\t2026-01-05\ta.csv\tclaude\tx\tm\t1\t失敗: 利用枠\r\n" +
+                "2026-01-05 16:50:00\t2026-01-05\ta.csv\tclaude\tx\tm\t1\t成功（追記）\r\n", new UTF8Encoding(true));
+            return date;
+        }
+
         public static int Run()
         {
             var log = new StringBuilder();
@@ -3911,6 +4272,16 @@ namespace WorkLog
                "■工程 | ・09:00〜10:30 A工区の数量計算 | ・11:00〜12:00 B地区の協議資料 | ・13:00〜13:30 打合せ | ■軽作業 | ・10:40 メール対応 | #1");
             eq("FormatFix の直した数", n.ToString(), "3");
             eq("FormatFix の直せない行", string.Join(" | ", bad), "・現場の写真整理");
+
+            // 1日の帯: 記録 8:30〜17:59（10:00〜10:09 は無操作）、休憩 12:00〜13:00、離席 15:00〜15:40、17:00 に退勤
+            Slot[] day = DayStatus.Build(MakeDay(), Settings.Get());
+            Func<Slot, string> count = k => day.Count(x => x == k).ToString();
+            eq("帯の作業（分）", count(Slot.Work), "400");
+            eq("帯の無操作（分）", count(Slot.Idle), "10");
+            eq("帯の休憩（分）", count(Slot.Break), "60");
+            eq("帯の離席（分）", count(Slot.Afk), "40");
+            eq("帯の退勤（分）", count(Slot.Off), "420");
+            eq("AI の呼び出し", ClaudeCli.CallsOn(new DateTime(2026, 1, 5)).Count(c => c.Value) + "/" + ClaudeCli.CallsOn(new DateTime(2026, 1, 5)).Count, "3/4");
             log.Append(ng == 0 ? "すべて期待どおり\r\n" : ng + " 件が期待と違う\r\n");
             Core.WriteText(Path.Combine(Core.Dir, "selftest.log"), log.ToString());
             return ng == 0 ? 0 : 1;
@@ -3944,6 +4315,28 @@ namespace WorkLog
 
             // テスト用: 日報の書式を直す処理を確かめる（0=すべて期待どおり 1=違う）。結果は保存先の selftest.log
             if (args.Length >= 1 && args[0] == "--selftest" && Core.Test) return SelfTest.Run();
+
+            // テスト用: 日報画面の帯（テスト用の 2026-01-05）を画像にして終わる（見た目の確認）
+            if (args.Length >= 2 && args[0] == "--screenshot-timeline" && Core.Test)
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                string date = SelfTest.MakeDay();
+                using (var f = new Form { Text = "帯", Font = new Font("Meiryo UI", 10f), ClientSize = new Size(900, 80), StartPosition = FormStartPosition.CenterScreen })
+                {
+                    var t = new DayTimeline(null);
+                    f.Controls.Add(t);
+                    f.Show();
+                    t.SetDate(date);
+                    Application.DoEvents();
+                    using (var bmp = new Bitmap(t.Width, t.Height))
+                    {
+                        t.DrawToBitmap(bmp, new Rectangle(0, 0, t.Width, t.Height));
+                        bmp.Save(args[1], System.Drawing.Imaging.ImageFormat.Png);
+                    }
+                }
+                return 0;
+            }
 
             // テスト用: バージョン情報の画面を画像にして終わる（見た目の確認）
             if (args.Length >= 2 && args[0] == "--screenshot-about" && Core.Test)

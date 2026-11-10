@@ -46,7 +46,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.15.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.16.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -374,6 +374,161 @@ namespace WorkLog
                         return t.Name.Trim();
             }
             return null;
+        }
+
+        // ---- ウィンドウタイトルとタスクの対応（タスク_タイトル.txt: アプリ<TAB>タイトル<TAB>タスク<TAB>user か ai）----
+        // 「タイトルとタスク」の画面で利用者が付ける。手で付けた対応が LearnMin 件たまったら、残りは AI が手本から予測して付ける
+        public const string NoTask = "なし";   // タスクではないと決めたタイトル
+        public const int LearnMin = 10;
+        static string MapPath { get { return Path.Combine(Core.Dir, "タスク_タイトル.txt"); } }
+        static readonly object mapLock = new object();
+
+        public class TitleTask { public string Proc = "", Title = "", Task = ""; public bool ByAi; }
+
+        // 表記ゆれ（保存していない印の * ● と前後の空白、アプリ名の大文字小文字）をそろえた見出し
+        public static string Key(string proc, string title)
+        {
+            return (proc ?? "").Trim().ToLowerInvariant() + "\t" + (title ?? "").Trim().TrimStart('*', '●', '•').Trim();
+        }
+
+        public static Dictionary<string, TitleTask> LoadMap()
+        {
+            var map = new Dictionary<string, TitleTask>();
+            try
+            {
+                if (!File.Exists(MapPath)) return map;
+                foreach (string raw in Core.ReadText(MapPath).Split('\n'))
+                {
+                    string[] c = raw.TrimEnd('\r').Split('\t');
+                    if (c.Length < 3 || c[0].StartsWith("#") || c[2].Trim().Length == 0) continue;
+                    map[Key(c[0], c[1])] = new TitleTask { Proc = c[0].Trim(), Title = c[1].Trim(), Task = c[2].Trim(), ByAi = c.Length > 3 && c[3].Trim() == "ai" };
+                }
+            }
+            catch (Exception ex) { Core.Error("タスク", ex.Message); }
+            return map;
+        }
+
+        static void SaveMap(Dictionary<string, TitleTask> map)
+        {
+            var b = new StringBuilder("# ウィンドウタイトルとタスクの対応（アプリ<TAB>タイトル<TAB>タスク<TAB>手なら user、AI の予測なら ai）。「なし」はタスクではないタイトル\r\n");
+            foreach (TitleTask t in map.Values)
+                b.Append(Clean(t.Proc) + "\t" + Clean(t.Title) + "\t" + Clean(t.Task) + "\t" + (t.ByAi ? "ai" : "user") + "\r\n");
+            Core.WriteText(MapPath, b.ToString());
+        }
+
+        // 1つのタイトルのタスクを決める（空なら対応を消す）
+        public static void SetTitle(string proc, string title, string task, bool byAi)
+        {
+            lock (mapLock)
+            {
+                Dictionary<string, TitleTask> map = LoadMap();
+                string k = Key(proc, title);
+                if (string.IsNullOrWhiteSpace(task)) map.Remove(k);
+                else map[k] = new TitleTask { Proc = proc, Title = title, Task = task.Trim(), ByAi = byAi };
+                SaveMap(map);
+            }
+        }
+
+        public static int UserCount(Dictionary<string, TitleTask> map) { return map.Values.Count(x => !x.ByAi); }
+
+        // タスクの名前: タイトルの対応が先（「なし」ならタスクではない）。なければタイトルに出る語で
+        public static string Resolve(Dictionary<string, TitleTask> map, List<TaskItem> tasks, string proc, string title)
+        {
+            TitleTask t;
+            if (map.TryGetValue(Key(proc, title), out t)) return t.Task == NoTask ? null : t.Task;
+            return Match(tasks, proc, title);
+        }
+
+        // 最近 days 日の記録の、アプリ×タイトルごとの使った時間（分。多い順）
+        public static List<KeyValuePair<TitleTask, int>> RecentTitles(int days, Settings s)
+        {
+            var count = new Dictionary<string, KeyValuePair<TitleTask, int>>();
+            for (int i = 0; i < days; i++)
+            {
+                List<Row> rows = Reporter.ReadActive(DateTime.Today.AddDays(-i).ToString("yyyy-MM-dd"), s);
+                if (rows == null) continue;
+                foreach (Row r in rows)
+                {
+                    string k = Key(r.Proc, r.Title);
+                    KeyValuePair<TitleTask, int> v;
+                    count[k] = count.TryGetValue(k, out v)
+                        ? new KeyValuePair<TitleTask, int>(v.Key, v.Value + 1)
+                        : new KeyValuePair<TitleTask, int>(new TitleTask { Proc = r.Proc, Title = r.Title.Trim() }, 1);
+                }
+            }
+            return count.Values.Select(v => new KeyValuePair<TitleTask, int>(v.Key, Reporter.Minutes(v.Value))).OrderByDescending(v => v.Value).ToList();
+        }
+
+        // AI に見せるタイトル（伏せ字の設定を反映）
+        static string Shown(TitleTask t, Settings s)
+        {
+            string title;
+            if (!s.MaskProc.TryGetValue(t.Proc, out title)) title = t.Title;
+            foreach (string w in s.MaskWords) title = title.Replace(w, "＊＊");
+            return t.Proc + " | " + title;
+        }
+
+        // 手で付けた対応を手本に、対応のないタイトルのタスクを AI（ふだんのモデル）が予測して付ける。
+        // 手で付けた対応が LearnMin 件に満たないとき・タスクがないときは何もしない。付けた数を返す
+        public static int Predict(List<TitleTask> titles, Settings s)
+        {
+            Dictionary<string, TitleTask> map = LoadMap();
+            List<string> names = Load().Where(t => !t.Done && t.Name.Trim().Length > 0).Select(t => t.Name.Trim()).ToList();
+            if (UserCount(map) < LearnMin || names.Count == 0) return 0;
+            List<TitleTask> todo = titles.Where(t => t.Title.Trim().Length > 0 && !map.ContainsKey(Key(t.Proc, t.Title)))
+                .GroupBy(t => Key(t.Proc, t.Title)).Select(g => g.First()).Take(80).ToList();
+            if (todo.Count == 0) return 0;
+            List<TitleTask> examples = map.Values.Where(x => !x.ByAi).ToList();
+            examples = examples.Skip(Math.Max(0, examples.Count - 150)).ToList();
+            var allowed = new HashSet<string>(names.Concat(examples.Select(x => x.Task)).Concat(new[] { NoTask }));
+            string prompt =
+                "ウィンドウタイトルから、どのタスクの作業かを当ててください。\n" +
+                "下の「手本」は、利用者がアプリとウィンドウタイトルにタスクを付けたものです。同じ考え方で「当てるもの」にタスクを付けてください。\n\n" +
+                "条件:\n" +
+                "- タスクは「タスクの一覧」か手本にある名前から選ぶ。どれでもない・判断できないときは「" + NoTask + "」\n" +
+                "- 出力は「番号: タスク名」を1行ずつだけ（前置き・説明は不要）\n\n" +
+                "タスクの一覧: " + string.Join("、", allowed.Where(x => x != NoTask)) + "\n\n" +
+                "手本（アプリ | ウィンドウタイトル → タスク）:\n" + string.Concat(examples.Select(x => Shown(x, s) + " → " + x.Task + "\n")) + "\n" +
+                "当てるもの（番号: アプリ | ウィンドウタイトル）:\n" + string.Concat(todo.Select((x, i) => (i + 1) + ": " + Shown(x, s) + "\n"));
+            Dictionary<int, string> got = ParsePredict(ClaudeCli.Ask(prompt, s, DateTime.Today.ToString("yyyy-MM-dd"), "（タスクの予測）"));
+            int n = 0;
+            lock (mapLock)
+            {
+                map = LoadMap();
+                for (int i = 0; i < todo.Count; i++)
+                {
+                    string task, k = Key(todo[i].Proc, todo[i].Title);
+                    if (!got.TryGetValue(i + 1, out task) || !allowed.Contains(task) || map.ContainsKey(k)) continue;
+                    map[k] = new TitleTask { Proc = todo[i].Proc, Title = todo[i].Title, Task = task, ByAi = true };
+                    n++;
+                }
+                if (n > 0) SaveMap(map);
+            }
+            return n;
+        }
+
+        // 「番号: タスク名」の行を読む
+        public static Dictionary<int, string> ParsePredict(string answer)
+        {
+            var d = new Dictionary<int, string>();
+            foreach (string raw in (answer ?? "").Replace("\r\n", "\n").Split('\n'))
+            {
+                Match m = Regex.Match(raw.Trim(), @"^(\d+)\s*[:：.．)）]\s*(.+)$");
+                if (m.Success) d[int.Parse(m.Groups[1].Value)] = m.Groups[2].Value.Trim().Trim('「', '」').Trim();
+            }
+            return d;
+        }
+
+        // 日報を作る前に、その日の（MinMinutes 以上使った）タイトルで対応のないものを予測しておく。失敗しても日報は作る
+        public static void PredictFor(List<Row> active, Settings s)
+        {
+            try
+            {
+                List<TitleTask> titles = active.GroupBy(r => Key(r.Proc, r.Title)).Where(g => Reporter.Minutes(g.Count()) >= Math.Max(1, s.MinMinutes))
+                    .Select(g => new TitleTask { Proc = g.First().Proc, Title = g.First().Title.Trim() }).ToList();
+                Predict(titles, s);
+            }
+            catch (Exception ex) { Core.Error("タスクの予測", ex.Message); }
         }
 
         // AI に渡す決まり（終わっていないタスクがあるときだけ）
@@ -908,12 +1063,14 @@ namespace WorkLog
             var groups = new Dictionary<string, int>();
             var segs = new List<Seg>();
             List<TaskItem> tasks = Tasks.Load();
+            if (tasks.Any(x => !x.Done)) Tasks.PredictFor(active, s);   // 対応のないタイトルは AI が予測しておく（手本が足りなければ何もしない）
+            Dictionary<string, Tasks.TitleTask> map = Tasks.LoadMap();
             foreach (Row a in active)
             {
                 string t;
                 if (!s.MaskProc.TryGetValue(a.Proc, out t)) t = a.Title;
                 foreach (string w in s.MaskWords) t = t.Replace(w, "＊＊");
-                string task = Tasks.Match(tasks, a.Proc, a.Title);   // 伏せる前のタイトルで判定
+                string task = Tasks.Resolve(map, tasks, a.Proc, a.Title);   // 伏せる前のタイトルで判定
                 string k = a.Proc + "\t" + t + (task != null ? " 〔タスク: " + task + "〕" : "");
                 int n;
                 groups.TryGetValue(k, out n);
@@ -2912,6 +3069,174 @@ namespace WorkLog
         }
     }
 
+    // タイトルとタスク: 最近のウィンドウタイトルの一覧に、正しいタスク名を付ける。手で付けた対応が Tasks.LearnMin 件たまったら、残りは AI が予測する
+    class TaskTitleForm : Form
+    {
+        static readonly Color AiColor = Color.FromArgb(30, 90, 170), WordColor = Color.Gray;
+        readonly DataGridView grid = new DataGridView();
+        readonly Label info = new Label { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(8, 8, 8, 6), MaximumSize = new Size(960, 0) };
+        readonly Button predictBtn;
+        readonly AutoCompleteStringCollection names = new AutoCompleteStringCollection();
+        List<Tasks.TitleTask> titles = new List<Tasks.TitleTask>();
+        bool loading, predicting, autoTried;
+
+        public TaskTitleForm(Icon icon)
+        {
+            Text = "タイトルとタスク" + (Core.Test ? "（テスト）" : "");
+            Icon = icon;
+            AutoScaleDimensions = new SizeF(96f, 96f);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            Font = new Font("Meiryo UI", 10f);
+            ClientSize = new Size(1000, 640);
+            MinimumSize = new Size(700, 420);
+            StartPosition = FormStartPosition.CenterScreen;
+
+            grid.Dock = DockStyle.Fill;
+            grid.BackgroundColor = SystemColors.Window;
+            grid.RowHeadersVisible = false;
+            grid.AllowUserToAddRows = false;
+            grid.AllowUserToDeleteRows = false;
+            grid.AllowUserToResizeRows = false;
+            grid.SelectionMode = DataGridViewSelectionMode.CellSelect;
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "使った時間", ReadOnly = true, Width = 90, DefaultCellStyle = { Alignment = DataGridViewContentAlignment.MiddleRight } });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "アプリ", ReadOnly = true, Width = 110 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "ウィンドウタイトル", ReadOnly = true, AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タスク（ここに書く）", Width = 220 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "付け方", ReadOnly = true, Width = 90 });
+            foreach (DataGridViewColumn c in grid.Columns) c.SortMode = DataGridViewColumnSortMode.NotSortable;   // 行の順番と titles をそろえておく
+            grid.EditingControlShowing += (o, e) =>
+            {
+                var tb = e.Control as TextBox;
+                if (tb == null) return;
+                bool task = grid.CurrentCell != null && grid.CurrentCell.ColumnIndex == 3;
+                tb.AutoCompleteMode = task ? AutoCompleteMode.SuggestAppend : AutoCompleteMode.None;
+                tb.AutoCompleteSource = task ? AutoCompleteSource.CustomSource : AutoCompleteSource.None;
+                if (task) tb.AutoCompleteCustomSource = names;
+            };
+            grid.CellValueChanged += (o, e) => { if (!loading && e.RowIndex >= 0 && e.ColumnIndex == 3) Edited(e.RowIndex); };
+
+            var bar = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, Padding = new Padding(6, 6, 6, 4) };
+            AddButton(bar, "読み直す", (o, e) => Reload());
+            predictBtn = AddButton(bar, "AI で残りを予測する", (o, e) => RunPredict(true));
+            AddButton(bar, "閉じる", (o, e) => Close());
+
+            Controls.Add(grid);
+            Controls.Add(info);
+            Controls.Add(bar);
+            Shown += (o, e) => Reload();
+        }
+
+        static Button AddButton(FlowLayoutPanel bar, string text, EventHandler click)
+        {
+            var b = new Button { Text = text, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8, 2, 8, 2), Margin = new Padding(3) };
+            b.Click += click;
+            bar.Controls.Add(b);
+            return b;
+        }
+
+        // 最近14日のタイトル（使った時間の長い順に400件まで）と、今の対応を出す
+        void Reload()
+        {
+            Settings s = Settings.Get();
+            List<KeyValuePair<Tasks.TitleTask, int>> recent = Tasks.RecentTitles(14, s).Take(400).ToList();
+            Dictionary<string, Tasks.TitleTask> map = Tasks.LoadMap();
+            List<TaskItem> tasks = Tasks.Load();
+            names.Clear();
+            names.AddRange(tasks.Where(t => !t.Done).Select(t => t.Name.Trim()).Concat(map.Values.Select(x => x.Task)).Concat(new[] { Tasks.NoTask }).Distinct().ToArray());
+            loading = true;
+            grid.Rows.Clear();
+            titles = recent.Select(r => r.Key).ToList();
+            foreach (KeyValuePair<Tasks.TitleTask, int> r in recent)
+            {
+                Tasks.TitleTask m;
+                string task = "", how = "";
+                Color color = SystemColors.WindowText;
+                if (map.TryGetValue(Tasks.Key(r.Key.Proc, r.Key.Title), out m)) { task = m.Task; how = m.ByAi ? "AI の予測" : "手"; if (m.ByAi) color = AiColor; }
+                else
+                {
+                    string w = Tasks.Match(tasks, r.Key.Proc, r.Key.Title);
+                    if (w != null) { task = w; how = "語で一致"; color = WordColor; }
+                }
+                int i = grid.Rows.Add(DayStatus.Span(r.Value), r.Key.Proc, r.Key.Title, task, how);
+                grid.Rows[i].Cells[3].Style.ForeColor = color;
+            }
+            loading = false;
+            UpdateInfo(map);
+            // 手本がたまっていて、対応のないタイトルがあれば、開いたときに1回だけ AI が予測する
+            if (!autoTried && Tasks.UserCount(map) >= Tasks.LearnMin && titles.Any(t => !map.ContainsKey(Tasks.Key(t.Proc, t.Title))))
+            {
+                autoTried = true;
+                RunPredict(false);
+            }
+        }
+
+        void UpdateInfo(Dictionary<string, Tasks.TitleTask> map)
+        {
+            int user = Tasks.UserCount(map);
+            int ai = titles.Count(t => { Tasks.TitleTask m; return map.TryGetValue(Tasks.Key(t.Proc, t.Title), out m) && m.ByAi; });
+            int none = titles.Count(t => !map.ContainsKey(Tasks.Key(t.Proc, t.Title)));
+            info.Text = "最近14日のウィンドウタイトルです。「タスク（ここに書く）」に正しいタスク名を書いてください（候補が出ます。タスクでないものは「" + Tasks.NoTask + "」）。" +
+                        "新しい名前を書くと、タスクの一覧にも足します。\r\n" +
+                        "手で付けた " + user + " 件・AI の予測 " + ai + " 件（青字）・まだ付いていない " + none + " 件。" +
+                        (user < Tasks.LearnMin
+                            ? "手で " + Tasks.LearnMin + " 件付けると、残りを AI が予測して付けます（あと " + (Tasks.LearnMin - user) + " 件）。"
+                            : "残りは AI が手本から予測して付けます（日報を作るときも、その日のタイトルを予測します）。AI の予測を直すと、手で付けたものになります。") +
+                        "灰色は「タイトルに出る語」で当てはまったもの（直すと手で付けたものになります）。";
+            predictBtn.Enabled = !predicting && user >= Tasks.LearnMin && none > 0;
+        }
+
+        // タスク名が書かれた・直された: 手で付けた対応として残す（空なら対応を消す）。新しい名前はタスクの一覧にも足す
+        void Edited(int row)
+        {
+            Tasks.TitleTask t = titles[row];
+            string task = Convert.ToString(grid.Rows[row].Cells[3].Value).Trim();
+            try
+            {
+                Tasks.SetTitle(t.Proc, t.Title, task, false);
+                List<TaskItem> list = Tasks.Load();
+                if (task.Length > 0 && task != Tasks.NoTask && !list.Any(x => x.Name.Trim() == task))
+                {
+                    list.Add(new TaskItem { Name = task });
+                    Tasks.Save(list);
+                    names.Add(task);
+                }
+            }
+            catch (Exception ex) { MessageBox.Show(this, "保存できませんでした: " + ex.Message, "タイトルとタスク"); return; }
+            loading = true;
+            grid.Rows[row].Cells[3].Style.ForeColor = SystemColors.WindowText;
+            grid.Rows[row].Cells[4].Value = task.Length > 0 ? "手" : "";
+            loading = false;
+            UpdateInfo(Tasks.LoadMap());
+        }
+
+        void RunPredict(bool byUser)
+        {
+            if (predicting) return;
+            predicting = true;
+            predictBtn.Enabled = false;
+            string keep = info.Text;
+            info.Text = "AI がタイトルからタスクを予測しています…（1分ほどかかることがあります）\r\n" + keep;
+            List<Tasks.TitleTask> list = titles.ToList();
+            var th = new Thread(() =>
+            {
+                int n = 0;
+                string error = null;
+                try { n = Tasks.Predict(list, Settings.Get()); }
+                catch (Exception ex) { error = ex.Message; Core.Error("タスクの予測", ex.Message); }
+                if (IsDisposed) return;
+                BeginInvoke((Action)(() =>
+                {
+                    predicting = false;
+                    Reload();
+                    if (error != null) MessageBox.Show(this, "AI で予測できませんでした: " + error, "タイトルとタスク", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    else if (byUser) MessageBox.Show(this, n + " 件のタイトルに、AI がタスクを付けました（青字）。違うものは直してください。", "タイトルとタスク");
+                }));
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+    }
+
     // 時刻の入力欄。4桁（1430）で 14:30。ホイールか ↑↓ で、時の上（左側）なら1時間、分の上（右側）なら1分ずつ変わる。
     // Shift か Ctrl を押しながらのホイールは、どこでも1時間ずつ。空なら時刻なし
     class TimeBox : TextBox
@@ -3241,7 +3566,8 @@ namespace WorkLog
                 AutoSize = true, MaximumSize = new Size(W - 16, 0), ForeColor = Color.DimGray, Margin = new Padding(3, 0, 3, 4),
                 Text = "タスクの名前と、前面のウィンドウのタイトルに出る語（ファイル名・フォルダ名・案件名など。カンマ区切り）を書いてください。" +
                        "タイトルに語が入っている時間は、そのタスクとして日報に書きます（上にあるタスクが先）。語が空ならタスクの名前で探します。" +
-                       "終わったら「完了」に印を。行を選んで Delete で消せます。"
+                       "終わったら「完了」に印を。行を選んで Delete で消せます。\n" +
+                       "「タイトル一覧でタスクを付ける」では、最近のウィンドウタイトルにタスクを1つずつ付けられます（" + Tasks.LearnMin + " 件付けると、残りは AI が予測）。"
             };
             taskGrid.Dock = DockStyle.Fill;
             taskGrid.BackgroundColor = SystemColors.Window;
@@ -3255,7 +3581,15 @@ namespace WorkLog
             taskGrid.CellValueChanged += (o, e) => SaveTasks();
             taskGrid.UserDeletedRow += (o, e) => SaveTasks();
             taskInfo.MaximumSize = new Size(W - 16, 0);
-            Control[] rows = { title, hint, taskGrid, taskInfo };
+            var titlesBtn = new Button { Text = "タイトル一覧でタスクを付ける…", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(6, 2, 6, 2), Margin = new Padding(3, 2, 3, 6) };
+            titlesBtn.Font = new Font(Font, FontStyle.Bold);
+            titlesBtn.Click += (o, e) =>
+            {
+                using (var f = new TaskTitleForm(Icon)) f.ShowDialog(this);
+                LoadTasks();
+                UpdateTaskInfo();
+            };
+            Control[] rows = { title, hint, titlesBtn, taskGrid, taskInfo };
             foreach (Control c in rows)
             {
                 p.RowStyles.Add(c == taskGrid ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.AutoSize));
@@ -3299,11 +3633,12 @@ namespace WorkLog
                 List<TaskItem> tasks = Tasks.Load();
                 if (!tasks.Any(t => !t.Done)) { taskInfo.Text = "まだタスクはありません。上の表に書いてください。"; return; }
                 List<Row> rows = Reporter.ReadActive(DateTime.Today.ToString("yyyy-MM-dd"), Settings.Get()) ?? new List<Row>();
+                Dictionary<string, Tasks.TitleTask> map = Tasks.LoadMap();
                 var count = new Dictionary<string, int>();
                 int none = 0;
                 foreach (Row r in rows)
                 {
-                    string t = Tasks.Match(tasks, r.Proc, r.Title);
+                    string t = Tasks.Resolve(map, tasks, r.Proc, r.Title);
                     if (t == null) { none++; continue; }
                     int n;
                     count.TryGetValue(t, out n);
@@ -4766,6 +5101,18 @@ namespace WorkLog
             eq("タスク: 名前", Tasks.Match(tl, "EXCEL", "全体R8工程表.xlsx"), "R8工程表");
             eq("タスク: 完了は使わない", Tasks.Match(tl, "EXCEL", "数量計算.xlsx") ?? "(なし)", "(なし)");
             eq("タスク: アプリ名", Tasks.Match(tl, "OUTLOOK", "受信トレイ"), "メール");
+
+            eq("タイトルの見出し", Tasks.Key("EXCEL", " *数量計算.xlsx - Excel "), "excel\t数量計算.xlsx - Excel");
+            var tmap = new Dictionary<string, Tasks.TitleTask>
+            {
+                { Tasks.Key("EXCEL", "〇〇橋_数量計算.xlsx - Excel"), new Tasks.TitleTask { Task = "別のタスク" } },
+                { Tasks.Key("chrome", "YouTube"), new Tasks.TitleTask { Task = Tasks.NoTask } },
+            };
+            eq("タイトルの対応が語より先", Tasks.Resolve(tmap, tl, "EXCEL", "●〇〇橋_数量計算.xlsx - Excel"), "別のタスク");
+            eq("「なし」はタスクではない", Tasks.Resolve(tmap, tl, "CHROME", "YouTube") ?? "(なし)", "(なし)");
+            eq("対応がなければ語", Tasks.Resolve(tmap, tl, "OUTLOOK", "受信トレイ"), "メール");
+            Dictionary<int, string> pp = Tasks.ParsePredict("1: 〇〇橋 詳細設計\n2：なし\nわかりません\n3. 「R8工程表」");
+            eq("予測の読み取り", string.Join(" | ", pp.OrderBy(x => x.Key).Select(x => x.Key + "=" + x.Value)), "1=〇〇橋 詳細設計 | 2=なし | 3=R8工程表");
 
             // AIで直す（会話）: 返事と日報の案に分ける
             string reply, rep;

@@ -46,7 +46,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.16.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.17.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -383,7 +383,7 @@ namespace WorkLog
         static string MapPath { get { return Path.Combine(Core.Dir, "タスク_タイトル.txt"); } }
         static readonly object mapLock = new object();
 
-        public class TitleTask { public string Proc = "", Title = "", Task = ""; public bool ByAi; }
+        public class TitleTask { public string Proc = "", Title = "", Task = ""; public bool ByAi; public DateTime Last; }
 
         // 表記ゆれ（保存していない印の * ● と前後の空白、アプリ名の大文字小文字）をそろえた見出し
         public static string Key(string proc, string title)
@@ -451,9 +451,8 @@ namespace WorkLog
                 {
                     string k = Key(r.Proc, r.Title);
                     KeyValuePair<TitleTask, int> v;
-                    count[k] = count.TryGetValue(k, out v)
-                        ? new KeyValuePair<TitleTask, int>(v.Key, v.Value + 1)
-                        : new KeyValuePair<TitleTask, int>(new TitleTask { Proc = r.Proc, Title = r.Title.Trim() }, 1);
+                    if (count.TryGetValue(k, out v)) { if (r.Time > v.Key.Last) v.Key.Last = r.Time; count[k] = new KeyValuePair<TitleTask, int>(v.Key, v.Value + 1); }
+                    else count[k] = new KeyValuePair<TitleTask, int>(new TitleTask { Proc = r.Proc, Title = r.Title.Trim(), Last = r.Time }, 1);
                 }
             }
             return count.Values.Select(v => new KeyValuePair<TitleTask, int>(v.Key, Reporter.Minutes(v.Value))).OrderByDescending(v => v.Value).ToList();
@@ -799,11 +798,7 @@ namespace WorkLog
         // 見つからないときの案内（「AIの接続先」に出す）
         public static string NotFoundHelp()
         {
-            return "探した場所: PATH（デスクトップアプリ本体の Claude.exe は除く）、%USERPROFILE%\\.local\\bin、" +
-                   "Claude デスクトップアプリの中（%APPDATA% と %LOCALAPPDATA% の Claude\\claude-code など。ストア版は Packages の中）\r\n" +
-                   "下の「詳しく探す」で PC の中をもっと広く探せます。" +
-                   "デスクトップアプリの版によっては Claude Code を外から使える形で持っていないので、そのときは「Claude Code の入れ方（公式のページ）」の手順で入れてください" +
-                   "（ログインは今のプランのアカウントでできます）。";
+            return "「詳しく探す」で検索、または「Claude Code の入れ方」を参照。";
         }
 
         // どこの Claude Code か（「AIの接続先」に出す）
@@ -1365,14 +1360,14 @@ namespace WorkLog
                 // 失敗扱いにして、ログインを直したあとの自動作成で作り直す（今の日報があれば消さない）
                 r.Ok = false;
                 r.NeedLogin = true;
-                r.Message = ex.Message + "。トレイのメニュー「AIの接続先」で確かめてください" + (merge ? "（今の日報はそのままです）" : "");
+                r.Message = ex.Message + "（AIの接続先）";
                 if (merge) return r;
                 body = "（" + r.Message + "。直すと自動で作り直します。急ぐときは下の文を Claude に貼ってください）\n\n" + prompt;
             }
             catch (Exception ex)
             {
                 r.Ok = false;
-                r.Message = ex.Message + (merge ? "（今の日報はそのままです）" : "");
+                r.Message = ex.Message;
                 Core.Error("日報 " + date, "AI失敗: " + ex.Message);
                 if (merge) return r;
                 body = "（AIで日報を作れませんでした: " + ex.Message + "）\n" +
@@ -1426,13 +1421,13 @@ namespace WorkLog
             {
                 r.Ok = false;
                 r.NeedLogin = true;
-                r.Message = ex.Message + "。今の日報はそのままです";
+                r.Message = ex.Message + "（日報は変更なし）";
                 return r;
             }
             catch (Exception ex)
             {
                 r.Ok = false;
-                r.Message = "作り直せませんでした: " + ex.Message + "。今の日報はそのままです";
+                r.Message = "作り直しエラー: " + ex.Message + "（日報は変更なし）";
                 Core.Error("作り直し " + date, ex.Message);
                 return r;
             }
@@ -1452,7 +1447,7 @@ namespace WorkLog
                 {
                     SaveOld(date, "作り直し案", text);
                     r.Ok = false;
-                    r.Message = "作り直しているあいだに日報が直されたので、今の日報はそのままです（作り直した案は old フォルダ）";
+                    r.Message = "日報が別に更新されたため変更なし（案は old フォルダ）";
                     return r;
                 }
                 if (Norm(text) != Norm(existing))
@@ -1465,10 +1460,7 @@ namespace WorkLog
             ApplyAllAfk(date);
             SaveState(date, active[active.Count - 1].Time, true);
             r.Ok = true;
-            r.Message = changed == 0
-                ? "今の日報はそのままです（直すところ・足す作業はありませんでした）"
-                : "今の日報をもとに、直した・足した行 " + changed + " 件（青字ではありません。前の日報は old フォルダ）" +
-                  (restored > 0 ? "。AI が落とした行 " + restored + " 件はそのまま戻しました" : "");
+            r.Message = changed == 0 ? "変更なし" : "変更 " + changed + " 行" + (restored > 0 ? "（元の行 " + restored + " 件を復元）" : "");
             return r;
         }
 
@@ -1797,7 +1789,7 @@ namespace WorkLog
             }
             SaveState(date, all[all.Count - 1].Time, true);
             r.Ok = true;
-            r.Message = n > 0 ? n + "件を追記しました" : "追記する作業はありませんでした";
+            r.Message = n > 0 ? "追記 " + n + " 件" : "追記なし";
             r.Appended = true;
             return r;
         }
@@ -1965,6 +1957,7 @@ namespace WorkLog
         public const string Repo = "sarumogu2013-glitch/AutoNippou";
         public const string Page = "https://github.com/" + Repo + "/releases/latest";
         public const string Releases = "https://github.com/" + Repo + "/releases";
+        public const string Help = "https://github.com/" + Repo + "/blob/main/HELP.md";
         public class Release { public string Tag, Version, Notes, Url, ZipName, ZipUrl, Digest; }
 
         static string Dir { get { return Path.Combine(Core.Dir, "update"); } }
@@ -2191,9 +2184,35 @@ namespace WorkLog
             afkTimer.Tick += (o, e) => CheckAfk();
             afkTimer.Start();
             if (show) ShowForm(null);
-            CheckAi();
-            if (updated) Balloon("作業ログを " + Core.Version + " に更新しました", "変わったところは日報画面のメニュー「ヘルプ → バージョン情報」で見られます", ToolTipIcon.Info, () => ShowForm(null));
-            if (firstRun && !Core.Test) AskStartup();
+            if (updated) Balloon(Core.Version + " に更新", "更新履歴: ヘルプ → バージョン情報", ToolTipIcon.Info, () => ShowForm(null));
+            if (firstRun && !Core.Test) { AskStartup(); FirstAiSetup(); }
+            else CheckAi();
+        }
+
+        // 初めての起動: Claude Code が見つからなければ「詳しく探す」も行い、見つけたものを使う。そのあと AI の接続を確かめる
+        void FirstAiSetup()
+        {
+            var t = new Thread(() =>
+            {
+                string found = null;
+                try
+                {
+                    Settings s = Settings.Get();
+                    if (ClaudeCli.FindExe(s) == null)
+                    {
+                        List<KeyValuePair<string, string>> list = ClaudeCli.DeepSearch(null);
+                        if (list.Count > 0) { found = list[0].Key; Settings.SetClaudePath(found); }
+                    }
+                }
+                catch (Exception ex) { Core.Error("初回の AI の確認", ex.Message); }
+                ui.Post(_ =>
+                {
+                    if (found != null) Balloon("Claude Code を設定", found, ToolTipIcon.Info, ShowAiForm);
+                    CheckAi();
+                }, null);
+            });
+            t.IsBackground = true;
+            t.Start();
         }
 
         // 初めての起動: スタートアップに登録するか聞く（あとからトレイのメニューか設定のタブ「起動」で変えられる）
@@ -2202,11 +2221,8 @@ namespace WorkLog
             try
             {
                 if (StartupPath() != null) return;
-                if (MessageBox.Show("作業ログを Windows 起動時に自動で起動しますか？\n（作業の記録は、起動しているあいだだけ取れます）\n\n" +
-                        "あとからトレイのアイコンを右クリック →「Windows 起動時に自動で起動する」で変えられます。",
-                        "作業ログ", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                if (MessageBox.Show("Windows 起動時に自動で起動しますか？", "作業ログ", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
                 SetStartup(true);
-                Balloon("自動で起動するように登録しました", "登録した場所: " + Application.ExecutablePath, ToolTipIcon.Info, null);
             }
             catch (Exception ex) { Core.Error("スタートアップ", ex.Message); }
         }
@@ -2242,7 +2258,7 @@ namespace WorkLog
         // manual: メニューの「更新を確認」（結果を必ず知らせる）
         public void CheckUpdate(bool manual)
         {
-            if (checking) { if (manual) Balloon("更新", "更新を確かめている最中です", ToolTipIcon.Info, null); return; }
+            if (checking) { if (manual) Balloon("更新", "確認中", ToolTipIcon.Info, null); return; }
             if (pendingExe != null) { if (manual) { applyNow = true; TryApply(); } return; }
             checking = true;
             bool auto = Settings.Get().AutoUpdate;
@@ -2291,15 +2307,14 @@ namespace WorkLog
             }
             if (rel.Version == failedVersion || rel.Version == notifiedVersion) return;
             notifiedVersion = rel.Version;
-            Balloon("作業ログの新しい版 " + rel.Version + " があります", "クリックすると更新します", ToolTipIcon.Info, () => ConfirmUpdate(rel));
+            Balloon("新しい版 " + rel.Version, "クリックで更新", ToolTipIcon.Info, () => ConfirmUpdate(rel));
         }
 
         void ConfirmUpdate(Updater.Release rel)
         {
             string notes = (rel.Notes ?? "").Trim();
             if (notes.Length > 600) notes = notes.Substring(0, 600) + "…";
-            if (MessageBox.Show("新しい版 " + rel.Version + " があります（今は " + Updater.Current + "）。\n\n" + (notes.Length > 0 ? notes + "\n\n" : "") +
-                    "今すぐ更新しますか？\n作業ログが数秒止まって起動し直します。記録・日報・設定はそのまま引き継がれます。",
+            if (MessageBox.Show("新しい版 " + rel.Version + "（今は " + Updater.Current + "）\n\n" + (notes.Length > 0 ? notes + "\n\n" : "") + "更新しますか？",
                     "更新を確認", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             checking = true;
             var t = new Thread(() =>
@@ -2334,7 +2349,7 @@ namespace WorkLog
             if (pendingExe == null) return;
             if (busy)
             {
-                if (applyNow) Balloon("更新", "日報を作り終えたら更新します", ToolTipIcon.Info, null);
+                if (applyNow) Balloon("更新", "日報の作成後に更新", ToolTipIcon.Info, null);
                 return;   // 次の記録のときにまた試す
             }
             if (!applyNow && (Shown(form) || Shown(askForm) || Shown(settingsForm) || Shown(aiForm))) return;
@@ -2353,7 +2368,7 @@ namespace WorkLog
             {
                 failedVersion = rel.Version;
                 Updater.Log(rel.Version + " に入れ替えられませんでした: " + ex.Message);
-                Balloon("作業ログを更新できませんでした", ex.Message + "\nクリックするとリリースのページを開きます（zip から手で置き換えられます）",
+                Balloon("更新できません", ex.Message + "\nクリックでリリースのページ",
                     ToolTipIcon.Warning, () => { try { Process.Start(rel.Url); } catch { } });
                 return;
             }
@@ -2421,7 +2436,7 @@ namespace WorkLog
             if (shown) form.SaveQuiet();   // 手で直していた本文を先に保存
             bool applied = false;
             try { applied = Reporter.ApplyAfk(e); }
-            catch (Exception ex) { Core.Error("離席メモ", ex.Message); Balloon("離席メモ", "日報に足せませんでした: " + ex.Message, ToolTipIcon.Warning, null); }
+            catch (Exception ex) { Core.Error("離席メモ", ex.Message); Balloon("離席メモ", "日報に追加できません: " + ex.Message, ToolTipIcon.Warning, null); }
             if (!applied) Afk.Put(e);
             if (shown) form.ReportUpdated(date);
         }
@@ -2442,7 +2457,7 @@ namespace WorkLog
             lastInput = now;   // 退勤中のあいだを離席にしない
             logger.Tick();
             UpdateDuty();
-            Balloon("出勤しました（" + now.ToString("HH:mm") + "）", "作業の記録を始めました" + (manual ? "" : "（操作があったので出勤とみなしました）"), ToolTipIcon.Info, null);
+            Balloon("出勤（" + now.ToString("HH:mm") + "）", manual ? "記録開始" : "記録開始（操作を検知）", ToolTipIcon.Info, null);
             CheckAi();
             if (!busy && now >= started.AddMinutes(2)) { lastAuto = now; Run(() => Reporter.Auto(Settings.Get()), false, true); }
         }
@@ -2454,8 +2469,7 @@ namespace WorkLog
             offAt = at;
             Duty.Save(true, at);
             UpdateDuty();
-            Balloon("退勤しました（" + at.ToString("HH:mm") + "）", (manual ? "" : "操作がないので退勤とみなしました。") +
-                "記録を止めて待機します。次に出勤するときはトレイのメニューか日報画面の「出勤」", ToolTipIcon.Info, null);
+            Balloon("退勤（" + at.ToString("HH:mm") + "）", manual ? "記録停止" : "記録停止（操作なし）", ToolTipIcon.Info, null);
             if (askForm != null && !askForm.IsDisposed && askForm.Visible) askForm.Hide();
             if (!busy) { lastAuto = DateTime.Now; Run(() => Reporter.Auto(Settings.Get(), true), false, true); }
         }
@@ -2485,7 +2499,7 @@ namespace WorkLog
                 ClaudeCli.Auth auth;
                 string problem = ClaudeCli.Problem(Settings.Get(), out exe, out auth);
                 if (problem != null)
-                    ui.Post(_ => Balloon("AI（Claude Code）を使えません", problem + "\nクリックすると接続先を開きます", ToolTipIcon.Warning, ShowAiForm), null);
+                    ui.Post(_ => Balloon("AI（Claude Code）を使えません", problem, ToolTipIcon.Warning, ShowAiForm), null);
             });
             t.IsBackground = true;
             t.Start();
@@ -2592,7 +2606,7 @@ namespace WorkLog
 
         public void Generate(string date)
         {
-            if (busy) { Balloon("日報", "日報を作っている最中です。少し待ってください", ToolTipIcon.Info, null); return; }
+            if (busy) { Balloon("日報", "作成中", ToolTipIcon.Info, null); return; }
             Run(() => new List<Result> { Reporter.Make(date, Settings.Get()) }, true, true);
         }
 
@@ -2634,8 +2648,8 @@ namespace WorkLog
                 open = r.Date;
                 string d = r.Date;
                 if (r.NeedLogin) needLogin = r;
-                else if (!r.Ok) Balloon("日報 " + d + " をAIで作れませんでした", r.Message + "\nあとで自動でもう一度試します", ToolTipIcon.Warning, () => ShowForm(d));
-                else Balloon("日報 " + d + (r.Appended ? " に追記しました" : " ができました"), r.Message ?? "クリックすると開きます", ToolTipIcon.Info, () => ShowForm(d));
+                else if (!r.Ok) Balloon("日報 " + d + " を作れません", r.Message, ToolTipIcon.Warning, () => ShowForm(d));
+                else Balloon("日報 " + d + (r.Appended ? " 追記" : " 作成"), r.Message ?? "", ToolTipIcon.Info, () => ShowForm(d));
             }
             // ログインが原因のときは、日報画面ではなく接続先の画面へ案内する
             if (needLogin != null) Balloon("AI（Claude Code）を使えません", needLogin.Message, ToolTipIcon.Warning, ShowAiForm);
@@ -3073,8 +3087,9 @@ namespace WorkLog
     class TaskTitleForm : Form
     {
         static readonly Color AiColor = Color.FromArgb(30, 90, 170), WordColor = Color.Gray;
+        const int TaskCol = 4, HowCol = 5;
         readonly DataGridView grid = new DataGridView();
-        readonly Label info = new Label { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(8, 8, 8, 6), MaximumSize = new Size(960, 0) };
+        readonly Label info = new Label { Dock = DockStyle.Top, AutoSize = false, Height = 30, Padding = new Padding(8, 8, 8, 4) };
         readonly Button predictBtn;
         readonly AutoCompleteStringCollection names = new AutoCompleteStringCollection();
         List<Tasks.TitleTask> titles = new List<Tasks.TitleTask>();
@@ -3099,21 +3114,22 @@ namespace WorkLog
             grid.AllowUserToResizeRows = false;
             grid.SelectionMode = DataGridViewSelectionMode.CellSelect;
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "使った時間", ReadOnly = true, Width = 90, DefaultCellStyle = { Alignment = DataGridViewContentAlignment.MiddleRight } });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "最近", ReadOnly = true, Width = 95 });
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "アプリ", ReadOnly = true, Width = 110 });
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "ウィンドウタイトル", ReadOnly = true, AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill });
-            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タスク（ここに書く）", Width = 220 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タスク", Width = 220 });
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "付け方", ReadOnly = true, Width = 90 });
             foreach (DataGridViewColumn c in grid.Columns) c.SortMode = DataGridViewColumnSortMode.NotSortable;   // 行の順番と titles をそろえておく
             grid.EditingControlShowing += (o, e) =>
             {
                 var tb = e.Control as TextBox;
                 if (tb == null) return;
-                bool task = grid.CurrentCell != null && grid.CurrentCell.ColumnIndex == 3;
+                bool task = grid.CurrentCell != null && grid.CurrentCell.ColumnIndex == TaskCol;
                 tb.AutoCompleteMode = task ? AutoCompleteMode.SuggestAppend : AutoCompleteMode.None;
                 tb.AutoCompleteSource = task ? AutoCompleteSource.CustomSource : AutoCompleteSource.None;
                 if (task) tb.AutoCompleteCustomSource = names;
             };
-            grid.CellValueChanged += (o, e) => { if (!loading && e.RowIndex >= 0 && e.ColumnIndex == 3) Edited(e.RowIndex); };
+            grid.CellValueChanged += (o, e) => { if (!loading && e.RowIndex >= 0 && e.ColumnIndex == TaskCol) Edited(e.RowIndex); };
 
             var bar = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, Padding = new Padding(6, 6, 6, 4) };
             AddButton(bar, "読み直す", (o, e) => Reload());
@@ -3151,14 +3167,14 @@ namespace WorkLog
                 Tasks.TitleTask m;
                 string task = "", how = "";
                 Color color = SystemColors.WindowText;
-                if (map.TryGetValue(Tasks.Key(r.Key.Proc, r.Key.Title), out m)) { task = m.Task; how = m.ByAi ? "AI の予測" : "手"; if (m.ByAi) color = AiColor; }
+                if (map.TryGetValue(Tasks.Key(r.Key.Proc, r.Key.Title), out m)) { task = m.Task; how = m.ByAi ? "AI" : "手"; if (m.ByAi) color = AiColor; }
                 else
                 {
                     string w = Tasks.Match(tasks, r.Key.Proc, r.Key.Title);
-                    if (w != null) { task = w; how = "語で一致"; color = WordColor; }
+                    if (w != null) { task = w; how = "語"; color = WordColor; }
                 }
-                int i = grid.Rows.Add(DayStatus.Span(r.Value), r.Key.Proc, r.Key.Title, task, how);
-                grid.Rows[i].Cells[3].Style.ForeColor = color;
+                int i = grid.Rows.Add(DayStatus.Span(r.Value), r.Key.Last == DateTime.MinValue ? "" : r.Key.Last.ToString("MM/dd HH:mm"), r.Key.Proc, r.Key.Title, task, how);
+                grid.Rows[i].Cells[TaskCol].Style.ForeColor = color;
             }
             loading = false;
             UpdateInfo(map);
@@ -3175,13 +3191,8 @@ namespace WorkLog
             int user = Tasks.UserCount(map);
             int ai = titles.Count(t => { Tasks.TitleTask m; return map.TryGetValue(Tasks.Key(t.Proc, t.Title), out m) && m.ByAi; });
             int none = titles.Count(t => !map.ContainsKey(Tasks.Key(t.Proc, t.Title)));
-            info.Text = "最近14日のウィンドウタイトルです。「タスク（ここに書く）」に正しいタスク名を書いてください（候補が出ます。タスクでないものは「" + Tasks.NoTask + "」）。" +
-                        "新しい名前を書くと、タスクの一覧にも足します。\r\n" +
-                        "手で付けた " + user + " 件・AI の予測 " + ai + " 件（青字）・まだ付いていない " + none + " 件。" +
-                        (user < Tasks.LearnMin
-                            ? "手で " + Tasks.LearnMin + " 件付けると、残りを AI が予測して付けます（あと " + (Tasks.LearnMin - user) + " 件）。"
-                            : "残りは AI が手本から予測して付けます（日報を作るときも、その日のタイトルを予測します）。AI の予測を直すと、手で付けたものになります。") +
-                        "灰色は「タイトルに出る語」で当てはまったもの（直すと手で付けたものになります）。";
+            info.Text = "最近14日　手 " + user + " 件・AI " + ai + " 件・未入力 " + none + " 件" +
+                        (user < Tasks.LearnMin ? "　（AI の予測まで あと " + (Tasks.LearnMin - user) + " 件）" : "");
             predictBtn.Enabled = !predicting && user >= Tasks.LearnMin && none > 0;
         }
 
@@ -3189,7 +3200,7 @@ namespace WorkLog
         void Edited(int row)
         {
             Tasks.TitleTask t = titles[row];
-            string task = Convert.ToString(grid.Rows[row].Cells[3].Value).Trim();
+            string task = Convert.ToString(grid.Rows[row].Cells[TaskCol].Value).Trim();
             try
             {
                 Tasks.SetTitle(t.Proc, t.Title, task, false);
@@ -3201,10 +3212,10 @@ namespace WorkLog
                     names.Add(task);
                 }
             }
-            catch (Exception ex) { MessageBox.Show(this, "保存できませんでした: " + ex.Message, "タイトルとタスク"); return; }
+            catch (Exception ex) { MessageBox.Show(this, "保存できません: " + ex.Message, "タイトルとタスク"); return; }
             loading = true;
-            grid.Rows[row].Cells[3].Style.ForeColor = SystemColors.WindowText;
-            grid.Rows[row].Cells[4].Value = task.Length > 0 ? "手" : "";
+            grid.Rows[row].Cells[TaskCol].Style.ForeColor = SystemColors.WindowText;
+            grid.Rows[row].Cells[HowCol].Value = task.Length > 0 ? "手" : "";
             loading = false;
             UpdateInfo(Tasks.LoadMap());
         }
@@ -3214,8 +3225,7 @@ namespace WorkLog
             if (predicting) return;
             predicting = true;
             predictBtn.Enabled = false;
-            string keep = info.Text;
-            info.Text = "AI がタイトルからタスクを予測しています…（1分ほどかかることがあります）\r\n" + keep;
+            info.Text = "AI で予測中…";
             List<Tasks.TitleTask> list = titles.ToList();
             var th = new Thread(() =>
             {
@@ -3228,8 +3238,8 @@ namespace WorkLog
                 {
                     predicting = false;
                     Reload();
-                    if (error != null) MessageBox.Show(this, "AI で予測できませんでした: " + error, "タイトルとタスク", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    else if (byUser) MessageBox.Show(this, n + " 件のタイトルに、AI がタスクを付けました（青字）。違うものは直してください。", "タイトルとタスク");
+                    if (error != null) MessageBox.Show(this, "予測できません: " + error, "タイトルとタスク", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    else if (byUser) MessageBox.Show(this, "AI の予測: " + n + " 件", "タイトルとタスク");
                 }));
             });
             th.IsBackground = true;
@@ -3390,7 +3400,7 @@ namespace WorkLog
         readonly ComboBox reqKind = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 140 };
         readonly TextBox reqText = new TextBox { Multiline = true, AcceptsReturn = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill };
         readonly CheckBox reqEnv = new CheckBox { Text = "アプリの版と Windows の版を添える", AutoSize = true, Checked = true, Margin = new Padding(3, 6, 3, 2) };
-        readonly Button reqSend = new Button { Text = "GitHub に送る（ブラウザが開きます）", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8, 2, 8, 2), Margin = new Padding(3, 6, 3, 3) };
+        readonly Button reqSend = new Button { Text = "GitHub に送る", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8, 2, 8, 2), Margin = new Padding(3, 6, 3, 3) };
         readonly Label reqStatus = new Label { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 3) };
         readonly Label afkHead = new Label { AutoSize = true, Margin = new Padding(3, 6, 3, 4) };
         readonly DataGridView afkGrid = new DataGridView();
@@ -3509,6 +3519,7 @@ namespace WorkLog
             mError = Item(tools, "エラーの記録を開く(&E)", () => Process.Start("notepad.exe", "\"" + Path.Combine(Core.Dir, "error.log") + "\""));
             tools.DropDownOpening += (o, e) => mError.Enabled = File.Exists(Path.Combine(Core.Dir, "error.log"));
             ToolStripMenuItem help = TopMenu(menu, "ヘルプ(&H)");
+            Item(help, "使い方(&H)", () => { try { Process.Start(Updater.Help); } catch { } });
             Item(help, "更新を確認(&U)…", () => app.CheckUpdate(true));
             Item(help, "リリースのページを開く(&R)", () => Process.Start(Updater.Page));
             help.DropDownItems.Add(new ToolStripSeparator());
@@ -3520,6 +3531,7 @@ namespace WorkLog
             center.Controls.Add(BuildAddBar());
             center.Controls.Add(timeline);
             Controls.Add(center);
+            Controls.Add(new Splitter { Dock = DockStyle.Right, Width = 5, MinExtra = 300, MinSize = W });   // 右の欄の幅をドラッグで変える
             Controls.Add(BuildRight());
             Controls.Add(list);
             Controls.Add(bar);
@@ -3555,41 +3567,34 @@ namespace WorkLog
             return tabs;
         }
 
-        // 右の欄のタブ「タスク」: 今取り掛かっているタスクと、ウィンドウタイトルに出る語。当てはまった時間は日報にそのタスク名で書く
+        // 右の欄のタブ「タスク」: タスクとタイトルに出る語。今日当てはまった時間と、最近当てはまった日時を出す
         Control BuildTaskPanel()
         {
             var p = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(4, 2, 2, 2), BackColor = PanelBack };
             p.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            var title = new Label { Text = "今取り掛かっているタスク", AutoSize = true, Font = new Font(Font, FontStyle.Bold), Margin = new Padding(3, 6, 3, 2) };
-            var hint = new Label
+            var title = new Label { Text = "タスク", AutoSize = true, Font = new Font(Font, FontStyle.Bold), Margin = new Padding(3, 6, 3, 2) };
+            var titlesBtn = new Button { Text = "タイトル一覧でタスクを付ける…", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(6, 2, 6, 2), Margin = new Padding(3, 2, 3, 4) };
+            titlesBtn.Click += (o, e) =>
             {
-                AutoSize = true, MaximumSize = new Size(W - 16, 0), ForeColor = Color.DimGray, Margin = new Padding(3, 0, 3, 4),
-                Text = "タスクの名前と、前面のウィンドウのタイトルに出る語（ファイル名・フォルダ名・案件名など。カンマ区切り）を書いてください。" +
-                       "タイトルに語が入っている時間は、そのタスクとして日報に書きます（上にあるタスクが先）。語が空ならタスクの名前で探します。" +
-                       "終わったら「完了」に印を。行を選んで Delete で消せます。\n" +
-                       "「タイトル一覧でタスクを付ける」では、最近のウィンドウタイトルにタスクを1つずつ付けられます（" + Tasks.LearnMin + " 件付けると、残りは AI が予測）。"
+                using (var f = new TaskTitleForm(Icon)) f.ShowDialog(this);
+                LoadTasks();
             };
             taskGrid.Dock = DockStyle.Fill;
             taskGrid.BackgroundColor = SystemColors.Window;
             taskGrid.RowHeadersWidth = 24;
             taskGrid.AllowUserToResizeRows = false;
             taskGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
-            taskGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タスク", FillWeight = 45 });
-            taskGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タイトルに出る語", FillWeight = 55, ToolTipText = "例: 〇〇橋,R8工程表（カンマ区切り）" });
+            taskGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タスク", FillWeight = 40, MinimumWidth = 60 });
+            taskGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タイトルに出る語", FillWeight = 45, MinimumWidth = 60, ToolTipText = "カンマ区切り" });
+            taskGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "今日", ReadOnly = true, AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells });
+            taskGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "最近", ReadOnly = true, AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells });
             taskGrid.Columns.Add(new DataGridViewCheckBoxColumn { HeaderText = "完了", AutoSizeMode = DataGridViewAutoSizeColumnMode.ColumnHeader });
+            taskGrid.Columns[2].DefaultCellStyle.ForeColor = taskGrid.Columns[3].DefaultCellStyle.ForeColor = Color.DimGray;
             taskGrid.CurrentCellDirtyStateChanged += (o, e) => { if (taskGrid.IsCurrentCellDirty && taskGrid.CurrentCell is DataGridViewCheckBoxCell) taskGrid.CommitEdit(DataGridViewDataErrorContexts.Commit); };
-            taskGrid.CellValueChanged += (o, e) => SaveTasks();
+            taskGrid.CellValueChanged += (o, e) => { if (e.ColumnIndex != 2 && e.ColumnIndex != 3) SaveTasks(); };
             taskGrid.UserDeletedRow += (o, e) => SaveTasks();
-            taskInfo.MaximumSize = new Size(W - 16, 0);
-            var titlesBtn = new Button { Text = "タイトル一覧でタスクを付ける…", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(6, 2, 6, 2), Margin = new Padding(3, 2, 3, 6) };
-            titlesBtn.Font = new Font(Font, FontStyle.Bold);
-            titlesBtn.Click += (o, e) =>
-            {
-                using (var f = new TaskTitleForm(Icon)) f.ShowDialog(this);
-                LoadTasks();
-                UpdateTaskInfo();
-            };
-            Control[] rows = { title, hint, titlesBtn, taskGrid, taskInfo };
+            taskInfo.MaximumSize = new Size(0, 0);
+            Control[] rows = { title, titlesBtn, taskGrid, taskInfo };
             foreach (Control c in rows)
             {
                 p.RowStyles.Add(c == taskGrid ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.AutoSize));
@@ -3603,8 +3608,9 @@ namespace WorkLog
         {
             taskLoading = true;
             taskGrid.Rows.Clear();
-            foreach (TaskItem t in Tasks.Load()) taskGrid.Rows.Add(t.Name, t.Keywords, t.Done);
+            foreach (TaskItem t in Tasks.Load()) taskGrid.Rows.Add(t.Name, t.Keywords, "", "", t.Done);
             taskLoading = false;
+            UpdateTaskInfo();
         }
 
         void SaveTasks()
@@ -3617,43 +3623,52 @@ namespace WorkLog
                 string name = Convert.ToString(r.Cells[0].Value).Trim(), words = Convert.ToString(r.Cells[1].Value).Trim();
                 if (name.Length == 0 && words.Length == 0) continue;
                 if (name.Length == 0) name = words.Split(',', '、')[0].Trim();   // 名前が空なら最初の語を名前に
-                list.Add(new TaskItem { Name = name, Keywords = words, Done = r.Cells[2].Value is bool && (bool)r.Cells[2].Value });
+                list.Add(new TaskItem { Name = name, Keywords = words, Done = r.Cells[4].Value is bool && (bool)r.Cells[4].Value });
             }
             try { Tasks.Save(list); }
-            catch (Exception ex) { taskInfo.ForeColor = Color.Firebrick; taskInfo.Text = "保存できませんでした: " + ex.Message; return; }
+            catch (Exception ex) { taskInfo.ForeColor = Color.Firebrick; taskInfo.Text = "保存できません: " + ex.Message; return; }
             UpdateTaskInfo();
         }
 
-        // 今日の記録で、それぞれのタスクに当てはまった時間（語が合っているかを確かめる）
+        // 今日当てはまった時間（列「今日」）と、最近14日で最後に当てはまった日時（列「最近」mm/dd HH:mm）
         void UpdateTaskInfo()
         {
             taskInfo.ForeColor = Color.DimGray;
             try
             {
+                Settings s = Settings.Get();
                 List<TaskItem> tasks = Tasks.Load();
-                if (!tasks.Any(t => !t.Done)) { taskInfo.Text = "まだタスクはありません。上の表に書いてください。"; return; }
-                List<Row> rows = Reporter.ReadActive(DateTime.Today.ToString("yyyy-MM-dd"), Settings.Get()) ?? new List<Row>();
                 Dictionary<string, Tasks.TitleTask> map = Tasks.LoadMap();
-                var count = new Dictionary<string, int>();
+                var today = new Dictionary<string, int>();
+                var last = new Dictionary<string, DateTime>();
                 int none = 0;
-                foreach (Row r in rows)
+                for (int i = 0; i < 14; i++)
                 {
-                    string t = Tasks.Resolve(map, tasks, r.Proc, r.Title);
-                    if (t == null) { none++; continue; }
-                    int n;
-                    count.TryGetValue(t, out n);
-                    count[t] = n + 1;
-                }
-                taskInfo.Text = "今日の記録で当てはまった時間:\r\n" +
-                    string.Join("\r\n", tasks.Where(t => !t.Done).Select(t =>
+                    List<Row> rows = Reporter.ReadActive(DateTime.Today.AddDays(-i).ToString("yyyy-MM-dd"), s);
+                    if (rows == null) continue;
+                    foreach (Row r in rows)
                     {
-                        int n;
-                        count.TryGetValue(t.Name.Trim(), out n);
-                        return "　" + t.Name.Trim() + " … " + (n > 0 ? DayStatus.Span(Reporter.Minutes(n)) : "なし");
-                    })) +
-                    "\r\n　どれにも当てはまらない … " + DayStatus.Span(Reporter.Minutes(none));
+                        string t = Tasks.Resolve(map, tasks, r.Proc, r.Title);
+                        if (t == null) { if (i == 0) none++; continue; }
+                        DateTime d;
+                        if (!last.TryGetValue(t, out d) || r.Time > d) last[t] = r.Time;
+                        if (i == 0) { int n; today.TryGetValue(t, out n); today[t] = n + 1; }
+                    }
+                }
+                taskLoading = true;
+                foreach (DataGridViewRow row in taskGrid.Rows)
+                {
+                    if (row.IsNewRow) continue;
+                    string name = Convert.ToString(row.Cells[0].Value).Trim();
+                    int n;
+                    DateTime d;
+                    row.Cells[2].Value = today.TryGetValue(name, out n) ? DayStatus.Span(Reporter.Minutes(n)) : "";
+                    row.Cells[3].Value = last.TryGetValue(name, out d) ? d.ToString("MM/dd HH:mm") : "";
+                }
+                taskLoading = false;
+                taskInfo.Text = "今日 タスク外: " + DayStatus.Span(Reporter.Minutes(none));
             }
-            catch (Exception ex) { taskInfo.Text = "確かめられませんでした: " + ex.Message; }
+            catch (Exception ex) { taskLoading = false; taskInfo.Text = "集計できません: " + ex.Message; }
         }
 
         // 右の欄のタブ「要望」: 名前・種類・内容を書いて、GitHub の Issue の作成画面を開く
@@ -3666,8 +3681,7 @@ namespace WorkLog
             var hint = new Label
             {
                 AutoSize = true, MaximumSize = new Size(W - 16, 0), ForeColor = Color.DimGray, Margin = new Padding(3, 0, 3, 2),
-                Text = "このソフトの GitHub のページ（Issues）に送ります。ブラウザで作成画面が開くので、内容を確かめて「Create」を押してください。" +
-                       "送るには GitHub のアカウント（無料）が要ります。\n送った内容は誰でも見られます。社名や日報の中身など、見られて困ることは書かないでください。"
+                Text = "GitHub の Issues に送る（GitHub のアカウントが必要・内容は公開）"
             };
             foreach (string k in new[] { "要望", "不具合", "質問", "その他" }) reqKind.Items.Add(k);
             reqKind.SelectedIndex = 0;
@@ -3677,7 +3691,7 @@ namespace WorkLog
             reqSend.Font = new Font(Font, FontStyle.Bold);
             reqSend.Click += (o, e) => SendRequest();
             reqStatus.MaximumSize = new Size(W - 16, 0);
-            Control[] rows = { title, hint, lbl("名前（GitHub に出す表示名。空でもよい）"), reqName, lbl("種類"), reqKind, lbl("内容"), reqText, reqEnv, reqSend, reqStatus };
+            Control[] rows = { title, hint, lbl("名前"), reqName, lbl("種類"), reqKind, lbl("内容"), reqText, reqEnv, reqSend, reqStatus };
             foreach (Control c in rows)
             {
                 p.RowStyles.Add(c == reqText ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.AutoSize));
@@ -3698,9 +3712,7 @@ namespace WorkLog
             try { Process.Start(url); }
             catch (Exception ex) { reqStatus.ForeColor = Color.Firebrick; reqStatus.Text = "ブラウザを開けませんでした: " + ex.Message; return; }
             reqStatus.ForeColor = Color.DimGray;
-            reqStatus.Text = "ブラウザで GitHub の作成画面を開きました。「Create」を押すと送られます" +
-                             (truncated ? "（長いので途中までを入れました。続きはクリップボードにあります）" : "") +
-                             "。書いた内容は保存フォルダの「要望」フォルダにも残しました";
+            reqStatus.Text = "作成画面を開きました" + (truncated ? "（全文はクリップボード）" : "");
             reqText.Text = "";
         }
 
@@ -3729,10 +3741,10 @@ namespace WorkLog
             row.Controls.Add(lbl("終了"));
             row.Controls.Add(endBox);
             row.Controls.Add(now(endBox));
-            Label hint = lbl("4桁かホイールで時刻を変更（時の上か Shift+ホイールで1時間、分の上で1分）。開始だけなら軽作業");
+            Label hint = lbl("開始だけなら軽作業");
             hint.ForeColor = Color.DimGray;
             row.Controls.Add(hint);
-            string boxTip = "4桁で入力（1430 → 14:30）。\nホイールか ↑↓ で、時の上（左側）なら1時間、分の上（右側）なら1分ずつ変わります。\nShift か Ctrl を押しながらホイールを回すと、どこでも1時間ずつ変わります";
+            string boxTip = "4桁で入力（1430 → 14:30）\nホイール・↑↓: 時の上で1時間、分の上で1分\nShift+ホイール: 1時間";
             tip.SetToolTip(startBox, boxTip);
             tip.SetToolTip(endBox, boxTip);
             tip.SetToolTip(breakCheck, "印を外すと、この日は休憩なし（休憩の時間の操作も日報に入れ、休憩の行を消す）");
@@ -3808,7 +3820,7 @@ namespace WorkLog
             try { Reporter.SetBreakFlag(current, false); }
             catch (Exception ex) { message.Text = "休憩なしにできませんでした: " + ex.Message; return; }
             LoadBreak();
-            message.Text = "休憩の行を消したので、この日は休憩なしにしました（下の「休憩」に印を付けると戻ります）";
+            message.Text = "この日は休憩なし";
         }
 
         public void SetDuty(bool off)
@@ -3838,7 +3850,7 @@ namespace WorkLog
             var freeHead = new Label
             {
                 AutoSize = true, MaximumSize = new Size(W - 12, 0), Margin = new Padding(3, 10, 3, 2),
-                Text = "時刻のわからないメモ（1行に1つ。離席時間と照らして、AI が時刻を決めます）"
+                Text = "時刻のわからないメモ（1行に1つ）"
             };
             freeMemo.TextChanged += (o, e) => { if (!loading) freeDirty = true; };
             p.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -3901,7 +3913,7 @@ namespace WorkLog
             if (!Visible || sample) return;   // 次に開いたときに読み直す
             if (Previewing)
             {
-                if (date == current) message.Text = "日報に追記がありました。AI の案を確定するときに確認が出ます";
+                if (date == current) message.Text = "日報に追記あり";
                 return;
             }
             RefreshList(current);
@@ -3934,13 +3946,12 @@ namespace WorkLog
             var hint = new Label
             {
                 AutoSize = true, MaximumSize = new Size(W - 16, 0), ForeColor = Color.DimGray, Margin = new Padding(3, 0, 3, 4),
-                Text = "真ん中の日報をもとに、AI と会話しながら直します。行頭の番号で指せます。\n" +
-                       "例:「3番は△△橋の図面確認」「時刻のない行に時刻を入れて」「書式を整えて」「5番を消して番号を振り直して」"
+                Text = "日報の直し方を AI に頼む（行は番号で指定）"
             };
             var notesHead = new Label
             {
                 AutoSize = true, MaximumSize = new Size(W - 16, 0), Margin = new Padding(3, 8, 3, 2), ForeColor = Color.DimGray,
-                Text = "この日の訂正の記録（作り直すときにも AI に渡します）"
+                Text = "訂正の記録"
             };
             chatView.Font = new Font(Font.FontFamily, Font.Size * 0.95f);
             askBtn.Font = new Font(Font, FontStyle.Bold);
@@ -4090,12 +4101,12 @@ namespace WorkLog
             LoadAfk();
             LoadBreak();
             Text = "日報 サンプル" + (Core.Test ? "（テスト）" : "");
-            if (!busy) message.Text = "見本を表示しています（左の日付を選ぶと戻ります）";
+            if (!busy) message.Text = "見本";
             SetAiStatus("", false);
             UpdateButtons();
         }
 
-        const string BusyText = "日報を作っています…（1分ほどかかることがあります）";
+        const string BusyText = "日報を作成中…";
 
         public void SetBusy(bool b)
         {
@@ -4210,7 +4221,7 @@ namespace WorkLog
         {
             if (Previewing)
             {
-                DialogResult r = MessageBox.Show(this, "AI の案をまだ確定していません。\n\nはい: 確定して保存する\nいいえ: 元に戻す", "日報",
+                DialogResult r = MessageBox.Show(this, "AI の案を保存しますか？\n\nはい: 確定して保存\nいいえ: 元に戻す", "日報",
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                 if (r == DialogResult.Yes && Accept()) return;
                 Revert();
@@ -4236,7 +4247,7 @@ namespace WorkLog
                     string dir = Path.Combine(Core.Dir, "old");
                     Directory.CreateDirectory(dir);
                     Core.WriteText(Path.Combine(dir, "日報_" + current + "_手直し_" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt"), Body());
-                    message.Text = "日報がほかで書き換えられていたので、手で直した内容は old フォルダに残しました";
+                    message.Text = "日報が別に更新されたため、手で直した内容は old フォルダに保存";
                 }
                 else
                 {
@@ -4305,13 +4316,13 @@ namespace WorkLog
             instruction.Text = "";
             aiRunning = true;
             UpdateButtons();
-            SetAiStatus("AI が考えています…（1分ほどかかることがあります。そのあいだも本文は直せます）", false);
+            SetAiStatus("AI が応答中…", false);
             var t = new Thread(() =>
             {
                 string result = null, reply = null, error = null;
                 try { result = Reporter.Chat(date, sent, history, inst, noteText, Settings.Get(), out reply); }
-                catch (NeedLoginException ex) { error = ex.Message + "。メニュー「ツール → AIの接続先」で確かめてください"; }
-                catch (Exception ex) { error = "AI に頼めませんでした: " + ex.Message; Core.Error("AIで直す " + date, ex.Message); }
+                catch (NeedLoginException ex) { error = ex.Message + "（ツール → AIの接続先）"; }
+                catch (Exception ex) { error = "AI エラー: " + ex.Message; Core.Error("AIで直す " + date, ex.Message); }
                 if (IsDisposed) return;
                 BeginInvoke((Action)(() => AiDone(date, sent, inst, result, reply, error)));
             });
@@ -4324,15 +4335,15 @@ namespace WorkLog
             aiRunning = false;
             if (error != null) { SetAiStatus(error, true); UpdateButtons(); return; }
             Reporter.AddChat(date, false, reply);
-            if (date != current) { SetAiStatus(date + " の返事が来ましたが、日付を切り替えたので案は使いませんでした（会話には残しました）", true); UpdateButtons(); return; }
+            if (date != current) { SetAiStatus(date + " の案（日付が変わったため使いません）", true); UpdateButtons(); return; }
             chat.Add(new KeyValuePair<bool, string>(false, reply));
             AppendChat(false, reply);
             if (result == null) { SetAiStatus("", false); UpdateButtons(); return; }   // 返事・質問だけ
             if (Norm(Body()) != Norm(sent) &&
-                MessageBox.Show(this, "AI に頼んだあとに本文を手で直しています。\nAI の案に置き換えますか？（いいえ: 案を使わない）", "日報",
+                MessageBox.Show(this, "本文が変わっています。AI の案に置き換えますか？", "日報",
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
             {
-                SetAiStatus("AI の案は使いませんでした", false);
+                SetAiStatus("案は使いません", false);
                 UpdateButtons();
                 return;
             }
@@ -4348,9 +4359,7 @@ namespace WorkLog
             // 頼んだことを訂正の記録に足す（確定すると保存。元に戻すと消える）
             string line = "・" + Reporter.ResolveNumbers(inst, sent).Replace("\r\n", " ").Replace("\n", " ");
             if (!notes.Text.Contains(line)) notes.Text = (notes.Text.TrimEnd() + "\r\n" + line).Trim();
-            SetAiStatus(Norm(result) == Norm(previewBase)
-                ? "AI の案は元の日報と同じでした"
-                : "青字が AI の直した行です。本文をそのまま直してもかまいません。よければ「確定して保存」", false);
+            SetAiStatus(Norm(result) == Norm(previewBase) ? "変更なし" : "青字: AI が直した行", false);
             UpdateButtons();
         }
 
@@ -4379,7 +4388,7 @@ namespace WorkLog
             if (!Previewing || current == null) return false;
             string path = Core.ReportPath(current);
             if (File.Exists(path) && File.GetLastWriteTime(path) != loadedStamp &&
-                MessageBox.Show(this, "AI に頼んだあとに、日報が別に書き換えられています（自動の作り直しなど）。\nそれでも置き換えますか？", "日報",
+                MessageBox.Show(this, "日報が別に更新されています。置き換えますか？", "日報",
                     MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return false;
             try
             {
@@ -4390,13 +4399,13 @@ namespace WorkLog
                 previewBase = null;
                 dirty = notesDirty = false;
                 SetText(Body());
-                SetAiStatus("確定して保存しました（前の版は old フォルダ）", false);
-                message.Text = "AI で直した日報を保存しました（" + DateTime.Now.ToString("HH:mm") + "）";
+                SetAiStatus("保存（前の版は old フォルダ）", false);
+                message.Text = "保存（" + DateTime.Now.ToString("HH:mm") + "）";
                 BreakRemoved(before, Body());
                 UpdateButtons();
                 return true;
             }
-            catch (Exception ex) { SetAiStatus("保存できませんでした: " + ex.Message, true); return false; }
+            catch (Exception ex) { SetAiStatus("保存できません: " + ex.Message, true); return false; }
         }
 
         void Revert()
@@ -4408,7 +4417,7 @@ namespace WorkLog
             loading = false;
             dirty = previewDirty;
             previewBase = null;
-            SetAiStatus("AI の案を取り消して、元に戻しました", false);
+            SetAiStatus("元に戻しました", false);
             UpdateButtons();
         }
 
@@ -4417,8 +4426,7 @@ namespace WorkLog
             if (date == null || app.Busy) return;
             // まだ日報の形になっていない日（AI に失敗した日など）は、合成せずに作り直すだけなので聞かない
             if (File.Exists(Core.ReportPath(date)) && Core.ReadText(Core.ReportPath(date)).Contains("■") &&
-                MessageBox.Show(this, date + " の日報を作り直しますか？\n\n真ん中の日報をもとに、" + Settings.Get().FixModel + " が書式を直し、時刻のない行に時刻を入れ、" +
-                    "作業ログにしかない作業を足します。書いてある作業は残し、消した作業は足し直しません。\n前の日報は old フォルダに残します。", "日報",
+                MessageBox.Show(this, date + " の日報を作り直しますか？", "日報",
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             SaveIfDirty();
             app.Generate(date);
@@ -4506,7 +4514,7 @@ namespace WorkLog
             head.Text = e.Range + "（" + e.Duration + "）PC から離れていました。\nそのあいだ何をしていましたか？";
             memo.Text = e.Memo;
             note.ForeColor = Color.DimGray;
-            note.Text = "書いた内容はこの時間の作業として、すぐ日報に足します。あとで日報画面の「離席メモ」でも書けます";
+            note.Text = "この時間の作業として日報に入ります";
             Rectangle wa = Screen.PrimaryScreen.WorkingArea;
             Location = new Point(wa.Right - Width - 12, wa.Bottom - Height - 12);
         }
@@ -4580,10 +4588,10 @@ namespace WorkLog
         readonly Action saved;
         readonly DateTimePicker reportTime = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 90 };
         readonly NumericUpDown idle = Num(30, 3600), minMinutes = Num(0, 60), minDay = Num(0, 600), redo = Num(1, 600), catchUp = Num(1, 60), keep = Num(7, 3650);
-        readonly CheckBox openWindow = new CheckBox { Text = "日報ができたら日報画面を開く（外すと通知だけ）", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
+        readonly CheckBox openWindow = new CheckBox { Text = "日報ができたら日報画面を開く", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
         readonly CheckBox startup = new CheckBox { Text = "Windows 起動時に自動で起動する", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
-        readonly CheckBox autoUpdate = new CheckBox { Text = "新しい版が出たら自動で更新する（外すと知らせるだけ）", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
-        readonly CheckBox afkAsk = new CheckBox { Text = "離席から戻ったときに、何をしていたか聞く（外すと日報画面の「離席メモ」に書くだけ）", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
+        readonly CheckBox autoUpdate = new CheckBox { Text = "新しい版が出たら自動で更新する", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
+        readonly CheckBox afkAsk = new CheckBox { Text = "離席から戻ったときに何をしていたか聞く", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
         readonly NumericUpDown afkMinutes = Num(0, 240), appendMinutes = Num(0, 480), offIdle = Num(0, 600);
         readonly DateTimePicker workStart = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 90 };
         readonly CheckBox breakOn = new CheckBox { Text = "休憩時間", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 6, 6, 4) };
@@ -4619,20 +4627,14 @@ namespace WorkLog
             breakRow.Controls.Add(breakEnd);
             breakOn.CheckedChanged += (o, e) => breakStart.Enabled = breakEnd.Enabled = breakOn.Checked;
             Add(t, Auto(), breakRow);
-            Add(t, Auto(), Hint("日報に休憩の行を入れ、休憩時間の PC 操作は日報に入れません。この時間の離席は休憩として記録し、何をしていたか聞きません。\r\n日によって休憩なしにするときは、日報画面の下の「休憩」の印を外します"));
             Add(t, Auto(), L("自動で作るのは、操作時間が"), minDay, L("分以上の日だけ"));
             Add(t, Auto(), L("日報を作ったあとに"), redo, L("分以上作業したら追記する"));
             Add(t, Auto(), L("未作成の日報をさかのぼって探す"), catchUp, L("日"));
             Add(t, Auto(), openWindow);
-            Add(t, Auto(), Hint("追記では、今ある行（手で直した行も）は変えません。「作り直す」は、作り直した案と今の日報を「AIで直す」のモデルで合成します（前の2つは old フォルダ）"));
 
             t = Page(tabs, "出勤・退勤", 3);
             Add(t, Auto(), L("退勤中でも、この時刻を過ぎて操作があれば出勤"), workStart, L("（記録と AI を始める）"));
             Add(t, Auto(), L("仕上げの時刻を過ぎて、操作が"), offIdle, L("分なかったら退勤（0 で自動で退勤しない）"));
-            Add(t, Auto(), Hint("仕上げの時刻は「日報」の欄の「今日の日報を仕上げて知らせる時刻」です。\r\n" +
-                                "退勤すると今日の日報を仕上げ（残りの作業を追記）、記録と AI を止めて待機します。\r\n" +
-                                "トレイのメニューか日報画面の「出勤」「退勤」でも切り替えられます。\r\n" +
-                                "退勤を押したあと、その日のうちは自動では出勤しません（次の日の朝に操作があれば出勤）"));
 
             t = Page(tabs, "記録・集計", 3);
             Add(t, Auto(), L("無操作がこの時間続いたら離席扱い"), idle, L("秒"));
@@ -4640,7 +4642,6 @@ namespace WorkLog
             Add(t, Auto(), L("ログと古い日報を残す"), keep, L("日（これより古いものは削除）"));
             Add(t, Auto(), L("入力がこの時間なかったら離席として記録"), afkMinutes, L("分（0 で記録しない）"));
             Add(t, Auto(), afkAsk);
-            Add(t, Auto(), Hint("記録は " + Core.IntervalSec + " 秒ごとです。保存先: " + Core.Dir));
 
             t = Page(tabs, "除外・伏せ字", 1);
             Add(t, Auto(), L("集計しないプロセス（1行に1つ。例: explorer）"));
@@ -4652,29 +4653,20 @@ namespace WorkLog
 
             t = Page(tabs, "AI", 3);
             Add(t, Auto(), L("日報を作るモデル（ふだん）"), model);
-            Add(t, Auto(), Hint("毎日の自動作成に使います。claude-haiku-5-5 がいちばん利用枠を使いません"));
             Add(t, Auto(), L("「AIで直す」のモデル（高度）"), fixModel);
-            Add(t, Auto(), Hint("違いを直すときだけ使います。claude-opus-5-5 は賢いぶん利用枠を多く使います。略称ではなく正式な名前で"));
             var browse = new Button { Text = "参照…", AutoSize = true };
             browse.Click += (o, e) => Browse();
             Add(t, Auto(), L("Claude Code の場所"), claudePath, browse);
-            Add(t, Auto(), Hint(@"空のときは PATH、%USERPROFILE%\.local\bin、Claude デスクトップアプリの中（%APPDATA%\Claude\claude-code）の順に自動で探します"));
             var ai = new Button { Text = "AIの接続先を確かめる…", AutoSize = true, Margin = new Padding(3, 12, 3, 3) };
             ai.Click += (o, e) => showAi();
             Add(t, Auto(), ai);
 
             t = Page(tabs, "起動", 1);
             Add(t, Auto(), startup);
-            Add(t, Auto(), Hint(Core.Test ? "テスト中は登録できません" : "登録する場所: " + Application.ExecutablePath +
-                                             "\r\nexe を別の場所へ動かしたら、いったん外してから付け直してください" +
-                                             "\r\nトレイのアイコンを右クリックしたメニューでも登録・解除できます"));
             Add(t, Auto(), autoUpdate);
             var folder = new Button { Text = "保存フォルダを開く", AutoSize = true, Margin = new Padding(3, 16, 3, 3) };
             folder.Click += (o, e) => { try { Process.Start("explorer.exe", "\"" + Core.Dir + "\""); } catch (Exception ex) { Fail("開けませんでした: " + ex.Message); } };
             Add(t, Auto(), folder);
-            Add(t, Auto(), Hint("作業の記録・日報・設定・エラーの記録を保存しているフォルダです"));
-            Add(t, Auto(), Hint("12時間ごとに GitHub のリリースを確かめます。新しい版は、日報画面を閉じているときに入れ替えて起動し直します" +
-                                "\r\n（記録・日報・設定はそのまま）。いつでも日報画面のメニュー「ヘルプ → 更新を確認」で確かめられます"));
 
             foreach (string m in Models) { model.Items.Add(m); fixModel.Items.Add(m); }
             mask.Columns.Add("proc", "プロセス名（例: OUTLOOK）");
@@ -4883,7 +4875,7 @@ namespace WorkLog
             info.Dock = DockStyle.Top;
             info.Height = 250;
 
-            var label = new Label { Text = "■ 最近の呼び出し（新しい順。日報1日分ごとに、元のログ・使ったログイン・モデル・トークン数）", Dock = DockStyle.Top, Height = 28, TextAlign = ContentAlignment.BottomLeft };
+            var label = new Label { Text = "■ 最近の呼び出し", Dock = DockStyle.Top, Height = 28, TextAlign = ContentAlignment.BottomLeft };
 
             history.View = View.Details;
             history.FullRowSelect = true;
@@ -4897,7 +4889,7 @@ namespace WorkLog
             recheck = AddButton(bar, "再確認", (o, e) => Recheck(true));
             AddButton(bar, "ログイン（ブラウザが開きます）", (o, e) => Login());
             deep = AddButton(bar, "詳しく探す", (o, e) => Deep());
-            AddButton(bar, "Claude Code の入れ方（公式のページ）", (o, e) => Install());
+            AddButton(bar, "Claude Code の入れ方", (o, e) => Install());
             AddButton(bar, "履歴ファイルを開く", (o, e) =>
             {
                 string p = Path.Combine(Core.Dir, "ai_calls.log");
@@ -4927,28 +4919,24 @@ namespace WorkLog
         {
             deep.Enabled = recheck.Enabled = false;
             info.ForeColor = SystemColors.WindowText;
-            info.Text = "PC の中の Claude Code を探しています（1分ほどかかることがあります）…";
+            info.Text = "検索中…";
             var t = new Thread(() =>
             {
-                List<KeyValuePair<string, string>> found = ClaudeCli.DeepSearch(m => BeginInvoke((Action)(() => info.Text = "PC の中の Claude Code を探しています…\r\n" + m)));
+                List<KeyValuePair<string, string>> found = ClaudeCli.DeepSearch(m => BeginInvoke((Action)(() => info.Text = "検索中… " + m)));
                 BeginInvoke((Action)(() =>
                 {
                     deep.Enabled = recheck.Enabled = true;
                     if (found.Count == 0)
                     {
                         info.ForeColor = Color.Firebrick;
-                        info.Text = "PC の中に、外から使える Claude Code は見つかりませんでした。\r\n" +
-                                    "このデスクトップアプリは Claude Code を中に持っているだけのようです。「Claude Code の入れ方（公式のページ）」の手順で入れてください" +
-                                    "（入ったら「再確認」→「ログイン」で、今のプランのアカウントでログインします）。";
+                        info.Text = "Claude Code は見つかりませんでした。「Claude Code の入れ方」を参照してください。";
                         return;
                     }
                     string pick = found[0].Key;
                     try { Settings.SetClaudePath(pick); }
-                    catch (Exception ex) { info.Text = "見つけましたが、設定に保存できませんでした: " + ex.Message + "\r\n" + pick; return; }
+                    catch (Exception ex) { info.Text = "設定に保存できません: " + ex.Message + "\r\n" + pick; return; }
                     Recheck(true);
-                    MessageBox.Show(this, "Claude Code を見つけたので、これを使うようにしました。\r\n\r\n" + pick + "\r\n" + found[0].Value +
-                        (found.Count > 1 ? "\r\n\r\nほかにも見つかりました:\r\n" + string.Join("\r\n", found.Skip(1).Select(x => x.Key)) : "") +
-                        "\r\n\r\n（設定のタブ「AI」の「Claude Code の場所」に入れました）", "詳しく探す", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBox.Show(this, "使用する Claude Code:\r\n" + pick + "\r\n" + found[0].Value, "詳しく探す", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }));
             });
             t.IsBackground = true;
@@ -4961,8 +4949,7 @@ namespace WorkLog
             try
             {
                 Process.Start("https://code.claude.com/docs/en/setup");
-                info.Text = "ブラウザで Claude Code の公式の入れ方のページを開きました。Windows の手順で入れたら、この画面の「再確認」を押し、" +
-                            "「ログイン」で今のプラン（Pro / Max）のアカウントでログインしてください。";
+                info.Text = "入れ方のページを開きました。入れたあと「再確認」→「ログイン」。";
             }
             catch (Exception ex) { info.Text = "ブラウザを開けませんでした: " + ex.Message + "（https://code.claude.com/docs/en/setup）"; }
         }
@@ -5025,7 +5012,7 @@ namespace WorkLog
             try
             {
                 Process.Start(new ProcessStartInfo("cmd.exe", "/k \"\"" + exe + "\" auth login\"") { UseShellExecute = true });
-                info.Text = "黒い画面とブラウザでログインしてください。終わったら黒い画面を閉じて「再確認」を押してください。";
+                info.Text = "ログイン後、黒い画面を閉じて「再確認」。";
             }
             catch (Exception ex) { info.Text = "ログインを始められませんでした: " + ex.Message; }
         }

@@ -14,6 +14,10 @@
 
 PC の前面ウィンドウを低負荷で記録し、Claude Code（Pro プラン）で日報を自動で作る Windows のタスクトレイ常駐アプリ。
 
+## 使い方
+
+[HELP.md](HELP.md)（アプリのメニュー「ヘルプ → 使い方」からも開けます）
+
 ## ダウンロード・インストール
 
 [最新のリリース](https://github.com/sarumogu2013-glitch/AutoNippou/releases/latest) から `WorkLog-<版>.zip` を落として展開し、中の「インストール手順.txt」を見てください。

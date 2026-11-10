@@ -46,7 +46,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.17.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.18.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -3087,7 +3087,7 @@ namespace WorkLog
     class TaskTitleForm : Form
     {
         static readonly Color AiColor = Color.FromArgb(30, 90, 170), WordColor = Color.Gray;
-        const int TaskCol = 4, HowCol = 5;
+        const int TaskCol = 5, HowCol = 6;
         readonly DataGridView grid = new DataGridView();
         readonly Label info = new Label { Dock = DockStyle.Top, AutoSize = false, Height = 30, Padding = new Padding(8, 8, 8, 4) };
         readonly Button predictBtn;
@@ -3113,13 +3113,14 @@ namespace WorkLog
             grid.AllowUserToDeleteRows = false;
             grid.AllowUserToResizeRows = false;
             grid.SelectionMode = DataGridViewSelectionMode.CellSelect;
+            grid.Columns.Add(GridSort.NoColumn());
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "使った時間", ReadOnly = true, Width = 90, DefaultCellStyle = { Alignment = DataGridViewContentAlignment.MiddleRight } });
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "最近", ReadOnly = true, Width = 95 });
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "アプリ", ReadOnly = true, Width = 110 });
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "ウィンドウタイトル", ReadOnly = true, AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill });
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タスク", Width = 220 });
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "付け方", ReadOnly = true, Width = 90 });
-            foreach (DataGridViewColumn c in grid.Columns) c.SortMode = DataGridViewColumnSortMode.NotSortable;   // 行の順番と titles をそろえておく
+            GridSort.Enable(grid);   // 行の Tag に TitleTask を持つので、並べ替えても対応はずれない
             grid.EditingControlShowing += (o, e) =>
             {
                 var tb = e.Control as TextBox;
@@ -3173,7 +3174,11 @@ namespace WorkLog
                     string w = Tasks.Match(tasks, r.Key.Proc, r.Key.Title);
                     if (w != null) { task = w; how = "語"; color = WordColor; }
                 }
-                int i = grid.Rows.Add(DayStatus.Span(r.Value), r.Key.Last == DateTime.MinValue ? "" : r.Key.Last.ToString("MM/dd HH:mm"), r.Key.Proc, r.Key.Title, task, how);
+                int i = grid.Rows.Add(null, null, null, r.Key.Proc, r.Key.Title, task, how);
+                grid.Rows[i].Tag = r.Key;
+                GridSort.Set(grid.Rows[i].Cells[0], i + 1, i + 1);
+                GridSort.Set(grid.Rows[i].Cells[1], DayStatus.Span(r.Value), r.Value);
+                GridSort.Set(grid.Rows[i].Cells[2], r.Key.Last == DateTime.MinValue ? "" : r.Key.Last.ToString("MM/dd HH:mm"), r.Key.Last);
                 grid.Rows[i].Cells[TaskCol].Style.ForeColor = color;
             }
             loading = false;
@@ -3199,7 +3204,7 @@ namespace WorkLog
         // タスク名が書かれた・直された: 手で付けた対応として残す（空なら対応を消す）。新しい名前はタスクの一覧にも足す
         void Edited(int row)
         {
-            Tasks.TitleTask t = titles[row];
+            var t = (Tasks.TitleTask)grid.Rows[row].Tag;
             string task = Convert.ToString(grid.Rows[row].Cells[TaskCol].Value).Trim();
             try
             {
@@ -3244,6 +3249,64 @@ namespace WorkLog
             });
             th.IsBackground = true;
             th.Start();
+        }
+    }
+
+    // 表の並べ替え: 見出しのクリックで並べ替える。No 列（元の並び順）の見出しで元に戻せる。
+    // セルの Tag に値（分・日時など）があればそれで比べる。チェックの列は印の有無で比べる
+    static class GridSort
+    {
+        public static DataGridViewTextBoxColumn NoColumn()
+        {
+            var c = new DataGridViewTextBoxColumn { HeaderText = "No", ReadOnly = true, AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells };
+            c.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
+            c.DefaultCellStyle.ForeColor = Color.DimGray;
+            return c;
+        }
+
+        public static void Enable(DataGridView g)
+        {
+            foreach (DataGridViewColumn c in g.Columns) c.SortMode = DataGridViewColumnSortMode.Automatic;
+            g.SortCompare += (o, e) =>
+            {
+                object a = g.Rows[e.RowIndex1].Cells[e.Column.Index].Tag, b = g.Rows[e.RowIndex2].Cells[e.Column.Index].Tag;
+                if (a is IComparable && b != null && a.GetType() == b.GetType()) e.SortResult = ((IComparable)a).CompareTo(b);
+                else if (a is IComparable && b == null) e.SortResult = 1;
+                else if (a == null && b is IComparable) e.SortResult = -1;
+                else if (e.CellValue1 is bool || e.CellValue2 is bool) e.SortResult = (e.CellValue1 is bool && (bool)e.CellValue1).CompareTo(e.CellValue2 is bool && (bool)e.CellValue2);
+                else e.SortResult = string.Compare(Convert.ToString(e.CellValue1), Convert.ToString(e.CellValue2), StringComparison.CurrentCulture);
+                e.Handled = true;
+            };
+        }
+
+        // セルに値と、並べ替えに使う値を入れる
+        public static void Set(DataGridViewCell c, object shown, IComparable key) { c.Value = shown; c.Tag = key; }
+    }
+
+    // ListView の並べ替え（見出しのクリック。もう一度で逆順）。数字の列は数で比べる
+    class ListSorter : IComparer
+    {
+        public int Column;
+        public bool Desc;
+
+        public static void Enable(ListView v)
+        {
+            var s = new ListSorter();
+            v.ListViewItemSorter = s;
+            v.ColumnClick += (o, e) =>
+            {
+                if (s.Column == e.Column) s.Desc = !s.Desc; else { s.Column = e.Column; s.Desc = false; }
+                v.Sort();
+            };
+        }
+
+        public int Compare(object x, object y)
+        {
+            var a = (ListViewItem)x; var b = (ListViewItem)y;
+            string sa = Column < a.SubItems.Count ? a.SubItems[Column].Text : "", sb = Column < b.SubItems.Count ? b.SubItems[Column].Text : "";
+            long na, nb;
+            int r = long.TryParse(sa.Replace(",", ""), out na) && long.TryParse(sb.Replace(",", ""), out nb) ? na.CompareTo(nb) : string.Compare(sa, sb, StringComparison.CurrentCulture);
+            return Desc ? -r : r;
         }
     }
 
@@ -3584,14 +3647,16 @@ namespace WorkLog
             taskGrid.RowHeadersWidth = 24;
             taskGrid.AllowUserToResizeRows = false;
             taskGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            taskGrid.Columns.Add(GridSort.NoColumn());
             taskGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タスク", FillWeight = 40, MinimumWidth = 60 });
             taskGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タイトルに出る語", FillWeight = 45, MinimumWidth = 60, ToolTipText = "カンマ区切り" });
             taskGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "今日", ReadOnly = true, AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells });
             taskGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "最近", ReadOnly = true, AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells });
             taskGrid.Columns.Add(new DataGridViewCheckBoxColumn { HeaderText = "完了", AutoSizeMode = DataGridViewAutoSizeColumnMode.ColumnHeader });
-            taskGrid.Columns[2].DefaultCellStyle.ForeColor = taskGrid.Columns[3].DefaultCellStyle.ForeColor = Color.DimGray;
+            taskGrid.Columns[3].DefaultCellStyle.ForeColor = taskGrid.Columns[4].DefaultCellStyle.ForeColor = Color.DimGray;
+            GridSort.Enable(taskGrid);
             taskGrid.CurrentCellDirtyStateChanged += (o, e) => { if (taskGrid.IsCurrentCellDirty && taskGrid.CurrentCell is DataGridViewCheckBoxCell) taskGrid.CommitEdit(DataGridViewDataErrorContexts.Commit); };
-            taskGrid.CellValueChanged += (o, e) => { if (e.ColumnIndex != 2 && e.ColumnIndex != 3) SaveTasks(); };
+            taskGrid.CellValueChanged += (o, e) => { if (e.ColumnIndex == 1 || e.ColumnIndex == 2 || e.ColumnIndex == 5) SaveTasks(); };
             taskGrid.UserDeletedRow += (o, e) => SaveTasks();
             taskInfo.MaximumSize = new Size(0, 0);
             Control[] rows = { title, titlesBtn, taskGrid, taskInfo };
@@ -3608,7 +3673,12 @@ namespace WorkLog
         {
             taskLoading = true;
             taskGrid.Rows.Clear();
-            foreach (TaskItem t in Tasks.Load()) taskGrid.Rows.Add(t.Name, t.Keywords, "", "", t.Done);
+            int no = 0;
+            foreach (TaskItem t in Tasks.Load())
+            {
+                int i = taskGrid.Rows.Add(null, t.Name, t.Keywords, "", "", t.Done);
+                GridSort.Set(taskGrid.Rows[i].Cells[0], ++no, no);
+            }
             taskLoading = false;
             UpdateTaskInfo();
         }
@@ -3616,16 +3686,24 @@ namespace WorkLog
         void SaveTasks()
         {
             if (taskLoading) return;
-            var list = new List<TaskItem>();
+            // 並べ替えていても、保存は No の順（上にあるタスクが先）。足した行は最後
+            var list = new List<KeyValuePair<int, TaskItem>>();
+            int max = taskGrid.Rows.Cast<DataGridViewRow>().Select(r => r.Cells[0].Tag is int ? (int)r.Cells[0].Tag : 0).DefaultIfEmpty(0).Max();
             foreach (DataGridViewRow r in taskGrid.Rows)
             {
                 if (r.IsNewRow) continue;
-                string name = Convert.ToString(r.Cells[0].Value).Trim(), words = Convert.ToString(r.Cells[1].Value).Trim();
+                string name = Convert.ToString(r.Cells[1].Value).Trim(), words = Convert.ToString(r.Cells[2].Value).Trim();
                 if (name.Length == 0 && words.Length == 0) continue;
                 if (name.Length == 0) name = words.Split(',', '、')[0].Trim();   // 名前が空なら最初の語を名前に
-                list.Add(new TaskItem { Name = name, Keywords = words, Done = r.Cells[4].Value is bool && (bool)r.Cells[4].Value });
+                if (!(r.Cells[0].Tag is int))
+                {
+                    taskLoading = true;
+                    GridSort.Set(r.Cells[0], ++max, max);
+                    taskLoading = false;
+                }
+                list.Add(new KeyValuePair<int, TaskItem>((int)r.Cells[0].Tag, new TaskItem { Name = name, Keywords = words, Done = r.Cells[5].Value is bool && (bool)r.Cells[5].Value }));
             }
-            try { Tasks.Save(list); }
+            try { Tasks.Save(list.OrderBy(x => x.Key).Select(x => x.Value).ToList()); }
             catch (Exception ex) { taskInfo.ForeColor = Color.Firebrick; taskInfo.Text = "保存できません: " + ex.Message; return; }
             UpdateTaskInfo();
         }
@@ -3659,11 +3737,11 @@ namespace WorkLog
                 foreach (DataGridViewRow row in taskGrid.Rows)
                 {
                     if (row.IsNewRow) continue;
-                    string name = Convert.ToString(row.Cells[0].Value).Trim();
+                    string name = Convert.ToString(row.Cells[1].Value).Trim();
                     int n;
                     DateTime d;
-                    row.Cells[2].Value = today.TryGetValue(name, out n) ? DayStatus.Span(Reporter.Minutes(n)) : "";
-                    row.Cells[3].Value = last.TryGetValue(name, out d) ? d.ToString("MM/dd HH:mm") : "";
+                    if (today.TryGetValue(name, out n)) GridSort.Set(row.Cells[3], DayStatus.Span(Reporter.Minutes(n)), n); else GridSort.Set(row.Cells[3], "", null);
+                    if (last.TryGetValue(name, out d)) GridSort.Set(row.Cells[4], d.ToString("MM/dd HH:mm"), d); else GridSort.Set(row.Cells[4], "", null);
                 }
                 taskLoading = false;
                 taskInfo.Text = "今日 タスク外: " + DayStatus.Span(Reporter.Minutes(none));
@@ -3839,6 +3917,7 @@ namespace WorkLog
             afkGrid.AllowUserToAddRows = afkGrid.AllowUserToDeleteRows = afkGrid.AllowUserToResizeRows = false;
             afkGrid.RowHeadersVisible = false;
             afkGrid.BackgroundColor = SystemColors.Window;
+            afkGrid.Columns.Add(GridSort.NoColumn());
             afkGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "時間", ReadOnly = true, AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells });
             afkGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "何をしていたか", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill });
             afkGrid.Columns.Add(new DataGridViewCheckBoxColumn { HeaderText = "除く", AutoSizeMode = DataGridViewAutoSizeColumnMode.ColumnHeader, ToolTipText = "休憩・私用など、日報に入れないとき" });
@@ -3846,7 +3925,8 @@ namespace WorkLog
             {
                 if (afkGrid.IsCurrentCellDirty && afkGrid.CurrentCell is DataGridViewCheckBoxCell) afkGrid.CommitEdit(DataGridViewDataErrorContexts.Commit);
             };
-            afkGrid.CellValueChanged += (o, e) => { if (!loading && e.RowIndex >= 0 && e.RowIndex < afkList.Count) AfkEdited(e.RowIndex); };
+            GridSort.Enable(afkGrid);
+            afkGrid.CellValueChanged += (o, e) => { if (!loading && e.RowIndex >= 0 && afkGrid.Rows[e.RowIndex].Tag is AfkEntry) AfkEdited(e.RowIndex); };
             var freeHead = new Label
             {
                 AutoSize = true, MaximumSize = new Size(W - 12, 0), Margin = new Padding(3, 10, 3, 2),
@@ -3871,7 +3951,15 @@ namespace WorkLog
             afkGrid.Rows.Clear();
             try { afkList = current != null ? Afk.Load(current) : new List<AfkEntry>(); }
             catch (Exception ex) { afkList = new List<AfkEntry>(); message.Text = "離席メモを読めませんでした: " + ex.Message; }
-            foreach (AfkEntry e in afkList) PaintAfkRow(afkGrid.Rows.Add(e.Range, e.Memo, e.Skip));
+            int no = 0;
+            foreach (AfkEntry e in afkList)
+            {
+                int i = afkGrid.Rows.Add(null, e.Range, e.Memo, e.Skip);
+                afkGrid.Rows[i].Tag = e;
+                GridSort.Set(afkGrid.Rows[i].Cells[0], ++no, no);
+                GridSort.Set(afkGrid.Rows[i].Cells[1], e.Range, e.Start);
+                PaintAfkRow(i);
+            }
             afkGrid.ClearSelection();
             try { freeMemo.Text = current != null ? Afk.ReadFree(current) : ""; }
             catch (Exception ex) { freeMemo.Text = ""; message.Text = "メモを読めませんでした: " + ex.Message; }
@@ -3886,8 +3974,9 @@ namespace WorkLog
 
         void PaintAfkRow(int i)
         {
-            afkGrid.Rows[i].DefaultCellStyle.BackColor = afkList[i].Answered ? SystemColors.Window : Color.FromArgb(255, 246, 214);
-            afkGrid.Rows[i].Cells[0].ToolTipText = afkList[i].Duration;
+            var e = (AfkEntry)afkGrid.Rows[i].Tag;
+            afkGrid.Rows[i].DefaultCellStyle.BackColor = e.Answered ? SystemColors.Window : Color.FromArgb(255, 246, 214);
+            afkGrid.Rows[i].Cells[1].ToolTipText = e.Duration;
         }
 
         void UpdateAfkTab()
@@ -3898,9 +3987,9 @@ namespace WorkLog
 
         void AfkEdited(int i)
         {
-            AfkEntry e = afkList[i];
-            e.Memo = Convert.ToString(afkGrid.Rows[i].Cells[1].Value).Trim();
-            e.Skip = Convert.ToBoolean(afkGrid.Rows[i].Cells[2].Value);
+            var e = (AfkEntry)afkGrid.Rows[i].Tag;
+            e.Memo = Convert.ToString(afkGrid.Rows[i].Cells[2].Value).Trim();
+            e.Skip = Convert.ToBoolean(afkGrid.Rows[i].Cells[3].Value);
             PaintAfkRow(i);
             UpdateAfkTab();
             // 保存して日報へ足す（表のイベントの中で表を作り直さないよう、あとで）
@@ -4121,16 +4210,45 @@ namespace WorkLog
         public void SetRecordStatus(string s)
         {
             record.Text = s;
+            UpdateDatesIfStale();
             if (timeline.Date == DateTime.Today.ToString("yyyy-MM-dd")) timeline.Reload();
+        }
+
+        string listSig;   // 日付の一覧を作ったときの今日と日報のファイル（変わったら一覧を作り直す）
+
+        static List<string> ReportDates()
+        {
+            return Directory.Exists(Core.Dir)
+                ? Directory.GetFiles(Core.Dir, "日報_*.txt").Select(f => Path.GetFileNameWithoutExtension(f).Substring(3))
+                    .Where(Reporter.IsDate).OrderByDescending(d => d).ToList()
+                : new List<string>();
+        }
+
+        static string Sig(List<string> reports) { return DateTime.Today.ToString("yyyy-MM-dd") + "|" + string.Join(",", reports); }
+
+        // 日付が変わった・日報が増えたら、日付の一覧だけを作り直す（選んでいる日と本文はそのまま）。記録のたび（1分ごと）に呼ぶ
+        void UpdateDatesIfStale()
+        {
+            List<string> reports;
+            try { reports = ReportDates(); } catch { return; }
+            if (Sig(reports) == listSig || list.Items.Count == 0) return;
+            string today = DateTime.Today.ToString("yyyy-MM-dd");
+            List<string> dates = reports.Concat(new[] { today }).Distinct().OrderByDescending(d => d).ToList();
+            loading = true;
+            list.BeginUpdate();
+            list.Items.Clear();
+            foreach (string d in dates) list.Items.Add(new DateItem { Date = d, HasReport = reports.Contains(d) });
+            list.SelectedIndex = current != null ? dates.IndexOf(current) : -1;
+            list.EndUpdate();
+            loading = false;
+            listSig = Sig(reports);
         }
 
         public void RefreshList(string select)
         {
             SaveIfDirty();
-            List<string> reports = Directory.Exists(Core.Dir)
-                ? Directory.GetFiles(Core.Dir, "日報_*.txt").Select(f => Path.GetFileNameWithoutExtension(f).Substring(3))
-                    .Where(Reporter.IsDate).ToList()
-                : new List<string>();
+            List<string> reports = ReportDates();
+            listSig = Sig(reports);
             // 今日は日報がまだなくても出す（離席メモを書けるように）
             string today = DateTime.Today.ToString("yyyy-MM-dd");
             List<string> dates = reports.Concat(new[] { today }).Distinct().OrderByDescending(d => d).ToList();
@@ -4669,9 +4787,11 @@ namespace WorkLog
             Add(t, Auto(), folder);
 
             foreach (string m in Models) { model.Items.Add(m); fixModel.Items.Add(m); }
+            mask.Columns.Add(GridSort.NoColumn());
             mask.Columns.Add("proc", "プロセス名（例: OUTLOOK）");
             mask.Columns.Add("word", "置き換える言葉（例: メール対応）");
             mask.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            GridSort.Enable(mask);
             mask.Dock = DockStyle.Fill;
             mask.BackgroundColor = SystemColors.Window;
             mask.RowHeadersWidth = 28;
@@ -4757,7 +4877,8 @@ namespace WorkLog
             exclude.Text = string.Join("\r\n", s.ExcludeProc);
             words.Text = string.Join("\r\n", s.MaskWords);
             mask.Rows.Clear();
-            foreach (KeyValuePair<string, string> kv in s.MaskProc) mask.Rows.Add(kv.Key, kv.Value);
+            int no = 0;
+            foreach (KeyValuePair<string, string> kv in s.MaskProc) GridSort.Set(mask.Rows[mask.Rows.Add(null, kv.Key, kv.Value)].Cells[0], ++no, no);
             model.Text = s.Model;
             fixModel.Text = s.FixModel;
             claudePath.Text = s.ClaudePath;
@@ -4818,7 +4939,7 @@ namespace WorkLog
             foreach (DataGridViewRow row in mask.Rows)
             {
                 if (row.IsNewRow) continue;
-                string p = Convert.ToString(row.Cells[0].Value).Trim(), w = Convert.ToString(row.Cells[1].Value).Trim();
+                string p = Convert.ToString(row.Cells[1].Value).Trim(), w = Convert.ToString(row.Cells[2].Value).Trim();
                 if (p.Length == 0 && w.Length == 0) continue;
                 if (p.Length == 0 || w.Length == 0) return Fail("「タイトルを伏せるプロセス」は、プロセス名と置き換える言葉の両方を入れてください。");
                 if (Bad(p, true) || Bad(w, false)) return Fail("「タイトルを伏せるプロセス」に「,」「、」「:」は使えません: " + p + " / " + w);
@@ -4880,10 +5001,12 @@ namespace WorkLog
             history.View = View.Details;
             history.FullRowSelect = true;
             history.Dock = DockStyle.Fill;
+            history.Columns.Add("No", 50, HorizontalAlignment.Right);
             foreach (string[] c in new[] {
                 new[] { "日時", "155" }, new[] { "日報の日付", "100" }, new[] { "元のログ", "120" }, new[] { "ログイン", "290" },
                 new[] { "モデル", "150" }, new[] { "トークン", "80" }, new[] { "結果", "400" } })
                 history.Columns.Add(c[0], int.Parse(c[1]), c[0] == "トークン" ? HorizontalAlignment.Right : HorizontalAlignment.Left);
+            ListSorter.Enable(history);
 
             var bar = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, Padding = new Padding(6, 6, 6, 4), WrapContents = true };
             recheck = AddButton(bar, "再確認", (o, e) => Recheck(true));
@@ -5024,7 +5147,7 @@ namespace WorkLog
             foreach (string[] p in ClaudeCli.RecentLog(50))
             {
                 long n;
-                var it = new ListViewItem(new[] { p[0], p[1], p[2], p[4], p[5], long.TryParse(p[6], out n) ? n.ToString("N0") : p[6], p[7] });
+                var it = new ListViewItem(new[] { (history.Items.Count + 1).ToString(), p[0], p[1], p[2], p[4], p[5], long.TryParse(p[6], out n) ? n.ToString("N0") : p[6], p[7] });
                 it.ToolTipText = "Claude Code: " + p[3];
                 if (!p[7].StartsWith("成功")) it.ForeColor = Color.Firebrick;
                 history.Items.Add(it);

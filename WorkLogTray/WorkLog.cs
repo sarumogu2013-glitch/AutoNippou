@@ -46,7 +46,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.14.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.15.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -313,6 +313,79 @@ namespace WorkLog
     class Result { public string Date, Message; public bool Ok, NoData, NeedLogin, Appended; }
     class NeedLoginException : Exception { public NeedLoginException(string m) : base(m) { } }
     class StateEntry { public DateTime Last; public bool Ok; }
+
+    // 今取り掛かっているタスク（日報画面の右の欄「タスク」。タスク.txt: 名前<TAB>語（カンマ区切り）<TAB>完了なら done）
+    class TaskItem
+    {
+        public string Name = "", Keywords = "";
+        public bool Done;
+
+        // ウィンドウタイトル（かアプリ名）に出る語。空ならタスクの名前で探す
+        public List<string> Words
+        {
+            get
+            {
+                List<string> w = Keywords.Split(',', '、', '，').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+                if (w.Count == 0 && Name.Trim().Length > 0) w.Add(Name.Trim());
+                return w;
+            }
+        }
+    }
+
+    static class Tasks
+    {
+        static string PathOf { get { return Path.Combine(Core.Dir, "タスク.txt"); } }
+
+        static string Clean(string s) { return (s ?? "").Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' ').Trim(); }
+
+        public static List<TaskItem> Load()
+        {
+            var list = new List<TaskItem>();
+            try
+            {
+                if (!File.Exists(PathOf)) return list;
+                foreach (string raw in Core.ReadText(PathOf).Split('\n'))
+                {
+                    string[] c = raw.TrimEnd('\r').Split('\t');
+                    if (c[0].Trim().Length == 0 || c[0].StartsWith("#")) continue;
+                    list.Add(new TaskItem { Name = c[0].Trim(), Keywords = c.Length > 1 ? c[1].Trim() : "", Done = c.Length > 2 && c[2].Trim() == "done" });
+                }
+            }
+            catch (Exception ex) { Core.Error("タスク", ex.Message); }
+            return list;
+        }
+
+        public static void Save(List<TaskItem> list)
+        {
+            var b = new StringBuilder("# 今取り掛かっているタスク（名前<TAB>ウィンドウタイトルに出る語（カンマ区切り）<TAB>終わったら done）。日報画面の右の欄「タスク」で直せます\r\n");
+            foreach (TaskItem t in list.Where(x => Clean(x.Name).Length > 0))
+                b.Append(Clean(t.Name) + "\t" + Clean(t.Keywords) + "\t" + (t.Done ? "done" : "") + "\r\n");
+            Core.WriteText(PathOf, b.ToString());
+        }
+
+        // 前面のウィンドウのタイトルかアプリ名から、当てはまるタスクの名前（上にあるものから。なければ null）
+        public static string Match(List<TaskItem> list, string proc, string title)
+        {
+            foreach (TaskItem t in list)
+            {
+                if (t.Done || t.Name.Trim().Length == 0) continue;
+                foreach (string w in t.Words)
+                    if ((title ?? "").IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0 || string.Equals(proc, w, StringComparison.OrdinalIgnoreCase))
+                        return t.Name.Trim();
+            }
+            return null;
+        }
+
+        // AI に渡す決まり（終わっていないタスクがあるときだけ）
+        public static string Prompt()
+        {
+            List<string> names = Load().Where(t => !t.Done && t.Name.Trim().Length > 0).Select(t => t.Name.Trim()).ToList();
+            if (names.Count == 0) return "";
+            return "今取り掛かっているタスク（利用者が登録したもの）: " + string.Join("、", names) + "\n" +
+                   "作業ログの〔タスク: …〕は、ウィンドウタイトルからそのタスクと判定した作業。その作業は、作業内容にタスク名を使って書く" +
+                   "（例:「" + names[0] + "」「" + names[0] + "（図面修正）」）。同じタスクが続いているときは1つの工程にまとめる\n\n";
+        }
+    }
 
     // 離席（入力のなかった時間）と、そのあいだに何をしていたかのメモ
     class AfkEntry
@@ -834,12 +907,14 @@ namespace WorkLog
         {
             var groups = new Dictionary<string, int>();
             var segs = new List<Seg>();
+            List<TaskItem> tasks = Tasks.Load();
             foreach (Row a in active)
             {
                 string t;
                 if (!s.MaskProc.TryGetValue(a.Proc, out t)) t = a.Title;
                 foreach (string w in s.MaskWords) t = t.Replace(w, "＊＊");
-                string k = a.Proc + "\t" + t;
+                string task = Tasks.Match(tasks, a.Proc, a.Title);   // 伏せる前のタイトルで判定
+                string k = a.Proc + "\t" + t + (task != null ? " 〔タスク: " + task + "〕" : "");
                 int n;
                 groups.TryGetValue(k, out n);
                 groups[k] = n + 1;
@@ -1023,7 +1098,7 @@ namespace WorkLog
                 "<返事>\n利用者への短い返事（何をどう直したか。わからないことがあれば質問する）\n</返事>\n" +
                 "<日報>\n直した日報の本文（日報を直すときだけ書く。「■工程」「■軽作業」の形。見出しの日付行は不要）\n</日報>\n\n" +
                 (notes.Trim().Length > 0 ? "これまでの訂正（これも守る）:\n" + notes.Trim().Replace("\r\n", "\n") + "\n\n" : "") +
-                Afk.Prompt(date) +
+                Tasks.Prompt() + Afk.Prompt(date) +
                 (talk.Length > 0 ? "これまでの会話:\n" + talk + "\n" : "") +
                 "利用者の今の頼み:\n" + message.Trim() + "\n\n" +
                 "真ん中の日報（メイン。番号つき）:\n" + body + "\n\n" +
@@ -1112,7 +1187,7 @@ namespace WorkLog
                 "- 「時刻のない本人のメモ」があれば、作業ログになくても業務として必ず入れる\n" +
                 BreakRule(s, date) +
                 "- 該当がなければ「・なし」\n\n" +
-                NotesPrompt(date) + Afk.Prompt(date) + ManualPrompt(date) + LogText(active, s);
+                NotesPrompt(date) + Tasks.Prompt() + Afk.Prompt(date) + ManualPrompt(date) + LogText(active, s);
 
             string header = Header(date, active);
             string path = Core.ReportPath(date);
@@ -1179,7 +1254,7 @@ namespace WorkLog
                 "- 作業ログにあって、真ん中の日報にも作成済みの日報（md）にもない作業だけを足す。推定できないもの・私用と思われるものは足さない。足す作業は今ある工程と時間が重ならないようにする\n" +
                 "- 「時刻のない本人のメモ」のうち日報にないものは足す\n" +
                 BreakRule(s, date) + "\n" +
-                NotesPrompt(date) + Afk.Prompt(date) + ManualPrompt(date) +
+                NotesPrompt(date) + Tasks.Prompt() + Afk.Prompt(date) + ManualPrompt(date) +
                 "真ん中の日報（メイン）:\n" + body + "\n\n" +
                 MdPrompt(date) +
                 "作業ログ（離席時間は除いています）\n" + LogText(active, s);
@@ -1541,7 +1616,7 @@ namespace WorkLog
                 "- 「時刻のない本人のメモ」のうち日報にまだないものがあれば、それも入れる\n" +
                 BreakRule(s, date) +
                 "- 新しい作業がなければ「・なし」とだけ書く\n\n" +
-                NotesPrompt(date) + Afk.Prompt(date) +
+                NotesPrompt(date) + Tasks.Prompt() + Afk.Prompt(date) +
                 "今の日報:\n" + current.Replace("\r\n", "\n") + "\n\n" +
                 since.ToString("HH:mm") + " より後の作業ログ:\n" + LogText(fresh, s);
 
@@ -2982,7 +3057,10 @@ namespace WorkLog
         readonly TextBox notes = new TextBox { Multiline = true, AcceptsReturn = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill };
 
         // 「離席メモ」欄
-        readonly TabPage aiPage = new TabPage("AIで直す"), afkPage = new TabPage("離席メモ"), reqPage = new TabPage("要望");
+        readonly TabPage aiPage = new TabPage("AIで直す"), afkPage = new TabPage("離席メモ"), taskPage = new TabPage("タスク"), reqPage = new TabPage("要望");
+        readonly DataGridView taskGrid = new DataGridView();
+        readonly Label taskInfo = new Label { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 6, 3, 3) };
+        bool taskLoading;
         readonly TextBox reqName = new TextBox { Dock = DockStyle.Fill, MaxLength = 50 };
         readonly ComboBox reqKind = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 140 };
         readonly TextBox reqText = new TextBox { Multiline = true, AcceptsReturn = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill };
@@ -3142,11 +3220,105 @@ namespace WorkLog
             aiPage.Controls.Add(BuildAiPanel());
             afkPage.Controls.Add(BuildAfkPanel());
             reqPage.Controls.Add(BuildRequestPanel());
-            aiPage.BackColor = afkPage.BackColor = reqPage.BackColor = PanelBack;
+            taskPage.Controls.Add(BuildTaskPanel());
+            aiPage.BackColor = afkPage.BackColor = taskPage.BackColor = reqPage.BackColor = PanelBack;
             tabs.TabPages.Add(aiPage);
             tabs.TabPages.Add(afkPage);
+            tabs.TabPages.Add(taskPage);
             tabs.TabPages.Add(reqPage);
+            tabs.SelectedIndexChanged += (o, e) => { if (tabs.SelectedTab == taskPage) UpdateTaskInfo(); };
             return tabs;
+        }
+
+        // 右の欄のタブ「タスク」: 今取り掛かっているタスクと、ウィンドウタイトルに出る語。当てはまった時間は日報にそのタスク名で書く
+        Control BuildTaskPanel()
+        {
+            var p = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(4, 2, 2, 2), BackColor = PanelBack };
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            var title = new Label { Text = "今取り掛かっているタスク", AutoSize = true, Font = new Font(Font, FontStyle.Bold), Margin = new Padding(3, 6, 3, 2) };
+            var hint = new Label
+            {
+                AutoSize = true, MaximumSize = new Size(W - 16, 0), ForeColor = Color.DimGray, Margin = new Padding(3, 0, 3, 4),
+                Text = "タスクの名前と、前面のウィンドウのタイトルに出る語（ファイル名・フォルダ名・案件名など。カンマ区切り）を書いてください。" +
+                       "タイトルに語が入っている時間は、そのタスクとして日報に書きます（上にあるタスクが先）。語が空ならタスクの名前で探します。" +
+                       "終わったら「完了」に印を。行を選んで Delete で消せます。"
+            };
+            taskGrid.Dock = DockStyle.Fill;
+            taskGrid.BackgroundColor = SystemColors.Window;
+            taskGrid.RowHeadersWidth = 24;
+            taskGrid.AllowUserToResizeRows = false;
+            taskGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            taskGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タスク", FillWeight = 45 });
+            taskGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タイトルに出る語", FillWeight = 55, ToolTipText = "例: 〇〇橋,R8工程表（カンマ区切り）" });
+            taskGrid.Columns.Add(new DataGridViewCheckBoxColumn { HeaderText = "完了", AutoSizeMode = DataGridViewAutoSizeColumnMode.ColumnHeader });
+            taskGrid.CurrentCellDirtyStateChanged += (o, e) => { if (taskGrid.IsCurrentCellDirty && taskGrid.CurrentCell is DataGridViewCheckBoxCell) taskGrid.CommitEdit(DataGridViewDataErrorContexts.Commit); };
+            taskGrid.CellValueChanged += (o, e) => SaveTasks();
+            taskGrid.UserDeletedRow += (o, e) => SaveTasks();
+            taskInfo.MaximumSize = new Size(W - 16, 0);
+            Control[] rows = { title, hint, taskGrid, taskInfo };
+            foreach (Control c in rows)
+            {
+                p.RowStyles.Add(c == taskGrid ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.AutoSize));
+                p.Controls.Add(c, 0, p.RowCount++);
+            }
+            LoadTasks();
+            return p;
+        }
+
+        void LoadTasks()
+        {
+            taskLoading = true;
+            taskGrid.Rows.Clear();
+            foreach (TaskItem t in Tasks.Load()) taskGrid.Rows.Add(t.Name, t.Keywords, t.Done);
+            taskLoading = false;
+        }
+
+        void SaveTasks()
+        {
+            if (taskLoading) return;
+            var list = new List<TaskItem>();
+            foreach (DataGridViewRow r in taskGrid.Rows)
+            {
+                if (r.IsNewRow) continue;
+                string name = Convert.ToString(r.Cells[0].Value).Trim(), words = Convert.ToString(r.Cells[1].Value).Trim();
+                if (name.Length == 0 && words.Length == 0) continue;
+                if (name.Length == 0) name = words.Split(',', '、')[0].Trim();   // 名前が空なら最初の語を名前に
+                list.Add(new TaskItem { Name = name, Keywords = words, Done = r.Cells[2].Value is bool && (bool)r.Cells[2].Value });
+            }
+            try { Tasks.Save(list); }
+            catch (Exception ex) { taskInfo.ForeColor = Color.Firebrick; taskInfo.Text = "保存できませんでした: " + ex.Message; return; }
+            UpdateTaskInfo();
+        }
+
+        // 今日の記録で、それぞれのタスクに当てはまった時間（語が合っているかを確かめる）
+        void UpdateTaskInfo()
+        {
+            taskInfo.ForeColor = Color.DimGray;
+            try
+            {
+                List<TaskItem> tasks = Tasks.Load();
+                if (!tasks.Any(t => !t.Done)) { taskInfo.Text = "まだタスクはありません。上の表に書いてください。"; return; }
+                List<Row> rows = Reporter.ReadActive(DateTime.Today.ToString("yyyy-MM-dd"), Settings.Get()) ?? new List<Row>();
+                var count = new Dictionary<string, int>();
+                int none = 0;
+                foreach (Row r in rows)
+                {
+                    string t = Tasks.Match(tasks, r.Proc, r.Title);
+                    if (t == null) { none++; continue; }
+                    int n;
+                    count.TryGetValue(t, out n);
+                    count[t] = n + 1;
+                }
+                taskInfo.Text = "今日の記録で当てはまった時間:\r\n" +
+                    string.Join("\r\n", tasks.Where(t => !t.Done).Select(t =>
+                    {
+                        int n;
+                        count.TryGetValue(t.Name.Trim(), out n);
+                        return "　" + t.Name.Trim() + " … " + (n > 0 ? DayStatus.Span(Reporter.Minutes(n)) : "なし");
+                    })) +
+                    "\r\n　どれにも当てはまらない … " + DayStatus.Span(Reporter.Minutes(none));
+            }
+            catch (Exception ex) { taskInfo.Text = "確かめられませんでした: " + ex.Message; }
         }
 
         // 右の欄のタブ「要望」: 名前・種類・内容を書いて、GitHub の Issue の作成画面を開く
@@ -4581,6 +4753,19 @@ namespace WorkLog
             var aiOut = new List<string> { "■工程", "・09:00〜10:30 A工区の数量計算", "・11:00〜12:00 資料作成", "■軽作業", "・13:00 電話" };
             eq("AI が落とした行を戻す（数）", Reporter.KeepCorrect(center, aiOut).ToString(), "1");
             eq("AI が落とした行を戻す（行）", string.Join(" | ", aiOut), "■工程 | ・09:00〜10:30 A工区の数量計算 | ・11:00〜12:00 資料作成 | ■軽作業 | ・10:40 メール対応 | ・13:00 電話");
+
+            // タスク: ウィンドウタイトル・アプリ名から当てはめる（上のタスクが先・完了は使わない・語が空なら名前）
+            var tl = new List<TaskItem>
+            {
+                new TaskItem { Name = "〇〇橋 詳細設計", Keywords = "〇〇橋,ﾏﾙﾏﾙ橋" },
+                new TaskItem { Name = "R8工程表", Keywords = "" },
+                new TaskItem { Name = "済んだ案件", Keywords = "数量", Done = true },
+                new TaskItem { Name = "メール", Keywords = "OUTLOOK" },
+            };
+            eq("タスク: 語", Tasks.Match(tl, "EXCEL", "〇〇橋_数量計算.xlsx - Excel"), "〇〇橋 詳細設計");
+            eq("タスク: 名前", Tasks.Match(tl, "EXCEL", "全体R8工程表.xlsx"), "R8工程表");
+            eq("タスク: 完了は使わない", Tasks.Match(tl, "EXCEL", "数量計算.xlsx") ?? "(なし)", "(なし)");
+            eq("タスク: アプリ名", Tasks.Match(tl, "OUTLOOK", "受信トレイ"), "メール");
 
             // AIで直す（会話）: 返事と日報の案に分ける
             string reply, rep;

@@ -2086,10 +2086,42 @@ namespace WorkLog
         }
 
         // 最新のリリースを調べる（インストール用 zip がないリリースは例外）
+        // 最新のリリース。GitHub の API が回数の上限（403・429）のときは、リリースのページの転送先から版を読む
         public static Release Latest()
+        {
+            try { return LatestByApi(); }
+            catch (System.Net.WebException ex)
+            {
+                var res = ex.Response as System.Net.HttpWebResponse;
+                if (res == null || ((int)res.StatusCode != 403 && (int)res.StatusCode != 429)) throw;
+                Log("GitHub の API が回数の上限（" + (int)res.StatusCode + "）のため、リリースのページから確かめます");
+                return LatestByRedirect();
+            }
+        }
+
+        // github.com/…/releases/latest は最新のタグのページへ転送されるので、その行き先から版を読む（zip の SHA-256 はわからない）
+        static Release LatestByRedirect()
+        {
+            System.Net.HttpWebRequest req = Request(Page);
+            req.AllowAutoRedirect = false;
+            string location;
+            using (var res = (System.Net.HttpWebResponse)req.GetResponse()) location = res.Headers["Location"] ?? "";
+            Match m = Regex.Match(location, @"/releases/tag/(v?[0-9][0-9.]*)$");
+            if (!m.Success) throw new Exception("最新のリリースがわかりません（" + location + "）");
+            var rel = new Release { Tag = m.Groups[1].Value, Notes = "", Url = "https://github.com/" + Repo + "/releases/tag/" + m.Groups[1].Value, Digest = "" };
+            rel.Version = rel.Tag.TrimStart('v', 'V');
+            rel.ZipName = "WorkLog-" + rel.Version + ".zip";
+            rel.ZipUrl = "https://github.com/" + Repo + "/releases/download/" + rel.Tag + "/" + rel.ZipName;
+            return rel;
+        }
+
+        static Release LatestByApi()
         {
             System.Net.HttpWebRequest req = Request("https://api.github.com/repos/" + Repo + "/releases/latest");
             req.Accept = "application/vnd.github+json";
+            // テスト（CI）のときだけ、回数の上限に当たらないようにトークンを付ける
+            string token = Core.Test ? Environment.GetEnvironmentVariable("WORKLOG_GITHUB_TOKEN") : null;
+            if (!string.IsNullOrEmpty(token)) req.Headers["Authorization"] = "Bearer " + token;
             string json;
             using (var res = req.GetResponse())
             using (var r = new StreamReader(res.GetResponseStream(), Encoding.UTF8))

@@ -2742,6 +2742,7 @@ namespace WorkLog
         public void ShowForm(string date)
         {
             if (form == null || form.IsDisposed) form = new MainForm(this, icon);
+            form.UpdateLink();   // 設定が外から書き換えられたときも反映する
             form.RefreshList(date);
             form.SetRecordStatus(RecordStatus());
             form.SetDuty(off);

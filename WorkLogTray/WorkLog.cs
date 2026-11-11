@@ -46,7 +46,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.18.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.19.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -106,6 +106,8 @@ namespace WorkLog
         public int OffIdleMinutes = 30;  // ReportTime を過ぎて、操作がこの分数なかったら退勤とみなす（0 で自動で退勤しない）
         public bool AutoUpdate = true;   // 新しい版が出たら自動で入れ替える（false は知らせるだけ）
         public string UserName = "";     // 要望を送るときの名前（日報画面の「要望」タブで入れる）
+        public string LinkName = "Niコラボ";   // 日報画面の下のリンクのボタン（URL が空なら出さない）
+        public string LinkUrl = "";   // リポジトリに URL を置かないため、既定は空（設定のタブ「リンク」で入れる）
 
         public bool HasBreak { get { return BreakEnd > BreakStart; } }
         public string BreakText { get { return BreakStart.ToString(@"hh\:mm") + "〜" + BreakEnd.ToString(@"hh\:mm"); } }
@@ -138,6 +140,8 @@ namespace WorkLog
             add("ReportTime を過ぎて、操作がこの分数なかったら退勤とみなす（0 で自動で退勤しない）", "OffIdleMinutes", OffIdleMinutes.ToString());
             add("新しい版が出たら自動で更新する（1=自動で更新 0=知らせるだけ）", "AutoUpdate", AutoUpdate ? "1" : "0");
             add("要望を送るときの名前（日報画面の「要望」タブで入れる）", "UserName", UserName);
+            add("日報画面の下のリンクのボタン名", "LinkName", LinkName);
+            add("そのボタンで開く URL（空ならボタンを出さない）", "LinkUrl", LinkUrl);
             return b.ToString();
         }
 
@@ -243,6 +247,8 @@ namespace WorkLog
                         case "OffIdleMinutes": s.OffIdleMinutes = int.Parse(v); break;
                         case "AutoUpdate": s.AutoUpdate = v == "1" || v.ToLower() == "true"; break;
                         case "UserName": s.UserName = v; break;
+                        case "LinkName": s.LinkName = v; break;
+                        case "LinkUrl": s.LinkUrl = v; break;
                         case "Break":
                             if (v.Length == 0) s.BreakStart = s.BreakEnd = TimeSpan.Zero;
                             else { string[] b = v.Split('-'); s.BreakStart = TimeSpan.Parse(b[0].Trim()); s.BreakEnd = TimeSpan.Parse(b[1].Trim()); }
@@ -1171,6 +1177,7 @@ namespace WorkLog
                 "- 時刻と内容が適当に書かれた行（例:「9時から10時半 資料作成」「資料作成 13:00」「13:00-14:00 打合せ」「１３：００ 電話」）は、内容の言葉をできるだけそのまま使って正しい形に直す\n" +
                 "- 内容だけで時刻のない行は、作業ログからその作業の時刻を推定して入れる。ログで見つからなければ前後の行の時刻から決める\n" +
                 "- 時間の幅があり20分程度を超える作業は「■工程」、短い作業は「■軽作業」に入れる。それぞれ時刻の早い順\n" +
+                "- 工程は時間が途切れないようにつなげる（前の工程の終わり＝次の工程の始め）。軽作業しかしていない時間は、工程に「・HH:MM〜HH:MM 軽作業」と書く\n" +
                 "- 「作成済みの日報（md）」は前に AI が作った日報。md にあって真ん中の日報にない作業は、利用者が要らないので消したもの。足し直さない\n" +
                 "- 行頭の [番号] は付けない（番号はプログラムが振り直す）\n";
         }
@@ -1262,6 +1269,7 @@ namespace WorkLog
             if (report == null) return null;
             List<string> result = SplitLines((header != null ? header + "\n\n" : "") + Unnumber(StripHeader(report)));
             if (!message.Contains("休憩")) EnsureBreak(result, date, s);   // AI がうっかり休憩の行を落としたとき
+            ConnectProcesses(result, FixedLines(date, s));
             return Number(string.Join("\n", result).TrimEnd() + "\n");
         }
 
@@ -1333,6 +1341,7 @@ namespace WorkLog
                 "条件:\n" +
                 "- 同じ業務のまとまりを1つの工程にし、始めた時刻と終えた時刻を書く。途中に短い別作業が挟まっても、同じ業務が続いていれば1つの工程にまとめる\n" +
                 "- 合計20分程度以下の作業は工程にせず軽作業に入れ、終えた時刻だけを書く\n" +
+                "- 工程は時間が途切れないようにつなげる（前の工程の終わり＝次の工程の始め）。軽作業しかしていない時間は、工程に「・HH:MM〜HH:MM 軽作業」と書く\n" +
                 "- 工程・軽作業とも時刻の早い順。時刻は作業ログに出てくる時刻を使う\n" +
                 "- 作業内容は20文字程度。ファイル名やページ名から業務内容を具体的に推定する（例:「〇〇工区の数量計算」）\n" +
                 "- 推定できないもの、私用と思われるものは省く\n" +
@@ -1379,7 +1388,7 @@ namespace WorkLog
             {
                 Backup(path);
                 List<string> lines = SplitLines(header + "\n\n" + body.Trim());
-                if (r.Ok) { ApplyManual(lines, date); EnsureBreak(lines, date, s); }
+                if (r.Ok) { ApplyManual(lines, date); EnsureBreak(lines, date, s); ConnectProcesses(lines, FixedLines(date, s)); }
                 string text = string.Join("\n", lines).TrimEnd() + "\n";
                 Core.WriteText(path, r.Ok ? Number(text) : Regex.Replace(text, "\r?\n", "\r\n"));
             }
@@ -1441,6 +1450,7 @@ namespace WorkLog
             {
                 List<string> result = SplitLines(header + "\n\n" + string.Join("\n", lines).Trim());
                 EnsureBreak(result, date, s);
+                ConnectProcesses(result, FixedLines(date, s));
                 string text = Number(string.Join("\n", result).TrimEnd() + "\n");
                 // AI を待つあいだに手で直された・離席メモが足されたときは、上書きせずに案を old に残す
                 if (!File.Exists(path) || Norm(Core.ReadText(path)) != Norm(existing))
@@ -1521,6 +1531,66 @@ namespace WorkLog
         static readonly Regex LightRe = new Regex(@"^・(\d{1,2}:\d{2})\s");
 
         // 休憩の行がなければ足す。休憩の時間に作業が書いてあるとき（利用者が書いた）は足さない
+        // ---- 工程の時間をつなげる: 時刻の順に並べ、前の工程の終わり＝次の工程の始めにする。すき間が GapLight 分以上なら「軽作業」の工程で埋め、
+        // それより短いすき間・重なりは前の工程の終わりを動かす（前が動かさない行＝休憩・離席メモ・手で追記した行なら、次の工程の始めを動かす）----
+        public const int GapLight = 15;
+        public const string LightOnly = "軽作業";
+
+        class Proc { public TimeSpan A, B; public string Rest = "", Orig; public bool Fixed; }
+
+        static string Hm(TimeSpan t) { return ((int)t.TotalHours).ToString("00") + ":" + t.Minutes.ToString("00"); }
+
+        // 動かさない工程の行（休憩・離席メモ・手で追記した行）
+        static HashSet<string> FixedLines(string date, Settings s, string extra = null)
+        {
+            var set = new HashSet<string>(Afk.Load(date).Select(e => e.Line).Where(x => x.Length > 0));
+            foreach (KeyValuePair<bool, string> m in LoadManual(date)) set.Add(m.Value);
+            set.Add(BreakLine(s));
+            if (!string.IsNullOrEmpty(extra)) set.Add(extra);
+            return set;
+        }
+
+        // 直した行の数を返す
+        public static int ConnectProcesses(List<string> lines, ICollection<string> fixedLines)
+        {
+            int h = lines.FindIndex(l => l.Trim().StartsWith("■") && l.Contains("工程"));
+            if (h < 0) return 0;
+            int end = h + 1;
+            while (end < lines.Count && !lines[end].Trim().StartsWith("■")) end++;
+            var items = new List<Proc>();
+            var others = new List<string>();
+            int blanks = 0;
+            for (int i = h + 1; i < end; i++)
+            {
+                string l = Unnumber(lines[i]).Trim();
+                Match m = RangeRe.Match(l);
+                if (m.Success) items.Add(new Proc { A = Clock(m.Groups[1].Value), B = Clock(m.Groups[2].Value), Rest = m.Groups[3].Value, Orig = l, Fixed = fixedLines.Contains(l) });
+                else if (l.Length == 0) blanks++;
+                else if (l != "・なし") others.Add(l);
+            }
+            if (items.Count == 0) return 0;
+            items = items.OrderBy(x => x.A).ThenBy(x => x.B).ToList();
+            var result = new List<Proc> { items[0] };
+            for (int i = 1; i < items.Count; i++)
+            {
+                Proc prev = result[result.Count - 1], next = items[i];
+                TimeSpan gap = next.A - prev.B;
+                if (gap >= TimeSpan.FromMinutes(GapLight))
+                    result.Add(new Proc { A = prev.B, B = next.A, Rest = " " + LightOnly });
+                else if (gap != TimeSpan.Zero)
+                {
+                    if (!prev.Fixed && next.A > prev.A) prev.B = next.A;
+                    else if (!next.Fixed && prev.B < next.B) next.A = prev.B;
+                }
+                result.Add(next);
+            }
+            var built = result.Select(x => "・" + Hm(x.A) + "〜" + Hm(x.B) + x.Rest).ToList();
+            int changed = result.Count(x => x.Orig == null) + result.Count(x => x.Orig != null && x.Orig != "・" + Hm(x.A) + "〜" + Hm(x.B) + x.Rest);
+            lines.RemoveRange(h + 1, end - h - 1);
+            lines.InsertRange(h + 1, built.Concat(others).Concat(Enumerable.Repeat("", blanks)));
+            return changed;
+        }
+
         static bool EnsureBreak(List<string> lines, string date, Settings s)
         {
             string b = BreakLine(s);
@@ -1580,6 +1650,7 @@ namespace WorkLog
                 if (!text.Contains("■")) return false;
                 List<string> lines = SplitLines(text);
                 if (!lines.Any(l => Unnumber(l).Trim() == item)) InsertItem(lines, light, item);
+                ConnectProcesses(lines, FixedLines(date, Settings.Get(), item));
                 Core.WriteText(path, Number(string.Join("\n", lines).TrimEnd() + "\n"));
             }
             return true;
@@ -1725,6 +1796,7 @@ namespace WorkLog
                     InsertItem(lines, AfkIsLight(e), item);
                     e.Line = item;
                 }
+                ConnectProcesses(lines, FixedLines(e.Start.ToString("yyyy-MM-dd"), Settings.Get(), e.Line));
                 Core.WriteText(path, Number(string.Join("\n", lines).TrimEnd() + "\n"));
             }
             Afk.Put(e);
@@ -1760,6 +1832,7 @@ namespace WorkLog
                 "（例: 日報に「・13:00〜15:30 A工区の数量計算」があり 17:10 まで続いたら「・13:00〜17:10 A工区の数量計算」）。" +
                 since.ToString("HH:mm") + " は区切りではないので、ここで作業を分けない\n" +
                 "- 合計20分程度以下の作業は工程にせず軽作業に入れ、終えた時刻だけを書く\n" +
+                "- 工程は時間が途切れないようにつなげる（前の工程の終わり＝次の工程の始め）。軽作業しかしていない時間は、工程に「・HH:MM〜HH:MM 軽作業」と書く\n" +
                 "- 時刻は作業ログに出てくる時刻を使う。作業内容は20文字程度で、日報の書き方に合わせる\n" +
                 "- 推定できないもの、私用と思われるものは省く\n" +
                 "- 「時刻のない本人のメモ」のうち日報にまだないものがあれば、それも入れる\n" +
@@ -1783,6 +1856,7 @@ namespace WorkLog
                 fixedLines.Add(BreakLine(s));   // 休憩の行は延ばさない
                 n = MergeItems(lines, added, fixedLines);
                 EnsureBreak(lines, date, s);
+                ConnectProcesses(lines, FixedLines(date, s));
                 if (lines.Count > 0 && lines[0].StartsWith("日報 ")) lines[0] = Header(date, all);
                 Core.WriteText(path, Number(string.Join("\n", lines).TrimEnd() + "\n"));
                 SaveMd(date, Core.ReadText(path));
@@ -2012,10 +2086,42 @@ namespace WorkLog
         }
 
         // 最新のリリースを調べる（インストール用 zip がないリリースは例外）
+        // 最新のリリース。GitHub の API が回数の上限（403・429）のときは、リリースのページの転送先から版を読む
         public static Release Latest()
+        {
+            try { return LatestByApi(); }
+            catch (System.Net.WebException ex)
+            {
+                var res = ex.Response as System.Net.HttpWebResponse;
+                if (res == null || ((int)res.StatusCode != 403 && (int)res.StatusCode != 429)) throw;
+                Log("GitHub の API が回数の上限（" + (int)res.StatusCode + "）のため、リリースのページから確かめます");
+                return LatestByRedirect();
+            }
+        }
+
+        // github.com/…/releases/latest は最新のタグのページへ転送されるので、その行き先から版を読む（zip の SHA-256 はわからない）
+        static Release LatestByRedirect()
+        {
+            System.Net.HttpWebRequest req = Request(Page);
+            req.AllowAutoRedirect = false;
+            string location;
+            using (var res = (System.Net.HttpWebResponse)req.GetResponse()) location = res.Headers["Location"] ?? "";
+            Match m = Regex.Match(location, @"/releases/tag/(v?[0-9][0-9.]*)$");
+            if (!m.Success) throw new Exception("最新のリリースがわかりません（" + location + "）");
+            var rel = new Release { Tag = m.Groups[1].Value, Notes = "", Url = "https://github.com/" + Repo + "/releases/tag/" + m.Groups[1].Value, Digest = "" };
+            rel.Version = rel.Tag.TrimStart('v', 'V');
+            rel.ZipName = "WorkLog-" + rel.Version + ".zip";
+            rel.ZipUrl = "https://github.com/" + Repo + "/releases/download/" + rel.Tag + "/" + rel.ZipName;
+            return rel;
+        }
+
+        static Release LatestByApi()
         {
             System.Net.HttpWebRequest req = Request("https://api.github.com/repos/" + Repo + "/releases/latest");
             req.Accept = "application/vnd.github+json";
+            // テスト（CI）のときだけ、回数の上限に当たらないようにトークンを付ける
+            string token = Core.Test ? Environment.GetEnvironmentVariable("WORKLOG_GITHUB_TOKEN") : null;
+            if (!string.IsNullOrEmpty(token)) req.Headers["Authorization"] = "Bearer " + token;
             string json;
             using (var res = req.GetResponse())
             using (var r = new StreamReader(res.GetResponseStream(), Encoding.UTF8))
@@ -2524,6 +2630,7 @@ namespace WorkLog
         // 日報の時刻の案内を直し、AI の接続先が変わっていれば知らせる
         void OnSettingsSaved()
         {
+            if (form != null && !form.IsDisposed) form.UpdateLink();
             if (form != null && !form.IsDisposed && form.Visible) form.RefreshList(null);
             CheckAi();
         }
@@ -2667,6 +2774,7 @@ namespace WorkLog
         public void ShowForm(string date)
         {
             if (form == null || form.IsDisposed) form = new MainForm(this, icon);
+            form.UpdateLink();   // 設定が外から書き換えられたときも反映する
             form.RefreshList(date);
             form.SetRecordStatus(RecordStatus());
             form.SetDuty(off);
@@ -3438,7 +3546,7 @@ namespace WorkLog
         readonly ToolStripStatusLabel message = new ToolStripStatusLabel();
         readonly ToolStripStatusLabel record = new ToolStripStatusLabel();
         DayTimeline timeline;
-        readonly Button copyBullets, copyAll, saveBtn, redoBtn, todayBtn;
+        readonly Button copyBullets, copyAll, saveBtn, redoBtn, todayBtn, linkBtn;
         readonly ToolStripMenuItem mSave, mCopyBullets, mCopyAll, mAiFix, mRedo, mToday, mError;
 
         // 「AIで直す」欄
@@ -3549,6 +3657,8 @@ namespace WorkLog
             todayBtn = AddButton(bar, "今日の分を今すぐ作る", (o, e) => Redo(DateTime.Today.ToString("yyyy-MM-dd")));
             AddButton(bar, "サンプル", (o, e) => ShowSample());
             dutyBtn = AddButton(bar, "退勤", (o, e) => app.ToggleDuty());
+            linkBtn = AddButton(bar, "", (o, e) => OpenLink());
+            UpdateLink();
 
             var strip = new StatusStrip { SizingGrip = false };
             message.Spring = true;
@@ -4121,6 +4231,24 @@ namespace WorkLog
             b.Click += click;
             bar.Controls.Add(b);
             return b;
+        }
+
+        // 下のリンクのボタン（設定の LinkName・LinkUrl）
+        public void UpdateLink()
+        {
+            Settings s = Settings.Get();
+            linkBtn.Text = s.LinkName.Length > 0 ? s.LinkName : "リンク";
+            linkBtn.Visible = s.LinkUrl.Trim().Length > 0;
+        }
+
+        // 既定のブラウザで開く
+        void OpenLink()
+        {
+            string url = Settings.Get().LinkUrl.Trim();
+            if (url.Length == 0) return;
+            if (!Regex.IsMatch(url, @"^[a-zA-Z][a-zA-Z0-9+.-]*://")) url = "https://" + url;
+            try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
+            catch (Exception ex) { message.Text = "開けません: " + ex.Message; }
         }
 
         void ShowAbout()
@@ -4719,6 +4847,7 @@ namespace WorkLog
         readonly DataGridView mask = new DataGridView();
         readonly ComboBox model = new ComboBox { Width = 260 }, fixModel = new ComboBox { Width = 260 };
         readonly TextBox claudePath = new TextBox { Width = 360 };
+        readonly TextBox linkName = new TextBox { Width = 200 }, linkUrl = new TextBox { Width = 420 };
 
         public SettingsForm(Icon icon, Action saved, Action showAi)
         {
@@ -4785,6 +4914,10 @@ namespace WorkLog
             var folder = new Button { Text = "保存フォルダを開く", AutoSize = true, Margin = new Padding(3, 16, 3, 3) };
             folder.Click += (o, e) => { try { Process.Start("explorer.exe", "\"" + Core.Dir + "\""); } catch (Exception ex) { Fail("開けませんでした: " + ex.Message); } };
             Add(t, Auto(), folder);
+
+            t = Page(tabs, "リンク", 2);
+            Add(t, Auto(), L("ボタン名"), linkName);
+            Add(t, Auto(), L("URL"), linkUrl);
 
             foreach (string m in Models) { model.Items.Add(m); fixModel.Items.Add(m); }
             mask.Columns.Add(GridSort.NoColumn());
@@ -4882,6 +5015,8 @@ namespace WorkLog
             model.Text = s.Model;
             fixModel.Text = s.FixModel;
             claudePath.Text = s.ClaudePath;
+            linkName.Text = s.LinkName;
+            linkUrl.Text = s.LinkUrl;
             startup.Checked = TrayApp.StartupPath() != null;
             autoUpdate.Checked = s.AutoUpdate;
         }
@@ -4923,6 +5058,8 @@ namespace WorkLog
                 Model = model.Text.Trim().Length > 0 ? model.Text.Trim() : new Settings().Model,
                 FixModel = fixModel.Text.Trim().Length > 0 ? fixModel.Text.Trim() : new Settings().FixModel,
                 ClaudePath = claudePath.Text.Trim().Trim('"'),
+                LinkName = linkName.Text.Trim(),
+                LinkUrl = linkUrl.Text.Trim(),
                 ExcludeProc = new HashSet<string>(Split(exclude), StringComparer.OrdinalIgnoreCase),
                 MaskProc = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
                 MaskWords = Split(words),
@@ -5223,6 +5360,13 @@ namespace WorkLog
             eq("対応がなければ語", Tasks.Resolve(tmap, tl, "OUTLOOK", "受信トレイ"), "メール");
             Dictionary<int, string> pp = Tasks.ParsePredict("1: 〇〇橋 詳細設計\n2：なし\nわかりません\n3. 「R8工程表」");
             eq("予測の読み取り", string.Join(" | ", pp.OrderBy(x => x.Key).Select(x => x.Key + "=" + x.Value)), "1=〇〇橋 詳細設計 | 2=なし | 3=R8工程表");
+
+            // 工程をつなげる: 短いすき間は前を延ばす・15分以上は「軽作業」で埋める・休憩の後は次の始めを動かす・重なりは前の終わりを縮める
+            var procs = new List<string> { "■工程", "・09:00〜10:00 A", "・10:05〜11:00 B", "・11:30〜12:00 C", "・12:00〜13:00 休憩", "・13:10〜15:00 D", "・14:50〜16:00 E", "", "■軽作業", "・11:10 メール" };
+            int pc = Reporter.ConnectProcesses(procs, new HashSet<string> { "・12:00〜13:00 休憩" });
+            eq("工程をつなげる（行）", string.Join(" | ", procs),
+               "■工程 | ・09:00〜10:05 A | ・10:05〜11:00 B | ・11:00〜11:30 軽作業 | ・11:30〜12:00 C | ・12:00〜13:00 休憩 | ・13:00〜14:50 D | ・14:50〜16:00 E |  | ■軽作業 | ・11:10 メール");
+            eq("工程をつなげる（数）", pc.ToString(), "3");
 
             // AIで直す（会話）: 返事と日報の案に分ける
             string reply, rep;

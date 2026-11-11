@@ -63,6 +63,8 @@ jobs:
       # 古い版のふり（GitHub の最新リリースを落として exe を入れ替え、起動し直す）を実際に動かす
       - name: Test auto update
         shell: pwsh
+        env:
+          WORKLOG_GITHUB_TOKEN: ${{ github.token }}
         run: |
           $t = Join-Path $env:RUNNER_TEMP 'updtest'
           $app = Join-Path $t 'app'; $data = Join-Path $t 'data'

@@ -11,6 +11,7 @@
 //   --auto               未作成の日報をまとめて作って終了（画面なし）
 //   --updated <pid>      自動アップデートで起動された（前の版の終了を待ってから常駐する）
 //   --screenshot-about <png>  テスト中だけ: バージョン情報の画面を画像にして終わる
+//   --screenshot-settings <dir>  テスト中だけ: 設定画面の各タブを画像にして終わる
 //   --screenshot-timeline <png>  テスト中だけ: 日報画面の帯（テスト用の日）を画像にして終わる
 //   --selftest           テスト中だけ: 日報の書式を直す処理を確かめる（0=期待どおり 1=違う）
 //   --check-update [--apply]  テスト中（WORKLOG_TEST）だけ: 更新を確かめて落とす（--apply で入れ替えも）。0=最新 10=更新あり 2=失敗
@@ -46,7 +47,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.21.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.21.1";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -4988,12 +4989,12 @@ namespace WorkLog
             planRow.Controls.Add(planFrom);
             planRow.Controls.Add(new Label { Text = "〜", AutoSize = true, Margin = new Padding(3, 8, 3, 3) });
             planRow.Controls.Add(planTo);
-            Add(t, Auto(), L("勤務予定"), planRow, new Label { AutoSize = true });
+            Add(t, Auto(), L("勤務予定"), planRow);
             var dayRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
             foreach (int i in new[] { 1, 2, 3, 4, 5, 6, 0 }) dayRow.Controls.Add(planDays[i]);   // 月〜日の順に並べる
-            Add(t, Auto(), L("勤務予定の曜日"), dayRow, new Label { AutoSize = true });
-            Add(t, Auto(), L("退勤中でも、この時刻を過ぎて操作があれば出勤"), workStart, L("（記録と AI を始める）"));
-            Add(t, Auto(), L("仕上げの時刻を過ぎて、操作が"), offIdle, L("分なかったら退勤（0 で自動で退勤しない）"));
+            Add(t, Auto(), L("勤務予定の曜日"), dayRow);
+            Add(t, Auto(), L("自動で出勤"), workStart, L("以降に操作があれば"));
+            Add(t, Auto(), L("自動で退勤"), offIdle, L("分操作がなければ（仕上げの時刻以降。0 で自動にしない）"));
 
             t = Page(tabs, "記録・集計", 3);
             Add(t, Auto(), L("無操作がこの時間続いたら離席扱い"), idle, L("秒"));
@@ -5028,7 +5029,7 @@ namespace WorkLog
             Add(t, Auto(), folder);
 
             t = Page(tabs, "日報リンク", 3);
-            Add(t, Auto(), L("ボタン名"), linkName, new Label { AutoSize = true });
+            Add(t, Auto(), L("ボタン名"), linkName);
             var pick = new Button { Text = "ファイルを選ぶ…", AutoSize = true };
             pick.Click += (o, e) => PickLinkFile();
             Add(t, Auto(), L("URL・ファイル"), linkUrl, pick);
@@ -5083,13 +5084,13 @@ namespace WorkLog
             return t;
         }
 
-        // 1行足す。部品が1つなら全部の列にまたがる
+        // 1行足す。部品が列より少なければ、最後の部品を右端の列までまたがせる（ほかの行の幅で押し出されないように）
         static void Add(TableLayoutPanel t, RowStyle style, params Control[] cs)
         {
             int r = t.RowCount++;
             t.RowStyles.Add(style);
             for (int i = 0; i < cs.Length; i++) t.Controls.Add(cs[i], i, r);
-            if (cs.Length == 1) t.SetColumnSpan(cs[0], t.ColumnCount);
+            if (cs.Length < t.ColumnCount) t.SetColumnSpan(cs[cs.Length - 1], t.ColumnCount - cs.Length + 1);
         }
 
         static Button AddButton(FlowLayoutPanel bar, string text, EventHandler click)
@@ -5598,6 +5599,31 @@ namespace WorkLog
                     {
                         t.DrawToBitmap(bmp, new Rectangle(0, 0, t.Width, t.Height));
                         bmp.Save(args[1], System.Drawing.Imaging.ImageFormat.Png);
+                    }
+                }
+                return 0;
+            }
+
+            // テスト用: 設定画面の各タブを画像にして終わる（見た目の確認）
+            if (args.Length >= 2 && args[0] == "--screenshot-settings" && Core.Test)
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Directory.CreateDirectory(args[1]);
+                using (var f = new SettingsForm(SystemIcons.Application, null, null))
+                {
+                    f.StartPosition = FormStartPosition.CenterScreen;
+                    f.Show();
+                    TabControl tc = f.Controls.OfType<TabControl>().First();
+                    for (int i = 0; i < tc.TabCount; i++)
+                    {
+                        tc.SelectedIndex = i;
+                        Application.DoEvents();
+                        using (var bmp = new Bitmap(f.Width, f.Height))
+                        {
+                            f.DrawToBitmap(bmp, new Rectangle(0, 0, f.Width, f.Height));
+                            bmp.Save(Path.Combine(args[1], "settings_" + i + ".png"), System.Drawing.Imaging.ImageFormat.Png);
+                        }
                     }
                 }
                 return 0;

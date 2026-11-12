@@ -46,7 +46,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.19.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.20.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -106,8 +106,8 @@ namespace WorkLog
         public int OffIdleMinutes = 30;  // ReportTime を過ぎて、操作がこの分数なかったら退勤とみなす（0 で自動で退勤しない）
         public bool AutoUpdate = true;   // 新しい版が出たら自動で入れ替える（false は知らせるだけ）
         public string UserName = "";     // 要望を送るときの名前（日報画面の「要望」タブで入れる）
-        public string LinkName = "Niコラボ";   // 日報画面の下のリンクのボタン（URL が空なら出さない）
-        public string LinkUrl = "";   // リポジトリに URL を置かないため、既定は空（設定のタブ「リンク」で入れる）
+        public string LinkName = "";   // 日報リンクのボタン名（空なら「日報リンク」）。名前と開く先はリポジトリに置かないので既定は空
+        public string LinkUrl = "";    // 日報リンクで開く URL かファイル（Excel の日報など）。空ならボタンを出さない
 
         public bool HasBreak { get { return BreakEnd > BreakStart; } }
         public string BreakText { get { return BreakStart.ToString(@"hh\:mm") + "〜" + BreakEnd.ToString(@"hh\:mm"); } }
@@ -140,8 +140,8 @@ namespace WorkLog
             add("ReportTime を過ぎて、操作がこの分数なかったら退勤とみなす（0 で自動で退勤しない）", "OffIdleMinutes", OffIdleMinutes.ToString());
             add("新しい版が出たら自動で更新する（1=自動で更新 0=知らせるだけ）", "AutoUpdate", AutoUpdate ? "1" : "0");
             add("要望を送るときの名前（日報画面の「要望」タブで入れる）", "UserName", UserName);
-            add("日報画面の下のリンクのボタン名", "LinkName", LinkName);
-            add("そのボタンで開く URL（空ならボタンを出さない）", "LinkUrl", LinkUrl);
+            add("日報リンクのボタン名（空なら「日報リンク」）", "LinkName", LinkName);
+            add("日報リンクで開く URL かファイル（空ならボタンを出さない。{yyyy} {MM} {dd} は今日の年・月・日）", "LinkUrl", LinkUrl);
             return b.ToString();
         }
 
@@ -205,6 +205,8 @@ namespace WorkLog
             return v.Split(',', '、').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
         }
 
+        public static Settings FromText(string text) { return Parse(text); }   // 自己テスト用
+
         static Settings Parse(string text)
         {
             var s = new Settings();
@@ -247,8 +249,13 @@ namespace WorkLog
                         case "OffIdleMinutes": s.OffIdleMinutes = int.Parse(v); break;
                         case "AutoUpdate": s.AutoUpdate = v == "1" || v.ToLower() == "true"; break;
                         case "UserName": s.UserName = v; break;
-                        case "LinkName": s.LinkName = v; break;
-                        case "LinkUrl": s.LinkUrl = v; break;
+                        case "LinkName":
+                            // 古い設定ツールが「LinkName=名前 LinkUrl=URL」と1行に書いたものを直す
+                            int u = v.IndexOf("LinkUrl=", StringComparison.Ordinal);
+                            if (u >= 0) { if (s.LinkUrl.Length == 0) s.LinkUrl = v.Substring(u + 8).Trim(); v = v.Substring(0, u).Trim(); }
+                            s.LinkName = v;
+                            break;
+                        case "LinkUrl": if (v.Length > 0) s.LinkUrl = v; break;
                         case "Break":
                             if (v.Length == 0) s.BreakStart = s.BreakEnd = TimeSpan.Zero;
                             else { string[] b = v.Split('-'); s.BreakStart = TimeSpan.Parse(b[0].Trim()); s.BreakEnd = TimeSpan.Parse(b[1].Trim()); }
@@ -1210,6 +1217,18 @@ namespace WorkLog
             foreach (KeyValuePair<string, bool> k in CorrectLines(body))
                 if (!lines.Any(x => Unnumber(x).Trim() == k.Key)) { InsertItem(lines, k.Value, k.Key); n++; }
             return n;
+        }
+
+        // 日報リンクの開く先: {yyyy} {MM} {dd} を日付に置き換え、URL・ファイル・フォルダのどれでもなければ https:// を付ける
+        public static string LinkTarget(string link, DateTime day)
+        {
+            string t = (link ?? "").Trim().Trim('"');
+            if (t.Length == 0) return "";
+            t = t.Replace("{yyyy}", day.ToString("yyyy")).Replace("{MM}", day.ToString("MM")).Replace("{dd}", day.ToString("dd"));
+            if (Regex.IsMatch(t, @"^[a-zA-Z][a-zA-Z0-9+.-]*://")) return t;
+            string path = Environment.ExpandEnvironmentVariables(t);
+            if (Regex.IsMatch(path, @"^([a-zA-Z]:\\|\\\\)") || File.Exists(path) || Directory.Exists(path)) return path;
+            return "https://" + t;
         }
 
         // AI の返事を「返事」と「日報の案」に分ける（案がなければ null）
@@ -4233,22 +4252,21 @@ namespace WorkLog
             return b;
         }
 
-        // 下のリンクのボタン（設定の LinkName・LinkUrl）
+        // 下の日報リンクのボタン（設定の LinkName・LinkUrl）
         public void UpdateLink()
         {
             Settings s = Settings.Get();
-            linkBtn.Text = s.LinkName.Length > 0 ? s.LinkName : "リンク";
+            linkBtn.Text = s.LinkName.Trim().Length > 0 ? s.LinkName.Trim() : "日報リンク";
             linkBtn.Visible = s.LinkUrl.Trim().Length > 0;
         }
 
-        // 既定のブラウザで開く
+        // 日報リンクを開く: URL は既定のブラウザ、ファイル（Excel の日報など）・フォルダは関連付けられたアプリで
         void OpenLink()
         {
-            string url = Settings.Get().LinkUrl.Trim();
-            if (url.Length == 0) return;
-            if (!Regex.IsMatch(url, @"^[a-zA-Z][a-zA-Z0-9+.-]*://")) url = "https://" + url;
-            try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
-            catch (Exception ex) { message.Text = "開けません: " + ex.Message; }
+            string target = Reporter.LinkTarget(Settings.Get().LinkUrl, DateTime.Today);
+            if (target.Length == 0) return;
+            try { Process.Start(new ProcessStartInfo(target) { UseShellExecute = true }); }
+            catch (Exception ex) { message.Text = "開けません: " + target + "（" + ex.Message + "）"; }
         }
 
         void ShowAbout()
@@ -4847,7 +4865,7 @@ namespace WorkLog
         readonly DataGridView mask = new DataGridView();
         readonly ComboBox model = new ComboBox { Width = 260 }, fixModel = new ComboBox { Width = 260 };
         readonly TextBox claudePath = new TextBox { Width = 360 };
-        readonly TextBox linkName = new TextBox { Width = 200 }, linkUrl = new TextBox { Width = 420 };
+        readonly TextBox linkName = new TextBox { Width = 200 }, linkUrl = new TextBox { Dock = DockStyle.Fill, MinimumSize = new Size(300, 0) };
 
         public SettingsForm(Icon icon, Action saved, Action showAi)
         {
@@ -4915,9 +4933,11 @@ namespace WorkLog
             folder.Click += (o, e) => { try { Process.Start("explorer.exe", "\"" + Core.Dir + "\""); } catch (Exception ex) { Fail("開けませんでした: " + ex.Message); } };
             Add(t, Auto(), folder);
 
-            t = Page(tabs, "リンク", 2);
-            Add(t, Auto(), L("ボタン名"), linkName);
-            Add(t, Auto(), L("URL"), linkUrl);
+            t = Page(tabs, "日報リンク", 3);
+            Add(t, Auto(), L("ボタン名"), linkName, new Label { AutoSize = true });
+            var pick = new Button { Text = "ファイルを選ぶ…", AutoSize = true };
+            pick.Click += (o, e) => PickLinkFile();
+            Add(t, Auto(), L("URL・ファイル"), linkUrl, pick);
 
             foreach (string m in Models) { model.Items.Add(m); fixModel.Items.Add(m); }
             mask.Columns.Add(GridSort.NoColumn());
@@ -5024,6 +5044,17 @@ namespace WorkLog
         static List<string> Split(TextBox box)
         {
             return box.Text.Split('\n').Select(x => x.Trim()).Where(x => x.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        // 日報リンクに開くファイル（Excel の日報など）を選ぶ
+        void PickLinkFile()
+        {
+            using (var d = new OpenFileDialog { Title = "日報リンクで開くファイル", Filter = "Excel (*.xlsx;*.xlsm;*.xls)|*.xlsx;*.xlsm;*.xls|すべてのファイル (*.*)|*.*" })
+            {
+                string cur = linkUrl.Text.Trim().Trim('"');
+                try { if (cur.Length > 0 && !cur.Contains("://") && Directory.Exists(Path.GetDirectoryName(cur))) d.InitialDirectory = Path.GetDirectoryName(cur); } catch { }
+                if (d.ShowDialog(this) == DialogResult.OK) linkUrl.Text = d.FileName;
+            }
         }
 
         void Browse()
@@ -5367,6 +5398,16 @@ namespace WorkLog
             eq("工程をつなげる（行）", string.Join(" | ", procs),
                "■工程 | ・09:00〜10:05 A | ・10:05〜11:00 B | ・11:00〜11:30 軽作業 | ・11:30〜12:00 C | ・12:00〜13:00 休憩 | ・13:00〜14:50 D | ・14:50〜16:00 E |  | ■軽作業 | ・11:10 メール");
             eq("工程をつなげる（数）", pc.ToString(), "3");
+
+            // 日報リンク: 古い設定ツールの1行書きを直す・開く先
+            Settings ls = Settings.FromText("LinkName=テスト LinkUrl=https://example.com/a\r\n");
+            eq("日報リンク: 1行書きを直す", ls.LinkName + " | " + ls.LinkUrl, "テスト | https://example.com/a");
+            eq("日報リンク: 既定は空", new Settings().LinkName + "|" + new Settings().LinkUrl, "|");
+            DateTime ld = new DateTime(2026, 1, 5);
+            eq("日報リンク: URL", Reporter.LinkTarget("https://example.com/{yyyy}/{MM}", ld), "https://example.com/2026/01");
+            eq("日報リンク: ファイル", Reporter.LinkTarget(@"C:\日報\日報_{yyyy}{MM}.xlsx", ld), @"C:\日報\日報_202601.xlsx");
+            eq("日報リンク: 共有フォルダ", Reporter.LinkTarget(@"\\server\share\日報.xlsx", ld), @"\\server\share\日報.xlsx");
+            eq("日報リンク: ドメインだけ", Reporter.LinkTarget("example.com/x", ld), "https://example.com/x");
 
             // AIで直す（会話）: 返事と日報の案に分ける
             string reply, rep;

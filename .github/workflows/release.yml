@@ -111,6 +111,11 @@ jobs:
           $null = $p.Handle
           if (-not $p.WaitForExit(60000)) { throw '終わらない' }
           if ($p.ExitCode -ne 0) { throw "帯の画像を作れなかった（$($p.ExitCode)）" }
+          # 設定画面の各タブ
+          $p = Start-Process WorkLogTray/WorkLog.exe -ArgumentList '--screenshot-settings', (Join-Path $env:RUNNER_TEMP 'settings') -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(60000)) { throw '終わらない' }
+          if ($p.ExitCode -ne 0) { throw "設定画面の画像を作れなかった（$($p.ExitCode)）" }
 
       - name: Upload screenshot
         uses: actions/upload-artifact@v4
@@ -119,6 +124,7 @@ jobs:
           path: |
             ${{ runner.temp }}/about.png
             ${{ runner.temp }}/timeline.png
+            ${{ runner.temp }}/settings/*.png
 
       # PR のときは、画像を ci-screenshots ブランチにも置く（成果物を落とせない環境からも git で見られるように）
       - name: Publish screenshots (PR)
@@ -128,6 +134,7 @@ jobs:
           $d = Join-Path $env:RUNNER_TEMP 'shots-repo'
           New-Item -ItemType Directory -Force $d | Out-Null
           Copy-Item (Join-Path $env:RUNNER_TEMP 'about.png'), (Join-Path $env:RUNNER_TEMP 'timeline.png') $d
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'settings\*.png') $d
           Set-Location $d
           git init -q
           git add -A

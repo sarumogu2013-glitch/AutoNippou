@@ -46,7 +46,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.20.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.21.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -103,6 +103,14 @@ namespace WorkLog
         public TimeSpan BreakStart = new TimeSpan(12, 0, 0), BreakEnd = new TimeSpan(13, 0, 0);   // 休憩時間（同じなら休憩なし）
         public int AppendMinutes = 60;  // 今日の日報をこの分数ごとに追記する（0 で ReportTime にまとめて作る）
         public TimeSpan WorkStart = new TimeSpan(8, 0, 0);   // 退勤中でも、この時刻を過ぎて操作があれば出勤とみなす
+        public TimeSpan PlanFrom = new TimeSpan(8, 30, 0), PlanTo = new TimeSpan(17, 30, 0);   // 勤務予定（日報の時刻はこの中に収める）
+        public HashSet<DayOfWeek> PlanDays = new HashSet<DayOfWeek> { DayOfWeek.Monday, DayOfWeek.Tuesday, DayOfWeek.Wednesday, DayOfWeek.Thursday, DayOfWeek.Friday };
+        public const string DayChars = "日月火水木金土";   // DayOfWeek の順
+
+        public bool HasPlan { get { return PlanTo > PlanFrom && PlanDays.Count > 0; } }
+        public bool PlanOn(DateTime day) { return HasPlan && PlanDays.Contains(day.DayOfWeek); }
+        public string PlanText { get { return PlanFrom.ToString(@"hh\:mm") + "〜" + PlanTo.ToString(@"hh\:mm"); } }
+        public string PlanDaysText { get { return string.Concat(Enumerable.Range(0, 7).Where(i => PlanDays.Contains((DayOfWeek)i)).Select(i => DayChars[i])); } }
         public int OffIdleMinutes = 30;  // ReportTime を過ぎて、操作がこの分数なかったら退勤とみなす（0 で自動で退勤しない）
         public bool AutoUpdate = true;   // 新しい版が出たら自動で入れ替える（false は知らせるだけ）
         public string UserName = "";     // 要望を送るときの名前（日報画面の「要望」タブで入れる）
@@ -137,6 +145,8 @@ namespace WorkLog
             add("入力がこの分数なかったら離席として記録する（0 で記録しない）", "AfkMinutes", AfkMinutes.ToString());
             add("離席から戻ったときに何をしていたか聞く（1=聞く 0=日報画面の離席メモに書くだけ）", "AfkAsk", AfkAsk ? "1" : "0");
             add("退勤中（待機）でも、この時刻を過ぎて操作があれば出勤とみなす", "WorkStart", WorkStart.ToString(@"hh\:mm"));
+            add("勤務予定の時刻（日報の時刻はこの中に収める。始業・終業までに操作がない時間は「現場（外勤）」）", "PlanHours", PlanFrom.ToString(@"hh\:mm") + "-" + PlanTo.ToString(@"hh\:mm"));
+            add("勤務予定の曜日（例: 月火水木金。空なら勤務予定を使わない）", "PlanDays", PlanDaysText);
             add("ReportTime を過ぎて、操作がこの分数なかったら退勤とみなす（0 で自動で退勤しない）", "OffIdleMinutes", OffIdleMinutes.ToString());
             add("新しい版が出たら自動で更新する（1=自動で更新 0=知らせるだけ）", "AutoUpdate", AutoUpdate ? "1" : "0");
             add("要望を送るときの名前（日報画面の「要望」タブで入れる）", "UserName", UserName);
@@ -246,6 +256,12 @@ namespace WorkLog
                         case "AfkAsk": s.AfkAsk = v == "1" || v.ToLower() == "true"; break;
                         case "AppendMinutes": s.AppendMinutes = int.Parse(v); break;
                         case "WorkStart": s.WorkStart = TimeSpan.Parse(v); break;
+                        case "PlanHours":
+                            { string[] ph = v.Split('-'); s.PlanFrom = TimeSpan.Parse(ph[0].Trim()); s.PlanTo = TimeSpan.Parse(ph[1].Trim()); }
+                            break;
+                        case "PlanDays":
+                            s.PlanDays = new HashSet<DayOfWeek>(v.Where(ch => DayChars.IndexOf(ch) >= 0).Select(ch => (DayOfWeek)DayChars.IndexOf(ch)));
+                            break;
                         case "OffIdleMinutes": s.OffIdleMinutes = int.Parse(v); break;
                         case "AutoUpdate": s.AutoUpdate = v == "1" || v.ToLower() == "true"; break;
                         case "UserName": s.UserName = v; break;
@@ -1271,7 +1287,7 @@ namespace WorkLog
                 "- 行頭の [番号] は作業の通し番号。利用者の「3番」などはこの番号の行のこと\n" +
                 "- 足す作業は、利用者に頼まれたもの、または作業ログにあって真ん中の日報にも md にもないものだけ\n" +
                 "- 「休憩」の行は、頼まれない限りそのまま残す\n" +
-                BreakRule(s, date) + "\n" +
+                BreakRule(s, date) + PlanRule(date, s) + "\n" +
                 "返事の形（この形だけを出力）:\n" +
                 "<返事>\n利用者への短い返事（何をどう直したか。わからないことがあれば質問する）\n</返事>\n" +
                 "<日報>\n直した日報の本文（日報を直すときだけ書く。「■工程」「■軽作業」の形。見出しの日付行は不要）\n</日報>\n\n" +
@@ -1288,7 +1304,7 @@ namespace WorkLog
             if (report == null) return null;
             List<string> result = SplitLines((header != null ? header + "\n\n" : "") + Unnumber(StripHeader(report)));
             if (!message.Contains("休憩")) EnsureBreak(result, date, s);   // AI がうっかり休憩の行を落としたとき
-            ConnectProcesses(result, FixedLines(date, s));
+            Tidy(result, date, s);
             return Number(string.Join("\n", result).TrimEnd() + "\n");
         }
 
@@ -1365,7 +1381,7 @@ namespace WorkLog
                 "- 作業内容は20文字程度。ファイル名やページ名から業務内容を具体的に推定する（例:「〇〇工区の数量計算」）\n" +
                 "- 推定できないもの、私用と思われるものは省く\n" +
                 "- 「時刻のない本人のメモ」があれば、作業ログになくても業務として必ず入れる\n" +
-                BreakRule(s, date) +
+                BreakRule(s, date) + PlanRule(date, s) +
                 "- 該当がなければ「・なし」\n\n" +
                 NotesPrompt(date) + Tasks.Prompt() + Afk.Prompt(date) + ManualPrompt(date) + LogText(active, s);
 
@@ -1407,7 +1423,7 @@ namespace WorkLog
             {
                 Backup(path);
                 List<string> lines = SplitLines(header + "\n\n" + body.Trim());
-                if (r.Ok) { ApplyManual(lines, date); EnsureBreak(lines, date, s); ConnectProcesses(lines, FixedLines(date, s)); }
+                if (r.Ok) { ApplyManual(lines, date); EnsureBreak(lines, date, s); Tidy(lines, date, s); }
                 string text = string.Join("\n", lines).TrimEnd() + "\n";
                 Core.WriteText(path, r.Ok ? Number(text) : Regex.Replace(text, "\r?\n", "\r\n"));
             }
@@ -1433,7 +1449,7 @@ namespace WorkLog
                 "条件:\n" + MainRules() +
                 "- 作業ログにあって、真ん中の日報にも作成済みの日報（md）にもない作業だけを足す。推定できないもの・私用と思われるものは足さない。足す作業は今ある工程と時間が重ならないようにする\n" +
                 "- 「時刻のない本人のメモ」のうち日報にないものは足す\n" +
-                BreakRule(s, date) + "\n" +
+                BreakRule(s, date) + PlanRule(date, s) + "\n" +
                 NotesPrompt(date) + Tasks.Prompt() + Afk.Prompt(date) + ManualPrompt(date) +
                 "真ん中の日報（メイン）:\n" + body + "\n\n" +
                 MdPrompt(date) +
@@ -1469,7 +1485,7 @@ namespace WorkLog
             {
                 List<string> result = SplitLines(header + "\n\n" + string.Join("\n", lines).Trim());
                 EnsureBreak(result, date, s);
-                ConnectProcesses(result, FixedLines(date, s));
+                Tidy(result, date, s);
                 string text = Number(string.Join("\n", result).TrimEnd() + "\n");
                 // AI を待つあいだに手で直された・離席メモが足されたときは、上書きせずに案を old に残す
                 if (!File.Exists(path) || Norm(Core.ReadText(path)) != Norm(existing))
@@ -1570,8 +1586,29 @@ namespace WorkLog
         }
 
         // 直した行の数を返す
-        public static int ConnectProcesses(List<string> lines, ICollection<string> fixedLines)
+        public const string OutsideWork = "現場（外勤）";
+
+        // 日報の工程をそろえる（勤務予定の日は、時刻を勤務予定の中に収め、始業・終業までのすき間を「現場（外勤）」にする）
+        static int Tidy(List<string> lines, string date, Settings s, string extra = null)
         {
+            DateTime day = DateTime.ParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture);
+            bool plan = s.PlanOn(day);
+            return ConnectProcesses(lines, FixedLines(date, s, extra), plan ? s.PlanFrom : (TimeSpan?)null, plan ? s.PlanTo : (TimeSpan?)null);
+        }
+
+        // AI への指示（勤務予定の日だけ）
+        static string PlanRule(string date, Settings s)
+        {
+            DateTime day = DateTime.ParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture);
+            return s.PlanOn(day)
+                ? "- 勤務予定は " + s.PlanText + "。この外の時刻は書かない。始業から最初の PC の作業まで・最後の作業から終業までに操作がない時間は「" + OutsideWork + "」の工程として書く\n"
+                : "";
+        }
+
+        // from・to（勤務予定）があれば、工程・軽作業の時刻をその中に収め、始業・終業までのすき間を埋める
+        public static int ConnectProcesses(List<string> lines, ICollection<string> fixedLines, TimeSpan? from = null, TimeSpan? to = null)
+        {
+            int clamped = from.HasValue && to.HasValue ? ClampLight(lines, from.Value, to.Value) : 0;
             int h = lines.FindIndex(l => l.Trim().StartsWith("■") && l.Contains("工程"));
             if (h < 0) return 0;
             int end = h + 1;
@@ -1587,7 +1624,18 @@ namespace WorkLog
                 else if (l.Length == 0) blanks++;
                 else if (l != "・なし") others.Add(l);
             }
-            if (items.Count == 0) return 0;
+            if (from.HasValue && to.HasValue)
+            {
+                foreach (Proc x in items) { if (x.A < from.Value) x.A = from.Value; if (x.B > to.Value) x.B = to.Value; }
+                items = items.Where(x => x.B > x.A).ToList();
+            }
+            if (items.Count == 0)
+            {
+                if (clamped == 0) return 0;
+                lines.RemoveRange(h + 1, end - h - 1);
+                lines.InsertRange(h + 1, others.Concat(Enumerable.Repeat("", blanks)));
+                return clamped;
+            }
             items = items.OrderBy(x => x.A).ThenBy(x => x.B).ToList();
             var result = new List<Proc> { items[0] };
             for (int i = 1; i < items.Count; i++)
@@ -1603,11 +1651,46 @@ namespace WorkLog
                 }
                 result.Add(next);
             }
+            // 始業から最初の工程・最後の工程から終業まで: 短ければ工程を延ばし、GapLight 分以上なら「現場（外勤）」
+            if (from.HasValue && to.HasValue)
+            {
+                Proc first = result[0], last = result[result.Count - 1];
+                if (first.A > from.Value)
+                {
+                    if (first.A - from.Value >= TimeSpan.FromMinutes(GapLight)) result.Insert(0, new Proc { A = from.Value, B = first.A, Rest = " " + OutsideWork });
+                    else if (!first.Fixed) first.A = from.Value;
+                }
+                if (last.B < to.Value)
+                {
+                    if (to.Value - last.B >= TimeSpan.FromMinutes(GapLight)) result.Add(new Proc { A = last.B, B = to.Value, Rest = " " + OutsideWork });
+                    else if (!last.Fixed) last.B = to.Value;
+                }
+            }
             var built = result.Select(x => "・" + Hm(x.A) + "〜" + Hm(x.B) + x.Rest).ToList();
-            int changed = result.Count(x => x.Orig == null) + result.Count(x => x.Orig != null && x.Orig != "・" + Hm(x.A) + "〜" + Hm(x.B) + x.Rest);
+            int changed = clamped + result.Count(x => x.Orig == null) + result.Count(x => x.Orig != null && x.Orig != "・" + Hm(x.A) + "〜" + Hm(x.B) + x.Rest);
             lines.RemoveRange(h + 1, end - h - 1);
             lines.InsertRange(h + 1, built.Concat(others).Concat(Enumerable.Repeat("", blanks)));
             return changed;
+        }
+
+        // 軽作業の時刻を勤務予定の中に収める（直した数）
+        static int ClampLight(List<string> lines, TimeSpan from, TimeSpan to)
+        {
+            int n = 0;
+            bool light = false;
+            for (int i = 0; i < lines.Count; i++)
+            {
+                string l = Unnumber(lines[i]).Trim();
+                if (l.StartsWith("■")) { light = l.Contains("軽作業"); continue; }
+                if (!light) continue;
+                Match m = LightRe.Match(l);
+                if (!m.Success) continue;
+                TimeSpan t = Clock(m.Groups[1].Value), c = t < from ? from : t > to ? to : t;
+                if (c == t) continue;
+                lines[i] = "・" + Hm(c) + l.Substring(m.Groups[1].Index + m.Groups[1].Length);
+                n++;
+            }
+            return n;
         }
 
         static bool EnsureBreak(List<string> lines, string date, Settings s)
@@ -1669,7 +1752,7 @@ namespace WorkLog
                 if (!text.Contains("■")) return false;
                 List<string> lines = SplitLines(text);
                 if (!lines.Any(l => Unnumber(l).Trim() == item)) InsertItem(lines, light, item);
-                ConnectProcesses(lines, FixedLines(date, Settings.Get(), item));
+                Tidy(lines, date, Settings.Get(), item);
                 Core.WriteText(path, Number(string.Join("\n", lines).TrimEnd() + "\n"));
             }
             return true;
@@ -1815,7 +1898,7 @@ namespace WorkLog
                     InsertItem(lines, AfkIsLight(e), item);
                     e.Line = item;
                 }
-                ConnectProcesses(lines, FixedLines(e.Start.ToString("yyyy-MM-dd"), Settings.Get(), e.Line));
+                Tidy(lines, e.Start.ToString("yyyy-MM-dd"), Settings.Get(), e.Line);
                 Core.WriteText(path, Number(string.Join("\n", lines).TrimEnd() + "\n"));
             }
             Afk.Put(e);
@@ -1855,7 +1938,7 @@ namespace WorkLog
                 "- 時刻は作業ログに出てくる時刻を使う。作業内容は20文字程度で、日報の書き方に合わせる\n" +
                 "- 推定できないもの、私用と思われるものは省く\n" +
                 "- 「時刻のない本人のメモ」のうち日報にまだないものがあれば、それも入れる\n" +
-                BreakRule(s, date) +
+                BreakRule(s, date) + PlanRule(date, s) +
                 "- 新しい作業がなければ「・なし」とだけ書く\n\n" +
                 NotesPrompt(date) + Tasks.Prompt() + Afk.Prompt(date) +
                 "今の日報:\n" + current.Replace("\r\n", "\n") + "\n\n" +
@@ -1875,7 +1958,7 @@ namespace WorkLog
                 fixedLines.Add(BreakLine(s));   // 休憩の行は延ばさない
                 n = MergeItems(lines, added, fixedLines);
                 EnsureBreak(lines, date, s);
-                ConnectProcesses(lines, FixedLines(date, s));
+                Tidy(lines, date, s);
                 if (lines.Count > 0 && lines[0].StartsWith("日報 ")) lines[0] = Header(date, all);
                 Core.WriteText(path, Number(string.Join("\n", lines).TrimEnd() + "\n"));
                 SaveMd(date, Core.ReadText(path));
@@ -4858,6 +4941,9 @@ namespace WorkLog
         readonly CheckBox afkAsk = new CheckBox { Text = "離席から戻ったときに何をしていたか聞く", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
         readonly NumericUpDown afkMinutes = Num(0, 240), appendMinutes = Num(0, 480), offIdle = Num(0, 600);
         readonly DateTimePicker workStart = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 90 };
+        readonly DateTimePicker planFrom = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 80 };
+        readonly DateTimePicker planTo = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 80 };
+        readonly CheckBox[] planDays = Enumerable.Range(0, 7).Select(i => new CheckBox { Text = Settings.DayChars[i].ToString(), AutoSize = true, Margin = new Padding(3, 6, 3, 3) }).ToArray();
         readonly CheckBox breakOn = new CheckBox { Text = "休憩時間", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 6, 6, 4) };
         readonly DateTimePicker breakStart = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 80 };
         readonly DateTimePicker breakEnd = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 80 };
@@ -4898,6 +4984,14 @@ namespace WorkLog
             Add(t, Auto(), openWindow);
 
             t = Page(tabs, "出勤・退勤", 3);
+            var planRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
+            planRow.Controls.Add(planFrom);
+            planRow.Controls.Add(new Label { Text = "〜", AutoSize = true, Margin = new Padding(3, 8, 3, 3) });
+            planRow.Controls.Add(planTo);
+            Add(t, Auto(), L("勤務予定"), planRow, new Label { AutoSize = true });
+            var dayRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
+            foreach (int i in new[] { 1, 2, 3, 4, 5, 6, 0 }) dayRow.Controls.Add(planDays[i]);   // 月〜日の順に並べる
+            Add(t, Auto(), L("勤務予定の曜日"), dayRow, new Label { AutoSize = true });
             Add(t, Auto(), L("退勤中でも、この時刻を過ぎて操作があれば出勤"), workStart, L("（記録と AI を始める）"));
             Add(t, Auto(), L("仕上げの時刻を過ぎて、操作が"), offIdle, L("分なかったら退勤（0 で自動で退勤しない）"));
 
@@ -5025,6 +5119,9 @@ namespace WorkLog
             SetNum(afkMinutes, s.AfkMinutes);
             SetNum(offIdle, s.OffIdleMinutes);
             workStart.Value = DateTime.Today + s.WorkStart;
+            planFrom.Value = DateTime.Today + s.PlanFrom;
+            planTo.Value = DateTime.Today + s.PlanTo;
+            for (int i = 0; i < 7; i++) planDays[i].Checked = s.PlanDays.Contains((DayOfWeek)i);
             afkAsk.Checked = s.AfkAsk;
             openWindow.Checked = s.OpenWindowOnReport;
             exclude.Text = string.Join("\r\n", s.ExcludeProc);
@@ -5098,6 +5195,9 @@ namespace WorkLog
                 AfkMinutes = (int)afkMinutes.Value, AfkAsk = afkAsk.Checked,
                 AppendMinutes = (int)appendMinutes.Value,
                 WorkStart = new TimeSpan(workStart.Value.Hour, workStart.Value.Minute, 0),
+                PlanFrom = new TimeSpan(planFrom.Value.Hour, planFrom.Value.Minute, 0),
+                PlanTo = new TimeSpan(planTo.Value.Hour, planTo.Value.Minute, 0),
+                PlanDays = new HashSet<DayOfWeek>(Enumerable.Range(0, 7).Where(i => planDays[i].Checked).Select(i => (DayOfWeek)i)),
                 OffIdleMinutes = (int)offIdle.Value,
                 AutoUpdate = autoUpdate.Checked,
                 UserName = Settings.Get().UserName,
@@ -5114,6 +5214,7 @@ namespace WorkLog
                 s.MaskProc[p] = w;
             }
             if (breakOn.Checked && !s.HasBreak) return Fail("休憩時間は、終わりを始めより後にしてください。");
+            if (s.PlanTo <= s.PlanFrom) return Fail("勤務予定は、終わりを始めより後にしてください。");
             string bad = s.ExcludeProc.Concat(s.MaskWords).FirstOrDefault(x => Bad(x, false));
             if (bad != null) return Fail("「,」「、」は使えません（1行に1つずつ書いてください）: " + bad);
             if (s.ClaudePath.Length > 0 && !File.Exists(s.ClaudePath) &&
@@ -5408,6 +5509,18 @@ namespace WorkLog
             eq("日報リンク: ファイル", Reporter.LinkTarget(@"C:\日報\日報_{yyyy}{MM}.xlsx", ld), @"C:\日報\日報_202601.xlsx");
             eq("日報リンク: 共有フォルダ", Reporter.LinkTarget(@"\\server\share\日報.xlsx", ld), @"\\server\share\日報.xlsx");
             eq("日報リンク: ドメインだけ", Reporter.LinkTarget("example.com/x", ld), "https://example.com/x");
+
+            // 勤務予定（8:30〜17:30）: 外の時刻を収め、始業・終業までのすき間を「現場（外勤）」に
+            var plan1 = new List<string> { "■工程", "・08:00〜10:00 A", "・10:00〜15:00 B", "■軽作業", "・18:10 メール", "・08:10 電話" };
+            Reporter.ConnectProcesses(plan1, new HashSet<string>(), new TimeSpan(8, 30, 0), new TimeSpan(17, 30, 0));
+            eq("勤務予定: 収める・終業まで外勤", string.Join(" | ", plan1),
+               "■工程 | ・08:30〜10:00 A | ・10:00〜15:00 B | ・15:00〜17:30 現場（外勤） | ■軽作業 | ・17:30 メール | ・08:30 電話");
+            var plan2 = new List<string> { "■工程", "・09:40〜17:20 A" };
+            Reporter.ConnectProcesses(plan2, new HashSet<string>(), new TimeSpan(8, 30, 0), new TimeSpan(17, 30, 0));
+            eq("勤務予定: 始業まで外勤・短い終業前は延ばす", string.Join(" | ", plan2), "■工程 | ・08:30〜09:40 現場（外勤） | ・09:40〜17:30 A");
+            Settings ps = Settings.FromText("PlanHours=09:00-18:00\r\nPlanDays=月水金\r\n");
+            eq("勤務予定の設定", ps.PlanText + " " + ps.PlanDaysText + " " + ps.PlanOn(new DateTime(2026, 11, 11)) + " " + ps.PlanOn(new DateTime(2026, 11, 12)), "09:00〜18:00 月水金 True False");
+            eq("勤務予定の既定", new Settings().PlanText + " " + new Settings().PlanDaysText, "08:30〜17:30 月火水木金");
 
             // AIで直す（会話）: 返事と日報の案に分ける
             string reply, rep;

@@ -5034,6 +5034,15 @@ namespace WorkLog
             pick.Click += (o, e) => PickLinkFile();
             Add(t, Auto(), L("URL・ファイル"), linkUrl, pick);
 
+            // 高さの余りは最後の空の行に回す（最後の項目の行が伸びて、見出しが下にずれないように）
+            foreach (TabPage pg in tabs.TabPages)
+            {
+                var tl = pg.Controls.Count > 0 ? pg.Controls[0] as TableLayoutPanel : null;
+                if (tl == null || tl.RowStyles.Cast<RowStyle>().Any(r => r.SizeType == SizeType.Percent)) continue;
+                tl.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+                tl.RowCount++;
+            }
+
             foreach (string m in Models) { model.Items.Add(m); fixModel.Items.Add(m); }
             mask.Columns.Add(GridSort.NoColumn());
             mask.Columns.Add("proc", "プロセス名（例: OUTLOOK）");
@@ -5067,7 +5076,7 @@ namespace WorkLog
             return new TextBox { Multiline = true, AcceptsReturn = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill };
         }
 
-        static Label L(string s) { return new Label { Text = s, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 8, 6, 4) }; }
+        static Label L(string s) { return new Label { Text = s, AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Top, Margin = new Padding(3, 8, 6, 4) }; }
 
         static Label Hint(string s) { return new Label { Text = s, AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 2, 3, 8) }; }
 

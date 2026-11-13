@@ -47,7 +47,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.21.1";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.22.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -74,8 +74,27 @@ namespace WorkLog
             }
         }
 
-        public static string ReportPath(string date) { return Path.Combine(Dir, "日報_" + date + ".txt"); }
-        public static string CsvPath(string date) { return Path.Combine(Dir, date + ".csv"); }
+        // 記録（CSV）は 保存先\ログ、日報は 保存先\日報（0.22.0 から。前は保存先の直下）
+        public static string LogDir { get { string d = Path.Combine(Dir, "ログ"); Directory.CreateDirectory(d); return d; } }
+        public static string ReportDir { get { string d = Path.Combine(Dir, "日報"); Directory.CreateDirectory(d); return d; } }
+        public static string ReportPath(string date) { return Path.Combine(ReportDir, "日報_" + date + ".txt"); }
+        public static string CsvPath(string date) { return Path.Combine(LogDir, date + ".csv"); }
+        public static string WindowsPath(string date) { return Path.Combine(LogDir, "窓_" + date + ".csv"); }
+
+        // 0.22.0 より前の置き方（保存先の直下）の記録と日報を、ログ・日報のフォルダへ移す（移す先にあるものは上書きしない）
+        public static void MoveToFolders()
+        {
+            try
+            {
+                foreach (string f in Directory.GetFiles(Dir, "*.csv"))
+                    if (Regex.IsMatch(Path.GetFileName(f), @"^\d{4}-\d{2}-\d{2}\.csv$") && !File.Exists(Path.Combine(LogDir, Path.GetFileName(f))))
+                        File.Move(f, Path.Combine(LogDir, Path.GetFileName(f)));
+                foreach (string f in Directory.GetFiles(Dir, "日報_*.txt"))
+                    if (Regex.IsMatch(Path.GetFileName(f), @"^日報_\d{4}-\d{2}-\d{2}\.txt$") && !File.Exists(Path.Combine(ReportDir, Path.GetFileName(f))))
+                        File.Move(f, Path.Combine(ReportDir, Path.GetFileName(f)));
+            }
+            catch (Exception ex) { Error("フォルダの整理", ex.Message); }
+        }
         public static void WriteText(string path, string text) { File.WriteAllText(path, text, new UTF8Encoding(true)); }
 
         // 記録中のファイルも読めるように共有モードで開く
@@ -293,6 +312,120 @@ namespace WorkLog
         [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
         [StructLayout(LayoutKind.Sequential)] struct LII { public uint cbSize; public uint dwTime; }
         [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LII p);
+        delegate bool EnumProc(IntPtr h, IntPtr l);
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+        [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int index);
+        [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
+        [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int value, int size);
+
+        // ---- 開いているウィンドウ（開いた・閉じたときを ログ\窓_日付.csv に書く。閉じるまでその作業をしていたとみなす）----
+        static readonly TimeSpan WinGap = TimeSpan.FromMinutes(5);   // これ以上記録があいたら（スリープ・電源オフ・再起動）、いったん閉じたとみなす
+        HashSet<string> openWins;   // 前の記録のときに開いていたウィンドウ（アプリ<TAB>タイトル）
+        DateTime openAt = DateTime.MinValue;
+
+        static string StatePath { get { return Path.Combine(Core.LogDir, "窓_開いている.txt"); } }
+
+        static string CleanTitle(string t) { return (t ?? "").Replace('\r', ' ').Replace('\n', ' ').Replace('"', ' ').Replace('\t', ' ').Trim(); }
+
+        // 開いているウィンドウ: 見えている・持ち主のない・ツール用でない・隠されていない・タイトルのあるもの（集計しないプロセスと作業ログ自身は除く）
+        public static HashSet<string> OpenWindows(Settings s)
+        {
+            var set = new HashSet<string>();
+            var names = new Dictionary<uint, string>();
+            EnumWindows((h, l) =>
+            {
+                if (!IsWindowVisible(h) || GetWindow(h, 4) != IntPtr.Zero) return true;            // GW_OWNER
+                if ((GetWindowLong(h, -20) & 0x80) != 0) return true;                              // WS_EX_TOOLWINDOW
+                int cloaked;
+                if (DwmGetWindowAttribute(h, 14, out cloaked, 4) == 0 && cloaked != 0) return true; // DWMWA_CLOAKED
+                int n = GetWindowTextLength(h);
+                if (n <= 0) return true;
+                var sb = new StringBuilder(n + 1);
+                GetWindowText(h, sb, n + 1);
+                string title = CleanTitle(sb.ToString());
+                if (title.Length == 0 || title == "Program Manager") return true;
+                uint pid;
+                GetWindowThreadProcessId(h, out pid);
+                string proc;
+                if (!names.TryGetValue(pid, out proc))
+                {
+                    try { using (var p = Process.GetProcessById((int)pid)) proc = p.ProcessName; } catch { proc = ""; }
+                    names[pid] = proc;
+                }
+                if (proc.Length == 0 || s.ExcludeProc.Contains(proc) || proc.Equals("WorkLog", StringComparison.OrdinalIgnoreCase)) return true;
+                set.Add(proc + "\t" + title);
+                return true;
+            }, IntPtr.Zero);
+            return set;
+        }
+
+        static void WriteWinEvents(DateTime at, string kind, IEnumerable<string> keys)
+        {
+            List<string> list = keys.ToList();
+            if (list.Count == 0) return;
+            string file = Core.WindowsPath(at.ToString("yyyy-MM-dd"));
+            bool isNew = !File.Exists(file);
+            using (var fs = new FileStream(file, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+            using (var w = new StreamWriter(fs, new UTF8Encoding(isNew)))
+            {
+                if (isNew) w.WriteLine("\"time\",\"event\",\"process\",\"title\"");
+                foreach (string k in list)
+                {
+                    string[] c = k.Split(new[] { '\t' }, 2);
+                    w.WriteLine(string.Format("\"{0}\",\"{1}\",\"{2}\",\"{3}\"", at.ToString("yyyy-MM-dd HH:mm:ss"), kind, c[0], c.Length > 1 ? c[1] : ""));
+                }
+            }
+        }
+
+        void SaveWinState()
+        {
+            try { File.WriteAllText(StatePath, openAt.ToString("yyyy-MM-dd HH:mm:ss") + "\r\n" + string.Join("\r\n", openWins), new UTF8Encoding(false)); }
+            catch { }
+        }
+
+        void LoadWinState()
+        {
+            openWins = new HashSet<string>();
+            try
+            {
+                if (!File.Exists(StatePath)) return;
+                string[] lines = File.ReadAllLines(StatePath, Encoding.UTF8);
+                DateTime t;
+                if (lines.Length == 0 || !DateTime.TryParseExact(lines[0].Trim(), "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out t)) return;
+                openAt = t;
+                foreach (string l in lines.Skip(1)) if (l.Contains("\t")) openWins.Add(l);
+            }
+            catch { }
+        }
+
+        // 開いていたウィンドウをすべて、at に閉じたことにする（退勤・終了・記録があいたとき）
+        public void CloseWindows(DateTime at)
+        {
+            try
+            {
+                if (openWins == null) LoadWinState();
+                WriteWinEvents(at, "close", openWins);
+                openWins.Clear();
+                openAt = at;
+                SaveWinState();
+            }
+            catch (Exception ex) { Core.Error("ウィンドウの記録", ex.Message); }
+        }
+
+        void TickWindows(DateTime now)
+        {
+            if (openWins == null) LoadWinState();
+            // 日付が変わった・記録があいた: 前に開いていたものは、最後に確かめた時刻に閉じたことにする
+            if (openWins.Count > 0 && (now.Date != openAt.Date || now - openAt > WinGap)) CloseWindows(openAt);
+            HashSet<string> cur = OpenWindows(Settings.Get());
+            WriteWinEvents(now, "close", openWins.Where(k => !cur.Contains(k)));
+            WriteWinEvents(now, "open", cur.Where(k => !openWins.Contains(k)));
+            openWins = cur;
+            openAt = now;
+            SaveWinState();
+        }
 
         public DateTime LastOk = DateTime.MinValue;
         public string LastError;
@@ -329,6 +462,8 @@ namespace WorkLog
                 }
                 LastOk = now;
                 LastError = null;
+                try { TickWindows(now); }
+                catch (Exception ex) { Core.Error("ウィンドウの記録", ex.Message); }
             }
             catch (Exception ex)
             {
@@ -1083,7 +1218,62 @@ namespace WorkLog
         }
 
         // アプリ×タイトル別の合計と、時刻順のまとまり（同じアプリ×タイトルが続いた区間）
-        static string LogText(List<Row> active, Settings s)
+        // ---- 開いていたウィンドウ（ログ\窓_日付.csv）----
+        public class WinSpan { public string Proc, Title; public DateTime Start, End; }
+        static readonly Regex WinRe = new Regex("^\"([^\"]*)\",\"(open|close)\",\"([^\"]*)\",\"([^\"]*)\"");
+        public const int WinMinMinutes = 10;   // これより短く開いていたものは AI に渡さない
+
+        // 開いていた区間（開いた〜閉じた）。閉じていないものは、今日なら今まで、ほかの日はその日の最後の記録まで
+        public static List<WinSpan> WindowSpans(string date)
+        {
+            var list = new List<WinSpan>();
+            string path = Core.WindowsPath(date);
+            if (!File.Exists(path)) return list;
+            var open = new Dictionary<string, KeyValuePair<DateTime, string[]>>();
+            DateTime last = DateTime.MinValue;
+            foreach (string raw in Core.ReadText(path).Split('\n'))
+            {
+                Match m = WinRe.Match(raw.TrimEnd('\r').TrimStart('\uFEFF'));
+                DateTime t;
+                if (!m.Success || !DateTime.TryParseExact(m.Groups[1].Value, "yyyy-MM-dd HH:mm:ss", Inv, DateTimeStyles.None, out t)) continue;
+                if (t > last) last = t;
+                string key = m.Groups[3].Value + "\t" + m.Groups[4].Value;
+                KeyValuePair<DateTime, string[]> o;
+                if (m.Groups[2].Value == "open") { if (!open.ContainsKey(key)) open[key] = new KeyValuePair<DateTime, string[]>(t, new[] { m.Groups[3].Value, m.Groups[4].Value }); }
+                else if (open.TryGetValue(key, out o))
+                {
+                    if (t > o.Key) list.Add(new WinSpan { Proc = o.Value[0], Title = o.Value[1], Start = o.Key, End = t });
+                    open.Remove(key);
+                }
+            }
+            DateTime end = date == DateTime.Today.ToString("yyyy-MM-dd") ? DateTime.Now : last;
+            foreach (var kv in open)
+                if (end > kv.Value.Key) list.Add(new WinSpan { Proc = kv.Value.Value[0], Title = kv.Value.Value[1], Start = kv.Value.Key, End = end });
+            return list.OrderBy(x => x.Start).ToList();
+        }
+
+        // AI に渡す「開いていたウィンドウ」（since があればそれより後の分だけ）
+        static string WindowText(string date, Settings s, Dictionary<string, Tasks.TitleTask> map, List<TaskItem> tasks, DateTime? since)
+        {
+            List<WinSpan> spans = WindowSpans(date);
+            if (since.HasValue)
+                spans = spans.Where(x => x.End > since.Value).Select(x => new WinSpan { Proc = x.Proc, Title = x.Title, Start = x.Start < since.Value ? since.Value : x.Start, End = x.End }).ToList();
+            spans = spans.Where(x => (x.End - x.Start).TotalMinutes >= Math.Max(WinMinMinutes, s.MinMinutes) && !s.ExcludeProc.Contains(x.Proc))
+                .OrderByDescending(x => x.End - x.Start).Take(60).OrderBy(x => x.Start).ToList();
+            if (spans.Count == 0) return "";
+            var b = new StringBuilder("\n\n開いていたウィンドウ（開いた〜閉じた。閉じるまでその作業をしていたとみなす。前面で使っていた作業を優先し、ほかに作業のない時間をこの作業として書く）:\n");
+            foreach (WinSpan x in spans)
+            {
+                string t;
+                if (!s.MaskProc.TryGetValue(x.Proc, out t)) t = x.Title;
+                foreach (string w in s.MaskWords) t = t.Replace(w, "＊＊");
+                string task = Tasks.Resolve(map, tasks, x.Proc, x.Title);
+                b.Append(x.Start.ToString("HH:mm") + "-" + x.End.ToString("HH:mm") + " [" + x.Proc + "] " + t + (task != null ? " 〔タスク: " + task + "〕" : "") + "\n");
+            }
+            return b.ToString().TrimEnd('\n');
+        }
+
+        static string LogText(List<Row> active, Settings s, DateTime? since = null)
         {
             var groups = new Dictionary<string, int>();
             var segs = new List<Seg>();
@@ -1118,7 +1308,8 @@ namespace WorkLog
                 string[] p = x.Key.Split(new[] { '\t' }, 2);
                 return string.Format("{0}-{1} [{2}] {3}", x.Start.ToString("HH:mm"), x.End.ToString("HH:mm"), p[0], p[1]);
             }));
-            return "合計時間:\n" + summary + "\n\n時刻順:\n" + timeline;
+            string wins = active.Count > 0 ? WindowText(active[0].Time.ToString("yyyy-MM-dd"), s, map, tasks, since) : "";
+            return "合計時間:\n" + summary + "\n\n時刻順:\n" + timeline + wins;
         }
 
         // 作業の行（「・」で始まる行。「・なし」は除く）に通し番号 [1] [2] … を付け直す。「3番を直して」と指示できるように
@@ -1943,7 +2134,7 @@ namespace WorkLog
                 "- 新しい作業がなければ「・なし」とだけ書く\n\n" +
                 NotesPrompt(date) + Tasks.Prompt() + Afk.Prompt(date) +
                 "今の日報:\n" + current.Replace("\r\n", "\n") + "\n\n" +
-                since.ToString("HH:mm") + " より後の作業ログ:\n" + LogText(fresh, s);
+                since.ToString("HH:mm") + " より後の作業ログ:\n" + LogText(fresh, s, since);
 
             string added;
             try { added = ClaudeCli.Ask(prompt, s, date, "（追記）"); }
@@ -2026,8 +2217,11 @@ namespace WorkLog
             try
             {
                 DateTime limit = DateTime.Now.AddDays(-s.KeepDays);
-                foreach (string f in Directory.GetFiles(Core.Dir, "*.csv"))
-                    if (IsDate(Path.GetFileNameWithoutExtension(f)) && File.GetLastWriteTime(f) < limit) File.Delete(f);
+                foreach (string f in Directory.GetFiles(Core.LogDir, "*.csv"))
+                {
+                    string n = Path.GetFileNameWithoutExtension(f);
+                    if ((IsDate(n) || (n.StartsWith("窓_") && IsDate(n.Substring(2)))) && File.GetLastWriteTime(f) < limit) File.Delete(f);
+                }
                 string old = Path.Combine(Core.Dir, "old");
                 if (Directory.Exists(old))
                     foreach (string f in Directory.GetFiles(old, "日報_*.txt"))
@@ -2677,6 +2871,7 @@ namespace WorkLog
             off = true;
             offAt = at;
             Duty.Save(true, at);
+            logger.CloseWindows(at);   // 退勤中は開いていても作業していない
             UpdateDuty();
             Balloon("退勤（" + at.ToString("HH:mm") + "）", manual ? "記録停止" : "記録停止（操作なし）", ToolTipIcon.Info, null);
             if (askForm != null && !askForm.IsDisposed && askForm.Visible) askForm.Hide();
@@ -2912,6 +3107,7 @@ namespace WorkLog
         // 聞かずに終わる（更新で起動し直すときも）
         void Shutdown()
         {
+            if (!off) logger.CloseWindows(DateTime.Now);
             if (form != null && !form.IsDisposed) { form.SaveIfDirty(); form.Dispose(); }
             if (aiForm != null && !aiForm.IsDisposed) aiForm.Dispose();
             if (settingsForm != null && !settingsForm.IsDisposed) settingsForm.Dispose();
@@ -4449,7 +4645,7 @@ namespace WorkLog
         static List<string> ReportDates()
         {
             return Directory.Exists(Core.Dir)
-                ? Directory.GetFiles(Core.Dir, "日報_*.txt").Select(f => Path.GetFileNameWithoutExtension(f).Substring(3))
+                ? Directory.GetFiles(Core.ReportDir, "日報_*.txt").Select(f => Path.GetFileNameWithoutExtension(f).Substring(3))
                     .Where(Reporter.IsDate).OrderByDescending(d => d).ToList()
                 : new List<string>();
         }
@@ -5542,6 +5738,21 @@ namespace WorkLog
             rep = Reporter.ParseChat("■工程\n・09:00〜10:00 A", out reply);
             eq("会話: 形を守らず日報だけ", (rep != null) + " " + reply, "True 日報を直しました。青字のところを確かめてください。");
 
+            // 保存先の直下の記録・日報をフォルダへ移す（0.22.0 より前の置き方）
+            Core.WriteText(Path.Combine(Core.Dir, "2026-01-04.csv"), "x");
+            Core.WriteText(Path.Combine(Core.Dir, "日報_2026-01-04.txt"), "y");
+            Core.MoveToFolders();
+            eq("フォルダへ移す", File.Exists(Core.CsvPath("2026-01-04")) + " " + File.Exists(Core.ReportPath("2026-01-04")) + " " +
+               File.Exists(Path.Combine(Core.Dir, "2026-01-04.csv")) + " " + File.Exists(Path.Combine(Core.Dir, "日報_2026-01-04.txt")), "True True False False");
+
+            // 開いていたウィンドウ: 開いた〜閉じた
+            Core.WriteText(Core.WindowsPath("2026-01-05"), "\"time\",\"event\",\"process\",\"title\"\r\n" +
+                "\"2026-01-05 09:00:00\",\"open\",\"EXCEL\",\"A.xlsx\"\r\n\"2026-01-05 09:05:00\",\"open\",\"WINWORD\",\"B.docx\"\r\n" +
+                "\"2026-01-05 09:08:00\",\"close\",\"WINWORD\",\"B.docx\"\r\n\"2026-01-05 11:00:00\",\"close\",\"EXCEL\",\"A.xlsx\"\r\n" +
+                "\"2026-01-05 16:00:00\",\"open\",\"EXCEL\",\"C.xlsx\"\r\n\"2026-01-05 17:00:00\",\"open\",\"EXCEL\",\"D.xlsx\"\r\n");
+            eq("開いていたウィンドウ", string.Join(" | ", Reporter.WindowSpans("2026-01-05").Select(x => x.Title + " " + x.Start.ToString("HH:mm") + "-" + x.End.ToString("HH:mm"))),
+               "A.xlsx 09:00-11:00 | B.docx 09:05-09:08 | C.xlsx 16:00-17:00");
+
             // 1日の帯: 記録 8:30〜17:59（10:00〜10:09 は無操作）、休憩 12:00〜13:00、離席 15:00〜15:40、17:00 に退勤
             Slot[] day = DayStatus.Build(MakeDay(), Settings.Get());
             Func<Slot, string> count = k => day.Count(x => x == k).ToString();
@@ -5570,6 +5781,7 @@ namespace WorkLog
         {
             try { Directory.CreateDirectory(Core.Dir); }
             catch (Exception ex) { MessageBox.Show("保存先を作れません: " + Core.Dir + "\n" + ex.Message, "作業ログ"); return 2; }
+            Core.MoveToFolders();
 
             // 画面なしの実行
             if (args.Length >= 1 && (args[0] == "--auto" || args[0] == "--report"))

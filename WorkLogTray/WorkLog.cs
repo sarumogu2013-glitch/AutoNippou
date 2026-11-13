@@ -47,7 +47,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.22.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.22.1";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -1968,8 +1968,44 @@ namespace WorkLog
 
         static string Header(string date, List<Row> active)
         {
-            return string.Format("日報 {0}（PC稼働 {1}〜{2}／操作時間 約{3}時間）", date,
-                active[0].Time.ToString("HH:mm"), active[active.Count - 1].Time.ToString("HH:mm"), (Minutes(active.Count) / 60.0).ToString("0.#"));
+            return string.Format("日報 {0}（PC稼働 {1}〜{2}／操作時間 約{3}時間{4}）", date,
+                active[0].Time.ToString("HH:mm"), active[active.Count - 1].Time.ToString("HH:mm"), (Minutes(active.Count) / 60.0).ToString("0.#"), OffPart(date));
+        }
+
+        // その日の最後の退勤の時刻（そのあと同じ日に出勤していれば出さない）。見出しに「／退勤 HH:mm」と入れる
+        public static string OffPart(string date)
+        {
+            string off = null;
+            foreach (KeyValuePair<DateTime, bool> h in Duty.History())
+                if (h.Key.ToString("yyyy-MM-dd") == date) off = h.Value ? h.Key.ToString("HH:mm") : null;
+            return off != null ? "／退勤 " + off : "";
+        }
+
+        static readonly Regex OffInHeader = new Regex("／退勤 \\d{1,2}:\\d{2}");
+
+        // 見出しの行の退勤の時刻だけを入れ直す（退勤したとき。AI は使わない）
+        public static string WithOff(string header, string date)
+        {
+            string h = OffInHeader.Replace(header, "");
+            string part = OffPart(date);
+            if (part.Length == 0) return h;
+            int i = h.LastIndexOf('）');
+            return i >= 0 ? h.Substring(0, i) + part + h.Substring(i) : h + "（" + part.TrimStart('／') + "）";
+        }
+
+        public static void UpdateOffInHeader(string date)
+        {
+            string path = Core.ReportPath(date);
+            lock (reportLock)
+            {
+                if (!File.Exists(path)) return;
+                List<string> lines = SplitLines(Core.ReadText(path));
+                if (lines.Count == 0 || !lines[0].StartsWith("日報")) return;
+                string h = WithOff(lines[0], date);
+                if (h == lines[0]) return;
+                lines[0] = h;
+                Core.WriteText(path, Number(string.Join("\n", lines).TrimEnd() + "\n"));
+            }
         }
 
         static string BreakRule(Settings s, string date)
@@ -2872,6 +2908,9 @@ namespace WorkLog
             offAt = at;
             Duty.Save(true, at);
             logger.CloseWindows(at);   // 退勤中は開いていても作業していない
+            try { Reporter.UpdateOffInHeader(at.ToString("yyyy-MM-dd")); }   // 日報の見出しに退勤の時刻
+            catch (Exception ex) { Core.Error("退勤の時刻", ex.Message); }
+            if (form != null && !form.IsDisposed) form.ReportUpdated(at.ToString("yyyy-MM-dd"));
             UpdateDuty();
             Balloon("退勤（" + at.ToString("HH:mm") + "）", manual ? "記録停止" : "記録停止（操作なし）", ToolTipIcon.Info, null);
             if (askForm != null && !askForm.IsDisposed && askForm.Visible) askForm.Hide();
@@ -5744,6 +5783,15 @@ namespace WorkLog
             Core.MoveToFolders();
             eq("フォルダへ移す", File.Exists(Core.CsvPath("2026-01-04")) + " " + File.Exists(Core.ReportPath("2026-01-04")) + " " +
                File.Exists(Path.Combine(Core.Dir, "2026-01-04.csv")) + " " + File.Exists(Path.Combine(Core.Dir, "日報_2026-01-04.txt")), "True True False False");
+
+            // 退勤の時刻: 見出しに入れる（同じ日にまた出勤したら外す）
+            File.WriteAllText(Path.Combine(Core.Dir, "勤務履歴.log"), "on\t2026-01-05 08:05:00\r\noff\t2026-01-05 17:42:00\r\n", new UTF8Encoding(false));
+            eq("退勤の時刻: 見出し", Reporter.WithOff("日報 2026-01-05（PC稼働 08:30〜17:40／操作時間 約7.5時間）", "2026-01-05"),
+               "日報 2026-01-05（PC稼働 08:30〜17:40／操作時間 約7.5時間／退勤 17:42）");
+            eq("退勤の時刻: 入れ直し", Reporter.WithOff("日報 2026-01-05（PC稼働 08:30〜17:40／操作時間 約7.5時間／退勤 16:00）", "2026-01-05"),
+               "日報 2026-01-05（PC稼働 08:30〜17:40／操作時間 約7.5時間／退勤 17:42）");
+            File.AppendAllText(Path.Combine(Core.Dir, "勤務履歴.log"), "on\t2026-01-05 18:00:00\r\n");
+            eq("退勤の時刻: また出勤したら外す", Reporter.WithOff("日報 2026-01-05（PC稼働 08:30〜17:40／退勤 17:42）", "2026-01-05"), "日報 2026-01-05（PC稼働 08:30〜17:40）");
 
             // 開いていたウィンドウ: 開いた〜閉じた
             Core.WriteText(Core.WindowsPath("2026-01-05"), "\"time\",\"event\",\"process\",\"title\"\r\n" +

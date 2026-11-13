@@ -1785,22 +1785,25 @@ namespace WorkLog
         {
             DateTime day = DateTime.ParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture);
             bool plan = s.PlanOn(day);
-            return ConnectProcesses(lines, FixedLines(date, s, extra), plan ? s.PlanFrom : (TimeSpan?)null, plan ? s.PlanTo : (TimeSpan?)null);
+            TimeSpan? off = OffTime(date);   // 退勤した日は、終わりを退勤の時刻にする
+            return ConnectProcesses(lines, FixedLines(date, s, extra), plan ? s.PlanFrom : (TimeSpan?)null, off ?? (plan ? s.PlanTo : (TimeSpan?)null));
         }
 
         // AI への指示（勤務予定の日だけ）
         static string PlanRule(string date, Settings s)
         {
             DateTime day = DateTime.ParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture);
-            return s.PlanOn(day)
+            TimeSpan? off = OffTime(date);
+            return (s.PlanOn(day)
                 ? "- 勤務予定は " + s.PlanText + "。この外の時刻は書かない。始業から最初の PC の作業まで・最後の作業から終業までに操作がない時間は「" + OutsideWork + "」の工程として書く\n"
-                : "";
+                : "") +
+                (off.HasValue ? "- 退勤は " + Hm(off.Value) + "。最後の工程の終わりは退勤の時刻にする（終業の時刻より優先）\n" : "");
         }
 
         // from・to（勤務予定）があれば、工程・軽作業の時刻をその中に収め、始業・終業までのすき間を埋める
         public static int ConnectProcesses(List<string> lines, ICollection<string> fixedLines, TimeSpan? from = null, TimeSpan? to = null)
         {
-            int clamped = from.HasValue && to.HasValue ? ClampLight(lines, from.Value, to.Value) : 0;
+            int clamped = from.HasValue || to.HasValue ? ClampLight(lines, from, to) : 0;
             int h = lines.FindIndex(l => l.Trim().StartsWith("■") && l.Contains("工程"));
             if (h < 0) return 0;
             int end = h + 1;
@@ -1816,9 +1819,9 @@ namespace WorkLog
                 else if (l.Length == 0) blanks++;
                 else if (l != "・なし") others.Add(l);
             }
-            if (from.HasValue && to.HasValue)
+            if (from.HasValue || to.HasValue)
             {
-                foreach (Proc x in items) { if (x.A < from.Value) x.A = from.Value; if (x.B > to.Value) x.B = to.Value; }
+                foreach (Proc x in items) { if (from.HasValue && x.A < from.Value) x.A = from.Value; if (to.HasValue && x.B > to.Value) x.B = to.Value; }
                 items = items.Where(x => x.B > x.A).ToList();
             }
             if (items.Count == 0)
@@ -1844,15 +1847,14 @@ namespace WorkLog
                 result.Add(next);
             }
             // 始業から最初の工程・最後の工程から終業まで: 短ければ工程を延ばし、GapLight 分以上なら「現場（外勤）」
-            if (from.HasValue && to.HasValue)
             {
                 Proc first = result[0], last = result[result.Count - 1];
-                if (first.A > from.Value)
+                if (from.HasValue && first.A > from.Value)
                 {
                     if (first.A - from.Value >= TimeSpan.FromMinutes(GapLight)) result.Insert(0, new Proc { A = from.Value, B = first.A, Rest = " " + OutsideWork });
                     else if (!first.Fixed) first.A = from.Value;
                 }
-                if (last.B < to.Value)
+                if (to.HasValue && last.B < to.Value)
                 {
                     if (to.Value - last.B >= TimeSpan.FromMinutes(GapLight)) result.Add(new Proc { A = last.B, B = to.Value, Rest = " " + OutsideWork });
                     else if (!last.Fixed) last.B = to.Value;
@@ -1866,7 +1868,7 @@ namespace WorkLog
         }
 
         // 軽作業の時刻を勤務予定の中に収める（直した数）
-        static int ClampLight(List<string> lines, TimeSpan from, TimeSpan to)
+        static int ClampLight(List<string> lines, TimeSpan? from, TimeSpan? to)
         {
             int n = 0;
             bool light = false;
@@ -1877,7 +1879,7 @@ namespace WorkLog
                 if (!light) continue;
                 Match m = LightRe.Match(l);
                 if (!m.Success) continue;
-                TimeSpan t = Clock(m.Groups[1].Value), c = t < from ? from : t > to ? to : t;
+                TimeSpan t = Clock(m.Groups[1].Value), c = from.HasValue && t < from.Value ? from.Value : to.HasValue && t > to.Value ? to.Value : t;
                 if (c == t) continue;
                 lines[i] = "・" + Hm(c) + l.Substring(m.Groups[1].Index + m.Groups[1].Length);
                 n++;
@@ -1975,10 +1977,17 @@ namespace WorkLog
         // その日の最後の退勤の時刻（そのあと同じ日に出勤していれば出さない）。見出しに「／退勤 HH:mm」と入れる
         public static string OffPart(string date)
         {
-            string off = null;
+            TimeSpan? off = OffTime(date);
+            return off.HasValue ? "／退勤 " + Hm(off.Value) : "";
+        }
+
+        // その日の最後の退勤の時刻（分まで。そのあと同じ日に出勤していれば null）
+        public static TimeSpan? OffTime(string date)
+        {
+            TimeSpan? off = null;
             foreach (KeyValuePair<DateTime, bool> h in Duty.History())
-                if (h.Key.ToString("yyyy-MM-dd") == date) off = h.Value ? h.Key.ToString("HH:mm") : null;
-            return off != null ? "／退勤 " + off : "";
+                if (h.Key.ToString("yyyy-MM-dd") == date) off = h.Value ? new TimeSpan(h.Key.Hour, h.Key.Minute, 0) : (TimeSpan?)null;
+            return off;
         }
 
         static readonly Regex OffInHeader = new Regex("／退勤 \\d{1,2}:\\d{2}");
@@ -1999,12 +2008,15 @@ namespace WorkLog
             lock (reportLock)
             {
                 if (!File.Exists(path)) return;
-                List<string> lines = SplitLines(Core.ReadText(path));
+                string before = Core.ReadText(path);
+                List<string> lines = SplitLines(before);
                 if (lines.Count == 0 || !lines[0].StartsWith("日報")) return;
-                string h = WithOff(lines[0], date);
-                if (h == lines[0]) return;
-                lines[0] = h;
-                Core.WriteText(path, Number(string.Join("\n", lines).TrimEnd() + "\n"));
+                lines[0] = WithOff(lines[0], date);
+                if (lines.Any(l => l.Trim().StartsWith("■"))) Tidy(lines, date, Settings.Get());   // 最後の工程の終わりを退勤の時刻に
+                string text = Number(string.Join("\n", lines).TrimEnd() + "\n");
+                if (Norm(text) == Norm(before)) return;
+                Backup(path);
+                Core.WriteText(path, text);
             }
         }
 
@@ -5790,6 +5802,9 @@ namespace WorkLog
                "日報 2026-01-05（PC稼働 08:30〜17:40／操作時間 約7.5時間／退勤 17:42）");
             eq("退勤の時刻: 入れ直し", Reporter.WithOff("日報 2026-01-05（PC稼働 08:30〜17:40／操作時間 約7.5時間／退勤 16:00）", "2026-01-05"),
                "日報 2026-01-05（PC稼働 08:30〜17:40／操作時間 約7.5時間／退勤 17:42）");
+            var offEnd = new List<string> { "■工程", "・09:00〜17:30 A" };
+            Reporter.ConnectProcesses(offEnd, new HashSet<string>(), new TimeSpan(8, 30, 0), Reporter.OffTime("2026-01-05"));
+            eq("退勤の時刻: 最後の工程の終わり", string.Join(" | ", offEnd), "■工程 | ・08:30〜09:00 現場（外勤） | ・09:00〜17:42 A");
             File.AppendAllText(Path.Combine(Core.Dir, "勤務履歴.log"), "on\t2026-01-05 18:00:00\r\n");
             eq("退勤の時刻: また出勤したら外す", Reporter.WithOff("日報 2026-01-05（PC稼働 08:30〜17:40／退勤 17:42）", "2026-01-05"), "日報 2026-01-05（PC稼働 08:30〜17:40）");
 

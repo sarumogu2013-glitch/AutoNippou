@@ -13,6 +13,7 @@
 //   --screenshot-about <png>  テスト中だけ: バージョン情報の画面を画像にして終わる
 //   --screenshot-settings <dir>  テスト中だけ: 設定画面の各タブを画像にして終わる
 //   --screenshot-timeline <png>  テスト中だけ: 日報画面の帯（テスト用の日）を画像にして終わる
+//   --manual-sample <dir>  テスト中だけ: マニュアルの見本（Word・PowerPoint）と文字認識の結果（ocr.txt）を作って終わる
 //   --selftest           テスト中だけ: 日報の書式を直す処理を確かめる（0=期待どおり 1=違う）
 //   --check-update [--apply]  テスト中（WORKLOG_TEST）だけ: 更新を確かめて落とす（--apply で入れ替えも）。0=最新 10=更新あり 2=失敗
 // 動作確認用の環境変数: WORKLOG_TEST=保存先フォルダ（二重起動防止を本番と分け、スタートアップ登録を無効にする）
@@ -47,7 +48,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.23.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.24.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -136,6 +137,12 @@ namespace WorkLog
         public string UserName = "";     // 要望を送るときの名前（日報画面の「要望」タブで入れる）
         public string LinkName = "";   // 日報リンクのボタン名（空なら「日報リンク」）。名前と開く先はリポジトリに置かないので既定は空
         public string LinkUrl = "";    // 日報リンクで開く URL かファイル（Excel の日報など）。空ならボタンを出さない
+        public bool ScreenRead = true;   // 前面のウィンドウの文字を PC の中で読む（画像は残さない・AI に見せない）
+        public bool ScreenAsked = false; // 画面の文字・ブーストを使うか、本人に聞いたか（聞くまでは撮らない）
+        public string ImageAiOk = "";    // 画像の AI 解析を本人が確かめて許可したときのアカウント・プラン・モデル（変わったらもう一度確かめる。空なら画像を送らない）
+        public bool BoostAuto = true;    // 新しいアプリを使い始めたら自動でブーストする（false は手で始めたときだけ）
+        public int BoostPerDay = 2, BoostMinutes = 15;   // 自動のブーストは1日にこの回数まで・1回の分数
+        public long UsageLimit5h = 88000, UsageLimitWeek = 800000;   // 使用量の目安に使う Pro の枠（Sonnet に換算したトークン。公開されていないので目安）
 
         public bool HasBreak { get { return BreakEnd > BreakStart; } }
         public string BreakText { get { return BreakStart.ToString(@"hh\:mm") + "〜" + BreakEnd.ToString(@"hh\:mm"); } }
@@ -172,6 +179,14 @@ namespace WorkLog
             add("要望を送るときの名前（日報画面の「要望」タブで入れる）", "UserName", UserName);
             add("日報リンクのボタン名（空なら「日報リンク」）", "LinkName", LinkName);
             add("日報リンクで開く URL かファイル（空ならボタンを出さない。{yyyy} {MM} {dd} は今日の年・月・日）", "LinkUrl", LinkUrl);
+            add("前面のウィンドウの文字を PC の中で読む（1=読む 0=読まない。画像は残さず AI にも見せない）", "ScreenRead", ScreenRead ? "1" : "0");
+            add("画面の文字・ブーストを使うか聞いた（1=聞いた。0 なら次の起動で聞く。聞くまでは撮らない）", "ScreenAsked", ScreenAsked ? "1" : "0");
+            add("画像の AI 解析を許可したアカウント・プラン・モデル（設定のタブ「画面」の「画像の AI 解析の確認」で入る。空なら画像を送らない）", "ImageAiOk", ImageAiOk);
+            add("新しいアプリを使い始めたら自動でブーストする（1=自動 0=手で始めたときだけ）", "BoostAuto", BoostAuto ? "1" : "0");
+            add("自動のブーストは1日にこの回数まで", "BoostPerDay", BoostPerDay.ToString());
+            add("ブースト1回の分数", "BoostMinutes", BoostMinutes.ToString());
+            add("使用量の目安に使う Pro の5時間の枠（Sonnet に換算したトークン）", "UsageLimit5h", UsageLimit5h.ToString());
+            add("使用量の目安に使う Pro の1週間の枠（Sonnet に換算したトークン）", "UsageLimitWeek", UsageLimitWeek.ToString());
             return b.ToString();
         }
 
@@ -197,6 +212,25 @@ namespace WorkLog
             Settings s;
             lock (cacheLock) s = Parse(File.Exists(FilePath) ? Core.ReadText(FilePath) : "");
             s.ClaudePath = path ?? "";
+            Save(s);
+        }
+
+        // 画面の文字・ブーストを使うかだけを書き換える（初めて聞いたとき）
+        public static void SetScreen(bool on)
+        {
+            Settings s;
+            lock (cacheLock) s = Parse(File.Exists(FilePath) ? Core.ReadText(FilePath) : "");
+            s.ScreenRead = on;
+            s.ScreenAsked = true;
+            Save(s);
+        }
+
+        // 画像の AI 解析の許可だけを書き換える（空で取り消し）
+        public static void SetImageAiOk(string key)
+        {
+            Settings s;
+            lock (cacheLock) s = Parse(File.Exists(FilePath) ? Core.ReadText(FilePath) : "");
+            s.ImageAiOk = key ?? "";
             Save(s);
         }
 
@@ -292,6 +326,14 @@ namespace WorkLog
                             s.LinkName = v;
                             break;
                         case "LinkUrl": if (v.Length > 0) s.LinkUrl = v; break;
+                        case "ScreenRead": s.ScreenRead = v == "1" || v.ToLower() == "true"; break;
+                        case "ImageAiOk": s.ImageAiOk = v; break;
+                        case "ScreenAsked": s.ScreenAsked = v == "1" || v.ToLower() == "true"; break;
+                        case "BoostAuto": s.BoostAuto = v == "1" || v.ToLower() == "true"; break;
+                        case "BoostPerDay": s.BoostPerDay = int.Parse(v); break;
+                        case "BoostMinutes": s.BoostMinutes = int.Parse(v); break;
+                        case "UsageLimit5h": s.UsageLimit5h = long.Parse(v); break;
+                        case "UsageLimitWeek": s.UsageLimitWeek = long.Parse(v); break;
                         case "Break":
                             if (v.Length == 0) s.BreakStart = s.BreakEnd = TimeSpan.Zero;
                             else { string[] b = v.Split('-'); s.BreakStart = TimeSpan.Parse(b[0].Trim()); s.BreakEnd = TimeSpan.Parse(b[1].Trim()); }
@@ -1096,12 +1138,53 @@ namespace WorkLog
 
             string args = "-p --safe-mode --tools \"\" --no-session-persistence --output-format json --model \"" + (model ?? s.Model) +
                           "\" --system-prompt \"" + SystemPrompt + "\"";
+            return Call(exe, auth, args, prompt, date, note, ParseJson);
+        }
+
+        // 画像も見せて聞く（ブースト・マニュアル作成）。items: 画像の前に付ける文と、画像（jpg）の場所。stream-json で1回にまとめて渡す
+        public static string AskImages(string prompt, List<KeyValuePair<string, string>> items, Settings s, string date, string note, string model)
+        {
+            string exe;
+            Auth auth;
+            string problem = Problem(s, out exe, out auth);
+            if (problem != null) { WriteLog(date, exe, auth, null, 0, "失敗" + note + ": " + problem); throw new NeedLoginException(problem); }
+            var content = new List<object> { new Dictionary<string, object> { { "type", "text" }, { "text", prompt } } };
+            foreach (KeyValuePair<string, string> it in items)
+            {
+                content.Add(new Dictionary<string, object> { { "type", "text" }, { "text", it.Key } });
+                content.Add(new Dictionary<string, object> { { "type", "image" }, { "source", new Dictionary<string, object> {
+                    { "type", "base64" }, { "media_type", "image/jpeg" }, { "data", Convert.ToBase64String(File.ReadAllBytes(it.Value)) } } } });
+            }
+            var msg = new Dictionary<string, object> { { "type", "user" }, { "message", new Dictionary<string, object> { { "role", "user" }, { "content", content } } } };
+            string stdin = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Serialize(msg) + "\n";
+            string args = "-p --safe-mode --tools \"\" --no-session-persistence --input-format stream-json --output-format stream-json --verbose --model \"" + (model ?? s.Model) +
+                          "\" --system-prompt \"" + SystemPrompt + "\"";
+            return Call(exe, auth, args, stdin, date, note, ParseResultLine);
+        }
+
+        // stream-json の出力から、最後の結果の行（"type":"result"）を読む
+        public static Dictionary<string, object> ParseResultLine(string text)
+        {
+            var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+            foreach (string line in text.Split('\n').Reverse())
+            {
+                string l = line.Trim();
+                if (!l.StartsWith("{") || l.IndexOf("\"result\"", StringComparison.Ordinal) < 0) continue;
+                Dictionary<string, object> j;
+                try { j = ser.Deserialize<Dictionary<string, object>>(l); } catch { continue; }
+                if (Str(j, "type") == "result") return j;
+            }
+            throw new Exception(text.Length > 200 ? text.Substring(text.Length - 200) : text);
+        }
+
+        static string Call(string exe, Auth auth, string args, string stdin, string date, string note, Func<string, Dictionary<string, object>> parse)
+        {
             Exception last = null;
             for (int i = 1; i <= 2; i++)
             {
                 try
                 {
-                    Dictionary<string, object> j = ParseJson(RunExe(exe, args, prompt, 300000));
+                    Dictionary<string, object> j = parse(RunExe(exe, args, stdin, 300000));
                     string text = Str(j, "result").Trim();
                     var models = new List<string>();
                     long tokens = 0;
@@ -1348,7 +1431,10 @@ namespace WorkLog
                 return string.Format("{0}-{1} [{2}] {3}", x.Start.ToString("HH:mm"), x.End.ToString("HH:mm"), p[0], p[1]);
             }));
             string wins = active.Count > 0 ? WindowText(active[0].Time.ToString("yyyy-MM-dd"), s, map, tasks, since) : "";
-            return "合計時間:\n" + summary + "\n\n時刻順:\n" + timeline + wins;
+            string screen = "";
+            try { if (active.Count > 0) screen = Shots.Prompt(active[0].Time.ToString("yyyy-MM-dd"), s, active.Select(a => a.Proc).Distinct(), since); }
+            catch (Exception ex) { Core.Error("画面の語", ex.Message); }
+            return "合計時間:\n" + summary + "\n\n時刻順:\n" + timeline + wins + screen;
         }
 
         // 作業の行（「・」で始まる行。「・なし」は除く）に通し番号 [1] [2] … を付け直す。「3番を直して」と指示できるように
@@ -2635,6 +2721,11 @@ namespace WorkLog
         readonly Icon icon = MakeIcon(Color.FromArgb(30, 111, 217)), offIcon = MakeIcon(Color.FromArgb(150, 150, 150));
         readonly SynchronizationContext ui;
         readonly System.Windows.Forms.Timer afkTimer = new System.Windows.Forms.Timer();
+        readonly System.Windows.Forms.Timer shotTimer = new System.Windows.Forms.Timer();   // 画面の文字・ブースト・マニュアル作成（1秒ごと）
+        ToolStripMenuItem boostItem, manualItem, screenItem;
+        RecIndicator indicator;
+        int shotState = -1;
+        readonly Dictionary<string, Icon> icons = new Dictionary<string, Icon>();
         DateTime lastAuto = DateTime.MinValue;
         DateTime lastInput;
         MainForm form;
@@ -2660,6 +2751,12 @@ namespace WorkLog
             ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
             menu.Items.Add("日報を開く", null, (o, e) => ShowForm(null));
             menu.Items.Add("今日の日報を今すぐ作る", null, (o, e) => Generate(DateTime.Today.ToString("yyyy-MM-dd")));
+            screenItem = new ToolStripMenuItem("画面を撮る（文字を読む）", null, (o, e) => ToggleScreen());
+            menu.Items.Add(screenItem);
+            boostItem = new ToolStripMenuItem("ブースト開始", null, (o, e) => ToggleBoost());
+            menu.Items.Add(boostItem);
+            manualItem = new ToolStripMenuItem("マニュアル作成を始める", null, (o, e) => ToggleManual()) { Visible = false };   // Shift を押しながら開いたときだけ出す
+            menu.Items.Add(manualItem);
             menu.Items.Add(new ToolStripSeparator());
             dutyItem = new ToolStripMenuItem("退勤", null, (o, e) => ToggleDuty());
             menu.Items.Add(dutyItem);
@@ -2669,7 +2766,15 @@ namespace WorkLog
             menu.Items.Add("更新を確認", null, (o, e) => CheckUpdate(true));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("終了", null, (o, e) => Quit());
-            menu.Opening += (o, e) => { try { startupItem.Checked = StartupPath() != null; } catch { } };
+            menu.Opening += (o, e) =>
+            {
+                try { startupItem.Checked = StartupPath() != null; } catch { }
+                boostItem.Text = Shots.Boosting ? "ブースト停止（" + Shots.BoostUntil.ToString("HH:mm") + " まで）" : "ブースト開始（" + Settings.Get().BoostMinutes + "分）";
+                boostItem.Enabled = !Shots.ManualOn;
+                screenItem.Checked = Settings.Get().ScreenRead && Settings.Get().ScreenAsked;
+                manualItem.Visible = Shots.ManualOn || (Control.ModifierKeys & Keys.Shift) != 0;
+                manualItem.Text = Shots.ManualOn ? "マニュアル作成を終える…" : "マニュアル作成を始める";
+            };
 
             tray.Icon = icon;
             tray.Text = "作業ログ";
@@ -2688,10 +2793,16 @@ namespace WorkLog
             afkTimer.Interval = 5000;
             afkTimer.Tick += (o, e) => CheckAfk();
             afkTimer.Start();
+            Shots.Notify = (title, text) => ui.Post(_ => Balloon(title, text, ToolTipIcon.Info, null), null);
+            Shots.NeedImageConfirm = () => ui.Post(_ => Balloon("ブーストの前に確認がいります", "画像の AI 解析の確認（ここをクリック）", ToolTipIcon.Info, () => ConfirmImageAi()), null);
+            shotTimer.Interval = 1000;
+            shotTimer.Tick += (o, e) => { Shots.Tick(!off && Logger.IdleSec() < 60); UpdateShotUi(false); };
+            if (!Core.Test) shotTimer.Start();
             if (show) ShowForm(null);
             if (updated) Balloon(Core.Version + " に更新", "更新履歴: ヘルプ → バージョン情報", ToolTipIcon.Info, () => ShowForm(null));
             if (firstRun && !Core.Test) { AskStartup(); FirstAiSetup(); }
             else CheckAi();
+            if (!Core.Test && !Settings.Get().ScreenAsked) AskScreen();
         }
 
         // 初めての起動: Claude Code が見つからなければ「詳しく探す」も行い、見つけたものを使う。そのあと AI の接続を確かめる
@@ -2718,6 +2829,23 @@ namespace WorkLog
             });
             t.IsBackground = true;
             t.Start();
+        }
+
+        // 画面の文字・ブーストを使うか、1回だけ聞く（0.24.0。聞くまでは撮らない。あとから設定のタブ「画面」で変えられる）
+        void AskScreen()
+        {
+            try
+            {
+                Settings s = Settings.Get();
+                string msg = "画面の文字を読む機能を使いますか？\n\n" +
+                    "・前面のウィンドウを撮って、PC の中で文字を読みます（画像はすぐ消します）。読んだ語は日報を作るときに AI に渡します。\n" +
+                    (s.BoostAuto ? "・初めて使うアプリでは、自動で「ブースト」します（" + s.BoostMinutes + "分・1日" + s.BoostPerDay + "回まで）。ブーストでは画面の画像を AI（Claude）に送ります。" +
+                        "画像を送るのは「画像の AI 解析の確認」で AI の設定を確かめて許可したあとだけです。\n" : "") +
+                    "\n撮っているあいだは、トレイのアイコンに印が付きます。トレイのメニュー「画面を撮る」や設定のタブ「画面」で、いつでも切り替えられます。";
+                bool on = MessageBox.Show(msg, "作業ログ", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes;
+                Settings.SetScreen(on);
+            }
+            catch (Exception ex) { Core.Error("画面の確認", ex.Message); }
         }
 
         // 初めての起動: スタートアップに登録するか聞く（あとからトレイのメニューか設定のタブ「起動」で変えられる）
@@ -2986,8 +3114,10 @@ namespace WorkLog
         void UpdateDuty()
         {
             dutyItem.Text = off ? "出勤する（記録と AI を始める）" : "退勤する（日報を仕上げて待機）";
-            tray.Icon = off ? offIcon : icon;
-            string st = "作業ログ " + RecordStatus();
+            int ss = Shots.State(Settings.Get());
+            if (off && ss == 1) ss = 0;
+            tray.Icon = ss == 0 ? (off ? offIcon : icon) : IconFor(ss);
+            string st = "作業ログ " + RecordStatus() + (ss == 1 ? "・画面: オン" : ss == 2 ? "・ブースト中" : ss == 3 ? "・マニュアル作成中" : "");
             tray.Text = st.Length > 63 ? st.Substring(0, 63) : st;
             if (form != null && !form.IsDisposed) { form.SetDuty(off); form.SetRecordStatus(RecordStatus()); }
         }
@@ -3168,6 +3298,126 @@ namespace WorkLog
             else if (form != null && !form.IsDisposed) form.RefreshList(open);
         }
 
+        void ToggleBoost()
+        {
+            if (Shots.Boosting) { Shots.StopBoost(); UpdateShotUi(true); return; }
+            if (Settings.Get().ImageAiOk.Length == 0 && !ConfirmImageAi()) return;
+            Shots.StartBoost(false, Settings.Get());
+            UpdateShotUi(true);
+        }
+
+        // 画面を撮る（文字を読む）のオン・オフ
+        void ToggleScreen()
+        {
+            Settings s = Settings.Get();
+            bool on = !(s.ScreenRead && s.ScreenAsked);
+            Settings.SetScreen(on);
+            if (!on) Shots.StopBoost();
+            UpdateShotUi(true);
+            Balloon(on ? "画面を撮る: オン" : "画面を撮る: オフ", on ? "前面のウィンドウの文字を PC の中で読みます" : "画面は撮りません（マニュアル作成は別）", ToolTipIcon.Info, null);
+        }
+
+        // 画像の AI 解析の確認の画面（許可したら true）
+        public bool ConfirmImageAi()
+        {
+            using (var f = new ImageAiForm(icon)) return f.ShowDialog() == DialogResult.OK;
+        }
+
+        // トレイのアイコンの印（緑=画面の文字・橙=ブースト中・赤=マニュアル作成中）と、記録中の表示
+        void UpdateShotUi(bool force)
+        {
+            int st = Shots.State(Settings.Get());
+            if (off && st == 1) st = 0;
+            string label = st == 2 ? "● 画面を記録中（ブースト " + Shots.BoostUntil.ToString("HH:mm") + " まで）" : st == 3 ? "● 画面を記録中（マニュアル作成）" : null;
+            if (label != null)
+            {
+                if (indicator == null || indicator.IsDisposed)
+                    indicator = new RecIndicator(() => { if (Shots.ManualOn) ToggleManual(); else if (Shots.Boosting) ToggleBoost(); });
+                indicator.SetText(label);
+                if (!indicator.Visible) indicator.Show();
+            }
+            else if (indicator != null && !indicator.IsDisposed && indicator.Visible) indicator.Hide();
+            if (st == shotState && !force) return;
+            shotState = st;
+            UpdateDuty();
+        }
+
+        Icon IconFor(int state)
+        {
+            string k = (off ? "off" : "on") + state;
+            Icon ic;
+            if (icons.TryGetValue(k, out ic)) return ic;
+            Color back = off ? Color.FromArgb(150, 150, 150) : Color.FromArgb(30, 111, 217);
+            Color? dot = state == 1 ? Color.FromArgb(40, 180, 70) : state == 2 ? Color.FromArgb(245, 150, 20) : state == 3 ? Color.FromArgb(220, 40, 40) : (Color?)null;
+            using (Bitmap bmp = Logo(32, back))
+            {
+                if (dot.HasValue)
+                    using (Graphics g = Graphics.FromImage(bmp))
+                    using (var br = new SolidBrush(dot.Value))
+                    {
+                        g.SmoothingMode = SmoothingMode.AntiAlias;
+                        g.FillEllipse(Brushes.White, 17, 17, 15, 15);
+                        g.FillEllipse(br, 19, 19, 11, 11);
+                    }
+                ic = Icon.FromHandle(bmp.GetHicon());
+            }
+            icons[k] = ic;
+            return ic;
+        }
+
+        // マニュアル作成: 始める → ウィンドウを切り替えるたびに撮る → 終える → 手順書（Word か PowerPoint）を作る
+        void ToggleManual()
+        {
+            if (!Shots.ManualOn)
+            {
+                if (MessageBox.Show("ウィンドウを切り替えるたびに画面を撮ります（終えるまで右下に「● 画面を記録中」が出ます）。始めますか？", "マニュアル作成",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                Shots.StartManual();
+                UpdateShotUi(true);
+                Balloon("マニュアル作成中", "ウィンドウを切り替えるたびに撮影", ToolTipIcon.Info, null);
+                return;
+            }
+            int count;
+            string dir = Shots.StopManual(out count);
+            UpdateShotUi(true);
+            if (dir == null) { Balloon("マニュアル作成", "撮った画面がありません", ToolTipIcon.Info, null); return; }
+            string title;
+            bool slides;
+            using (var f = new ManualForm(icon, count))
+            {
+                if (f.ShowDialog() != DialogResult.OK)
+                {
+                    Balloon("マニュアル作成", "画像だけ残しました", ToolTipIcon.Info, () => OpenPath(Path.GetDirectoryName(dir)));
+                    return;
+                }
+                title = f.TitleText;
+                slides = f.Slides;
+            }
+            if (Settings.Get().ImageAiOk.Length == 0 && !ConfirmImageAi())
+                Balloon("マニュアル作成", "画像を AI に送らずに作ります（ウィンドウの名前だけ）", ToolTipIcon.Info, null);
+            else Balloon("マニュアル作成", "作成中（" + count + "枚）", ToolTipIcon.Info, null);
+            Settings s = Settings.Get();
+            var t = new Thread(() =>
+            {
+                string path = null, note = "", err = null;
+                try { path = Manual.Build(dir, title, slides, s, out note); }
+                catch (Exception ex) { err = ex.Message; Core.Error("マニュアル作成", ex.ToString()); }
+                ui.Post(_ =>
+                {
+                    if (err != null) Balloon("マニュアルを作れませんでした", err, ToolTipIcon.Warning, () => OpenPath(Path.GetDirectoryName(dir)));
+                    else Balloon("マニュアルができました", Path.GetFileName(path) + (note.Length > 0 ? "\n" + note : ""), ToolTipIcon.Info, () => OpenPath(path));
+                }, null);
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        static void OpenPath(string path)
+        {
+            try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); }
+            catch (Exception ex) { Core.Error("開く", ex.Message); }
+        }
+
         void Balloon(string title, string text, ToolTipIcon kind, Action click)
         {
             balloonClick = click;
@@ -3218,6 +3468,8 @@ namespace WorkLog
             if (settingsForm != null && !settingsForm.IsDisposed) settingsForm.Dispose();
             if (askForm != null && !askForm.IsDisposed) askForm.Dispose();
             afkTimer.Stop();
+            shotTimer.Stop();
+            if (indicator != null && !indicator.IsDisposed) indicator.Dispose();
             timer.Stop();
             tray.Visible = false;
             tray.Dispose();
@@ -5281,6 +5533,51 @@ namespace WorkLog
 
     // 設定画面: settings.ini のすべての項目と、Windows 起動時の自動起動
     // バージョン情報: 名前と版だけを真ん中に出す。変わったところは GitHub のリリース（CHANGELOG.md）で見る
+    // マニュアル作成を終えたとき: 題と、Word か PowerPoint かを選ぶ
+    class ManualForm : Form
+    {
+        readonly TextBox title = new TextBox { Width = 320, Text = "手順書" };
+        readonly RadioButton doc = new RadioButton { Text = "ドキュメント（Word）", AutoSize = true, Checked = true };
+        readonly RadioButton ppt = new RadioButton { Text = "スライド（PowerPoint）", AutoSize = true };
+        public string TitleText { get { return title.Text.Trim().Length > 0 ? title.Text.Trim() : "手順書"; } }
+        public bool Slides { get { return ppt.Checked; } }
+
+        public ManualForm(Icon icon, int count)
+        {
+            Text = "マニュアル作成";
+            Icon = icon;
+            AutoScaleDimensions = new SizeF(96f, 96f);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            Font = new Font("Meiryo UI", 10f);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterScreen;
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            TopMost = true;
+            var t = new TableLayoutPanel { AutoSize = true, ColumnCount = 2, Padding = new Padding(12), Dock = DockStyle.Fill };
+            t.Controls.Add(new Label { Text = "撮った画面", AutoSize = true, Margin = new Padding(3, 6, 8, 3) }, 0, 0);
+            t.Controls.Add(new Label { Text = count + " 枚", AutoSize = true, Margin = new Padding(3, 6, 3, 3) }, 1, 0);
+            t.Controls.Add(new Label { Text = "題", AutoSize = true, Margin = new Padding(3, 6, 8, 3) }, 0, 1);
+            t.Controls.Add(title, 1, 1);
+            t.Controls.Add(new Label { Text = "形式", AutoSize = true, Margin = new Padding(3, 6, 8, 3) }, 0, 2);
+            var kinds = new FlowLayoutPanel { AutoSize = true, WrapContents = false };
+            kinds.Controls.Add(doc);
+            kinds.Controls.Add(ppt);
+            t.Controls.Add(kinds, 1, 2);
+            var bar = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, Margin = new Padding(0, 10, 0, 0) };
+            var cancel = new Button { Text = "作らない", AutoSize = true, DialogResult = DialogResult.Cancel };
+            var ok = new Button { Text = "作成", AutoSize = true, DialogResult = DialogResult.OK };
+            bar.Controls.Add(cancel);
+            bar.Controls.Add(ok);
+            t.Controls.Add(bar, 0, 3);
+            t.SetColumnSpan(bar, 2);
+            Controls.Add(t);
+            AcceptButton = ok;
+            CancelButton = cancel;
+        }
+    }
+
     class AboutForm : Form
     {
         public AboutForm(Icon icon)
@@ -5346,6 +5643,9 @@ namespace WorkLog
         readonly DataGridView mask = new DataGridView();
         readonly ComboBox model = new ComboBox { Width = 260 }, fixModel = new ComboBox { Width = 260 };
         readonly TextBox claudePath = new TextBox { Width = 360 };
+        readonly CheckBox screenRead = new CheckBox { Text = "前面のウィンドウの文字を読む（PC の中だけ）", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
+        readonly CheckBox boostAuto = new CheckBox { Text = "新しいアプリを使い始めたら自動でブーストする", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
+        readonly NumericUpDown boostPerDay = Num(0, 20), boostMinutes = Num(1, 120);
         readonly TextBox linkName = new TextBox { Width = 200 }, linkUrl = new TextBox { Dock = DockStyle.Fill, MinimumSize = new Size(300, 0) };
 
         public SettingsForm(Icon icon, Action saved, Action showAi)
@@ -5414,6 +5714,29 @@ namespace WorkLog
             var ai = new Button { Text = "AIの接続先を確かめる…", AutoSize = true, Margin = new Padding(3, 12, 3, 3) };
             ai.Click += (o, e) => showAi();
             Add(t, Auto(), ai);
+
+            t = Page(tabs, "画面", 3);
+            Add(t, Auto(), screenRead);
+            Add(t, Auto(), boostAuto);
+            Add(t, Auto(), L("自動のブースト"), boostPerDay, L("回まで（1日）"));
+            Add(t, Auto(), L("ブースト1回"), boostMinutes, L("分"));
+            var know = new Button { Text = "知識.md を開く", AutoSize = true, Margin = new Padding(3, 16, 3, 3) };
+            know.Click += (o, e) =>
+            {
+                try
+                {
+                    if (!File.Exists(Shots.KnowPath)) Core.WriteText(Shots.KnowPath, "# 知識（ブーストで画面を見て作った手がかり。1行に1つ「- [アプリ] 手がかり → 作業」。手で直したり消したりしてよい）\r\n\r\n");
+                    Process.Start("notepad.exe", "\"" + Shots.KnowPath + "\"");
+                }
+                catch (Exception ex) { Fail("開けませんでした: " + ex.Message); }
+            };
+            var imgAi = new Button { Text = "画像の AI 解析の確認…", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
+            imgAi.Click += (o, e) => { using (var f = new ImageAiForm(Icon)) f.ShowDialog(this); };
+            var row = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
+            row.Controls.Add(know);
+            row.Controls.Add(imgAi);
+            Add(t, Auto(), row);
+            screenRead.CheckedChanged += (o, e) => boostAuto.Enabled = boostPerDay.Enabled = screenRead.Checked;
 
             t = Page(tabs, "起動", 1);
             Add(t, Auto(), startup);
@@ -5540,6 +5863,11 @@ namespace WorkLog
             linkUrl.Text = s.LinkUrl;
             startup.Checked = TrayApp.StartupPath() != null;
             autoUpdate.Checked = s.AutoUpdate;
+            screenRead.Checked = s.ScreenRead;
+            boostAuto.Checked = s.BoostAuto;
+            SetNum(boostPerDay, s.BoostPerDay);
+            SetNum(boostMinutes, s.BoostMinutes);
+            boostAuto.Enabled = boostPerDay.Enabled = s.ScreenRead;
         }
 
         static List<string> Split(TextBox box)
@@ -5605,6 +5933,10 @@ namespace WorkLog
                 OffIdleMinutes = (int)offIdle.Value,
                 AutoUpdate = autoUpdate.Checked,
                 UserName = Settings.Get().UserName,
+                ScreenRead = screenRead.Checked, BoostAuto = boostAuto.Checked, ScreenAsked = true,
+                BoostPerDay = (int)boostPerDay.Value, BoostMinutes = (int)boostMinutes.Value,
+                UsageLimit5h = Settings.Get().UsageLimit5h, UsageLimitWeek = Settings.Get().UsageLimitWeek,
+                ImageAiOk = Settings.Get().ImageAiOk,
                 BreakStart = breakOn.Checked ? breakStart.Value.TimeOfDay - TimeSpan.FromSeconds(breakStart.Value.Second) : TimeSpan.Zero,
                 BreakEnd = breakOn.Checked ? breakEnd.Value.TimeOfDay - TimeSpan.FromSeconds(breakEnd.Value.Second) : TimeSpan.Zero
             };
@@ -5646,6 +5978,7 @@ namespace WorkLog
     {
         readonly TextBox info = new TextBox();
         readonly ListView history = new ListView();
+        readonly ListView usage = new ListView();
         readonly Button recheck;
         Button deep;
         readonly Action ready;
@@ -5658,8 +5991,8 @@ namespace WorkLog
             AutoScaleDimensions = new SizeF(96f, 96f);
             AutoScaleMode = AutoScaleMode.Dpi;
             Font = new Font("Meiryo UI", 10f);
-            ClientSize = new Size(900, 580);
-            MinimumSize = new Size(640, 420);
+            ClientSize = new Size(900, 700);
+            MinimumSize = new Size(640, 520);
             StartPosition = FormStartPosition.CenterScreen;
 
             info.Multiline = true;
@@ -5670,6 +6003,15 @@ namespace WorkLog
             info.Height = 250;
 
             var label = new Label { Text = "■ 最近の呼び出し", Dock = DockStyle.Top, Height = 28, TextAlign = ContentAlignment.BottomLeft };
+            var usageLabel = new Label { Text = "■ 使用量の目安（Claude Pro の枠に対して）", Dock = DockStyle.Top, Height = 28, TextAlign = ContentAlignment.BottomLeft };
+            usage.View = View.Details;
+            usage.FullRowSelect = true;
+            usage.Dock = DockStyle.Top;
+            usage.Height = 140;
+            usage.Columns.Add("No", 50, HorizontalAlignment.Right);
+            foreach (string[] c in new[] { new[] { "種類", "130" }, new[] { "直近5時間（トークン）", "170" }, new[] { "5時間の枠", "100" }, new[] { "直近7日（トークン）", "170" }, new[] { "1週間の枠", "100" } })
+                usage.Columns.Add(c[0], int.Parse(c[1]), c[0] == "種類" ? HorizontalAlignment.Left : HorizontalAlignment.Right);
+            ListSorter.Enable(usage);
 
             history.View = View.Details;
             history.FullRowSelect = true;
@@ -5696,6 +6038,8 @@ namespace WorkLog
             // Dock は後から追加したものが外側になる
             Controls.Add(history);
             Controls.Add(label);
+            Controls.Add(usage);
+            Controls.Add(usageLabel);
             Controls.Add(info);
             Controls.Add(bar);
 
@@ -5827,6 +6171,1233 @@ namespace WorkLog
             }
             history.ShowItemToolTips = true;
             history.EndUpdate();
+
+            Settings s = Settings.Get();
+            usage.BeginUpdate();
+            usage.Items.Clear();
+            foreach (Usage.Row r in Usage.Sum(ClaudeCli.RecentLog(5000), DateTime.Now))
+                usage.Items.Add(new ListViewItem(new[] { (usage.Items.Count + 1).ToString(), r.Kind, r.Tokens5h.ToString("N0"), Pct(r.Eq5h, s.UsageLimit5h), r.TokensWeek.ToString("N0"), Pct(r.EqWeek, s.UsageLimitWeek) }));
+            usage.EndUpdate();
+        }
+
+        static string Pct(double eq, long limit) { return limit <= 0 ? "—" : (eq * 100 / limit).ToString("0.0") + "%"; }
+    }
+
+    // ---- 画面の文字・ブースト・マニュアル作成（0.24.0）----
+    // ふだん（簡易モード）: 前面のウィンドウを撮って PC の中で文字を読み（Windows の文字認識。AI は使わない）、画像はすぐ消す。読んだ語だけを 画面\文字_日付.csv に残す
+    // ブースト: 短いあいだ画像を残し、終わったら AI に画像を見せて「文字だけで作業を見分ける手がかり」を 知識.md に書かせる
+    // マニュアル作成（トレイのメニューを Shift を押しながら開くと出る）: ウィンドウを切り替えるたびに撮り、終えたら手順書（Word か PowerPoint）を作る
+    static class Shots
+    {
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+        [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+        [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
+
+        // 簡易モードの決まり
+        public const int StableSec = 20;          // 同じウィンドウがこの秒数続いてから撮る（行き来しているあいだは撮らない）
+        public const int PerWindowMin = 10;       // 同じウィンドウは、この分数に1回まで
+        public const int HourMax = 12, DayMax = 80;
+        // ブーストの決まり
+        public const int BoostStableSec = 5, BoostPerWindowSec = 120, BoostMax = 20, BoostWidth = 1280;
+        // マニュアル作成の決まり
+        public const double ManualStableSec = 1.5;
+        public const int ManualMax = 150, ManualAiMax = 60, ManualAiWidth = 1024;
+
+        public static string RootDir { get { string d = Path.Combine(Core.Dir, "画面"); Directory.CreateDirectory(d); return d; } }
+        public static string TextPath(string date) { return Path.Combine(RootDir, "文字_" + date + ".csv"); }
+        public static string KnowPath { get { return Path.Combine(Core.Dir, "知識.md"); } }
+        static string SeenPath { get { return Path.Combine(RootDir, "ブースト済みのアプリ.txt"); } }
+        static string CountPath { get { return Path.Combine(RootDir, "ブースト回数.txt"); } }
+        public static string ManualRoot { get { string d = Path.Combine(Core.Dir, "マニュアル"); Directory.CreateDirectory(d); return d; } }
+
+        public static Action<string, string> Notify;   // 吹き出しで知らせる（トレイが入れる）
+        public static Action NeedImageConfirm;          // 自動のブーストの前に、画像の AI 解析の確認がいる（トレイが入れる）
+        static bool askedConfirm;
+
+        // 今の状態（トレイのアイコンの印・記録中の表示に使う）: 0=撮らない 1=画面の文字 2=ブースト中 3=マニュアル作成中
+        public static int State(Settings s)
+        {
+            if (ManualOn) return 3;
+            if (Boosting) return 2;
+            return s.ScreenRead && s.ScreenAsked ? 1 : 0;
+        }
+
+        // 前面のウィンドウ
+        static string curKey, curProc, curTitle;
+        static IntPtr curHwnd;
+        static DateTime curSince;
+        static readonly Dictionary<uint, string> procNames = new Dictionary<uint, string>();
+        static readonly uint SelfPid = (uint)Process.GetCurrentProcess().Id;
+
+        // 簡易モード
+        static readonly Dictionary<string, DateTime> lastShot = new Dictionary<string, DateTime>();
+        static readonly Dictionary<string, byte[]> lastThumb = new Dictionary<string, byte[]>();
+        static readonly Dictionary<string, HashSet<string>> seenWords = new Dictionary<string, HashSet<string>>();
+        static readonly List<DateTime> shotTimes = new List<DateTime>();
+        static string seenDate;
+
+        // ブースト
+        public static DateTime BoostUntil = DateTime.MinValue;
+        static string boostDir;
+        static int boostCount;
+        static bool boostAuto;
+        static readonly Dictionary<string, DateTime> boostLast = new Dictionary<string, DateTime>();
+        public static bool Boosting { get { return boostDir != null; } }
+
+        // マニュアル作成
+        public static bool ManualOn { get { return manualDir != null; } }
+        static string manualDir, manualLastKey;
+        static int manualCount;
+        static byte[] manualLastThumb;
+
+        // 撮った画像の後の処理（文字認識・保存）は1本のスレッドで順に行う
+        static readonly Queue<Action> work = new Queue<Action>();
+        static Thread worker;
+
+        static void Enqueue(Action a)
+        {
+            lock (work)
+            {
+                if (work.Count > 30) return;   // 詰まっているときは捨てる
+                work.Enqueue(a);
+                Monitor.Pulse(work);
+                if (worker != null) return;
+                worker = new Thread(() =>
+                {
+                    while (true)
+                    {
+                        Action next;
+                        lock (work)
+                        {
+                            while (work.Count == 0) Monitor.Wait(work);
+                            next = work.Dequeue();
+                        }
+                        try { next(); } catch (Exception ex) { Core.Error("画面", ex.Message); }
+                    }
+                });
+                worker.IsBackground = true;
+                worker.Start();
+            }
+        }
+
+        static string ProcName(uint pid)
+        {
+            string name;
+            if (procNames.TryGetValue(pid, out name)) return name;
+            try { using (var p = Process.GetProcessById((int)pid)) name = p.ProcessName; } catch { name = ""; }
+            if (procNames.Count > 500) procNames.Clear();
+            procNames[pid] = name;
+            return name;
+        }
+
+        // 1秒ごとに呼ぶ（トレイ）。working: 出勤中で、いま操作している
+        public static void Tick(bool working)
+        {
+            try
+            {
+                Settings s = Settings.Get();
+                DateTime now = DateTime.Now;
+                if (Boosting && now >= BoostUntil) FinishBoost(s);
+                IntPtr h = GetForegroundWindow();
+                var sb = new StringBuilder(512);
+                GetWindowText(h, sb, 512);
+                uint pid;
+                GetWindowThreadProcessId(h, out pid);
+                string proc = ProcName(pid), title = sb.ToString().Replace('\r', ' ').Replace('\n', ' ').Replace('"', ' ').Replace('\t', ' ').Trim();
+                if (proc.Length == 0 || title.Length == 0 || proc.Equals("WorkLog", StringComparison.OrdinalIgnoreCase) || pid == SelfPid) { curKey = null; return; }
+                string key = proc + "\t" + title;
+                if (key != curKey) { curKey = key; curProc = proc; curTitle = title; curHwnd = h; curSince = now; }
+                double stable = (now - curSince).TotalSeconds;
+
+                // マニュアル作成は、出勤・退勤や除外の設定にかかわらず、切り替えるたびに撮る
+                if (ManualOn)
+                {
+                    if (key != manualLastKey && stable >= ManualStableSec) ManualShot(key);
+                    return;
+                }
+                if (!working || s.ExcludeProc.Contains(proc) || s.MaskProc.ContainsKey(proc)) return;
+
+                if (Boosting)
+                {
+                    DateTime bl;
+                    if (stable >= BoostStableSec && boostCount < BoostMax && (!boostLast.TryGetValue(key, out bl) || now - bl >= TimeSpan.FromSeconds(BoostPerWindowSec)))
+                    {
+                        boostLast[key] = now;
+                        BoostShot();
+                    }
+                    return;
+                }
+                if (!s.ScreenRead || !s.ScreenAsked) return;
+                if (s.BoostAuto && stable >= StableSec && !SeenApp(proc) && BoostsToday() < s.BoostPerDay && s.ImageAiOk.Length == 0)
+                {
+                    if (!askedConfirm && NeedImageConfirm != null) { askedConfirm = true; NeedImageConfirm(); }   // 確かめるまでは自動でブーストしない
+                }
+                else if (s.BoostAuto && stable >= StableSec && !SeenApp(proc) && BoostsToday() < s.BoostPerDay)
+                {
+                    AddSeenApp(proc);
+                    StartBoost(true, s);
+                    return;
+                }
+                DateTime last;
+                if (stable < StableSec || (lastShot.TryGetValue(key, out last) && now - last < TimeSpan.FromMinutes(PerWindowMin))) return;
+                shotTimes.RemoveAll(t => t < now.AddDays(-1) || t.Date != now.Date);
+                if (shotTimes.Count >= DayMax || shotTimes.Count(t => t > now.AddHours(-1)) >= HourMax) return;
+                lastShot[key] = now;
+                Bitmap bmp = Capture(h);
+                if (bmp == null) return;
+                byte[] thumb = Thumb(bmp);
+                byte[] prev;
+                if (lastThumb.TryGetValue(key, out prev) && Same(prev, thumb)) { bmp.Dispose(); return; }   // 前と同じ画面
+                lastThumb[key] = thumb;
+                shotTimes.Add(now);
+                string p = proc, t2 = title;
+                Enqueue(() => ReadText(bmp, now, p, t2, s));
+            }
+            catch (Exception ex) { Core.Error("画面", ex.Message); }
+        }
+
+        // 前面のウィンドウを撮る（最小化・小さすぎるものは撮らない）
+        public static Bitmap Capture(IntPtr h)
+        {
+            RECT r;
+            if (h == IntPtr.Zero || IsIconic(h) || !GetWindowRect(h, out r)) return null;
+            Rectangle rect = Rectangle.Intersect(Rectangle.FromLTRB(r.L, r.T, r.R, r.B), SystemInformation.VirtualScreen);
+            if (rect.Width < 80 || rect.Height < 60) return null;
+            var bmp = new Bitmap(rect.Width, rect.Height, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+            try { using (Graphics g = Graphics.FromImage(bmp)) g.CopyFromScreen(rect.Location, Point.Empty, rect.Size); }
+            catch { bmp.Dispose(); return null; }
+            return bmp;
+        }
+
+        // 似ている画面かどうかを比べるための 16×16 の濃淡
+        public static byte[] Thumb(Bitmap b)
+        {
+            var px = new byte[256];
+            using (var s = new Bitmap(16, 16))
+            {
+                using (Graphics g = Graphics.FromImage(s))
+                {
+                    g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                    g.DrawImage(b, 0, 0, 16, 16);
+                }
+                for (int y = 0; y < 16; y++)
+                    for (int x = 0; x < 16; x++)
+                    {
+                        Color c = s.GetPixel(x, y);
+                        px[y * 16 + x] = (byte)((c.R * 3 + c.G * 6 + c.B) / 10);
+                    }
+            }
+            return px;
+        }
+
+        public static bool Same(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length) return false;
+            long d = 0;
+            for (int i = 0; i < a.Length; i++) d += Math.Abs(a[i] - b[i]);
+            return d / (double)a.Length < 3.0;
+        }
+
+        // 長い辺が max を超えないように縮める（新しい画像を返す）
+        public static Bitmap Fit(Bitmap b, int max)
+        {
+            double k = Math.Min(1.0, max / (double)Math.Max(b.Width, b.Height));
+            int w = Math.Max(1, (int)(b.Width * k)), hh = Math.Max(1, (int)(b.Height * k));
+            var o = new Bitmap(w, hh, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+            using (Graphics g = Graphics.FromImage(o))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.DrawImage(b, 0, 0, w, hh);
+            }
+            return o;
+        }
+
+        public static void SaveJpeg(Bitmap b, string path, long quality)
+        {
+            System.Drawing.Imaging.ImageCodecInfo codec = System.Drawing.Imaging.ImageCodecInfo.GetImageEncoders().First(c => c.FormatID == System.Drawing.Imaging.ImageFormat.Jpeg.Guid);
+            using (var ps = new System.Drawing.Imaging.EncoderParameters(1))
+            {
+                ps.Param[0] = new System.Drawing.Imaging.EncoderParameter(System.Drawing.Imaging.Encoder.Quality, quality);
+                b.Save(path, codec, ps);
+            }
+        }
+
+        // 画像の文字を読む（PC の中だけ）。読めないときは空
+        public static string Ocr(Bitmap bmp)
+        {
+            string tmp = Path.Combine(RootDir, "tmp_" + Guid.NewGuid().ToString("N") + ".png");
+            try
+            {
+                using (Bitmap fit = Fit(bmp, WinOcr.MaxSize)) fit.Save(tmp, System.Drawing.Imaging.ImageFormat.Png);
+                return WinOcr.Read(tmp);
+            }
+            catch (Exception ex) { Core.Error("文字認識", ex.Message); return ""; }
+            finally { try { File.Delete(tmp); } catch { } }
+        }
+
+        // 簡易モード: 読んだ語のうち、今日このウィンドウで初めて出た語だけを残す。画像は残さない
+        static void ReadText(Bitmap bmp, DateTime at, string proc, string title, Settings s)
+        {
+            string text;
+            try { text = Ocr(bmp); } finally { bmp.Dispose(); }
+            List<string> words = Words(text, s);
+            if (words.Count == 0) return;
+            string date = at.ToString("yyyy-MM-dd");
+            lock (seenWords)
+            {
+                if (seenDate != date) LoadSeen(date);
+                string key = proc + "\t" + title;
+                HashSet<string> set;
+                if (!seenWords.TryGetValue(key, out set)) seenWords[key] = set = new HashSet<string>();
+                words = words.Where(w => set.Add(w)).ToList();
+            }
+            if (words.Count == 0) return;
+            AppendText(at, proc, title, words);
+        }
+
+        static void AppendText(DateTime at, string proc, string title, List<string> words)
+        {
+            string file = TextPath(at.ToString("yyyy-MM-dd"));
+            bool isNew = !File.Exists(file);
+            using (var fs = new FileStream(file, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+            using (var w = new StreamWriter(fs, new UTF8Encoding(isNew)))
+            {
+                if (isNew) w.WriteLine("\"time\",\"process\",\"title\",\"words\"");
+                w.WriteLine(string.Format("\"{0}\",\"{1}\",\"{2}\",\"{3}\"", at.ToString("yyyy-MM-dd HH:mm:ss"), proc, title, string.Join(" ", words).Replace('"', ' ')));
+            }
+        }
+
+        static void LoadSeen(string date)
+        {
+            seenWords.Clear();
+            seenDate = date;
+            foreach (TextLine l in ReadLines(date))
+            {
+                string key = l.Proc + "\t" + l.Title;
+                HashSet<string> set;
+                if (!seenWords.TryGetValue(key, out set)) seenWords[key] = set = new HashSet<string>();
+                foreach (string w in l.Words) set.Add(w);
+            }
+        }
+
+        public class TextLine { public DateTime Time; public string Proc, Title; public string[] Words; }
+        static readonly Regex TextRe = new Regex("^\"([^\"]*)\",\"([^\"]*)\",\"([^\"]*)\",\"([^\"]*)\"");
+
+        public static List<TextLine> ReadLines(string date)
+        {
+            var list = new List<TextLine>();
+            string path = TextPath(date);
+            if (!File.Exists(path)) return list;
+            foreach (string raw in Core.ReadText(path).Split('\n'))
+            {
+                Match m = TextRe.Match(raw.TrimEnd('\r').TrimStart('\uFEFF'));
+                DateTime t;
+                if (m.Success && DateTime.TryParseExact(m.Groups[1].Value, "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out t))
+                    list.Add(new TextLine { Time = t, Proc = m.Groups[2].Value, Title = m.Groups[3].Value, Words = m.Groups[4].Value.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries) });
+            }
+            return list;
+        }
+
+        static readonly Regex WordRe = new Regex(@"[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}ー々〆A-Za-z0-9０-９Ａ-Ｚａ-ｚ_\-\.]+");
+        static readonly Regex CjkGap = new Regex(@"(?<=[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}ー々])\s+(?=[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}ー々])");
+
+        // 文字認識の結果から、作業の手がかりになりそうな語（2〜30文字。数字だけ・ひらがな2文字以下は除く。伏せる語は伏せる）。最大40語
+        public static List<string> Words(string text, Settings s)
+        {
+            text = CjkGap.Replace(text ?? "", "");   // 日本語は1文字ずつ空白で区切られて返ることがある
+            foreach (string w in s.MaskWords) if (w.Length > 0) text = text.Replace(w, " ");
+            var list = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (Match m in WordRe.Matches(text))
+            {
+                string w = m.Value.Trim('.', '-', '_');
+                if (w.Length < 2 || w.Length > 30) continue;
+                if (Regex.IsMatch(w, @"^[0-9０-９\.\-_]+$")) continue;
+                if (w.Length <= 2 && Regex.IsMatch(w, @"^\p{IsHiragana}+$")) continue;
+                if (w.Contains("@")) continue;
+                if (seen.Add(w)) list.Add(w);
+                if (list.Count >= 40) break;
+            }
+            return list;
+        }
+
+        // ---- ブースト ----
+        public static int BoostsToday()
+        {
+            try
+            {
+                if (!File.Exists(CountPath)) return 0;
+                string[] c = Core.ReadText(CountPath).Trim().Split('\t');
+                int n;
+                return c.Length == 2 && c[0] == DateTime.Today.ToString("yyyy-MM-dd") && int.TryParse(c[1], out n) ? n : 0;
+            }
+            catch { return 0; }
+        }
+
+        static HashSet<string> seenApps;
+        static bool SeenApp(string proc)
+        {
+            if (seenApps == null)
+            {
+                seenApps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                try { if (File.Exists(SeenPath)) foreach (string l in Core.ReadText(SeenPath).Split('\n')) if (l.Trim().Length > 0) seenApps.Add(l.Trim()); } catch { }
+            }
+            return seenApps.Contains(proc);
+        }
+
+        static void AddSeenApp(string proc)
+        {
+            SeenApp(proc);
+            if (!seenApps.Add(proc)) return;
+            try { File.AppendAllText(SeenPath, proc + "\r\n", new UTF8Encoding(false)); } catch { }
+        }
+
+        public static void StartBoost(bool auto, Settings s)
+        {
+            if (Boosting || ManualOn) return;
+            DateTime now = DateTime.Now;
+            boostDir = Path.Combine(RootDir, "ブースト_" + now.ToString("yyyyMMdd_HHmmss"));
+            Directory.CreateDirectory(boostDir);
+            boostCount = 0;
+            boostAuto = auto;
+            boostLast.Clear();
+            BoostUntil = now.AddMinutes(Math.Max(1, s.BoostMinutes));
+            try { Core.WriteText(CountPath, now.ToString("yyyy-MM-dd") + "\t" + (BoostsToday() + 1)); } catch { }
+            if (Notify != null) Notify("ブースト開始（" + BoostUntil.ToString("HH:mm") + " まで）", auto ? "新しいアプリ: " + curProc : "");
+        }
+
+        public static void StopBoost() { if (Boosting) BoostUntil = DateTime.Now; }
+
+        static void BoostShot()
+        {
+            Bitmap bmp = Capture(curHwnd);
+            if (bmp == null) return;
+            int no = ++boostCount;
+            string dir = boostDir, proc = curProc, title = curTitle;
+            DateTime at = DateTime.Now;
+            Enqueue(() =>
+            {
+                try
+                {
+                    string text = string.Join(" ", Words(Ocr(bmp), Settings.Get()));
+                    using (Bitmap fit = Fit(bmp, BoostWidth)) SaveJpeg(fit, Path.Combine(dir, no.ToString("000") + ".jpg"), 75);
+                    File.AppendAllText(Path.Combine(dir, "meta.tsv"), string.Join("\t", no.ToString("000"), at.ToString("HH:mm"), proc, title, text) + "\r\n", new UTF8Encoding(false));
+                    AppendText(at, proc, title, text.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).ToList());
+                }
+                finally { bmp.Dispose(); }
+            });
+        }
+
+        static void FinishBoost(Settings s)
+        {
+            string dir = boostDir;
+            boostDir = null;
+            Enqueue(() =>
+            {
+                int n = 0;
+                string err = null;
+                try { n = Knowledge.Learn(dir, s); }
+                catch (Exception ex) { err = ex.Message; Core.Error("ブースト", ex.Message); }
+                try { Directory.Delete(dir, true); } catch { }   // 画像は AI に見せたら消す
+                if (Notify != null) Notify(err == null ? "ブースト終了" : "ブーストで覚えられませんでした", err ?? ("覚えたこと: " + n + " 件（知識.md）"));
+            });
+        }
+
+        // ---- マニュアル作成 ----
+        public static string StartManual()
+        {
+            if (ManualOn) return manualDir;
+            StopBoost();
+            string root = Path.Combine(ManualRoot, DateTime.Now.ToString("yyyyMMdd_HHmmss"));
+            manualDir = Path.Combine(root, "画像");
+            Directory.CreateDirectory(manualDir);
+            manualCount = 0;
+            manualLastKey = null;
+            manualLastThumb = null;
+            return root;
+        }
+
+        // 終える。撮った画像のフォルダを返す（撮っていなければ null）
+        public static string StopManual(out int count)
+        {
+            count = manualCount;
+            string dir = manualDir;
+            manualDir = null;
+            if (dir == null) return null;
+            // 後ろの処理（保存）が終わるのを待つ
+            var done = new ManualResetEvent(false);
+            Enqueue(() => done.Set());
+            done.WaitOne(15000);
+            if (count == 0) { try { Directory.Delete(Path.GetDirectoryName(dir), true); } catch { } return null; }
+            return dir;
+        }
+
+        static void ManualShot(string key)
+        {
+            manualLastKey = key;
+            if (manualCount >= ManualMax) return;
+            Bitmap bmp = Capture(curHwnd);
+            if (bmp == null) return;
+            byte[] thumb = Thumb(bmp);
+            if (Same(manualLastThumb, thumb)) { bmp.Dispose(); return; }
+            manualLastThumb = thumb;
+            int no = ++manualCount;
+            string dir = manualDir, proc = curProc, title = curTitle;
+            DateTime at = DateTime.Now;
+            Enqueue(() =>
+            {
+                try
+                {
+                    bmp.Save(Path.Combine(dir, no.ToString("000") + ".png"), System.Drawing.Imaging.ImageFormat.Png);
+                    string text = string.Join(" ", Words(Ocr(bmp), Settings.Get()));
+                    File.AppendAllText(Path.Combine(dir, "meta.tsv"), string.Join("\t", no.ToString("000"), at.ToString("HH:mm:ss"), proc, title, text) + "\r\n", new UTF8Encoding(false));
+                }
+                finally { bmp.Dispose(); }
+            });
+        }
+
+        // ---- 日報を作るときに AI に渡す文（画面の語と、その日のアプリに関係する知識）----
+        public static string Prompt(string date, Settings s, IEnumerable<string> procs, DateTime? since)
+        {
+            var b = new StringBuilder();
+            List<TextLine> lines = ReadLines(date).Where(l => !since.HasValue || l.Time > since.Value).Where(l => !s.ExcludeProc.Contains(l.Proc) && !s.MaskProc.ContainsKey(l.Proc)).ToList();
+            if (lines.Count > 0)
+            {
+                b.Append("\n\n画面に出ていた語（PC の中で読み取ったもの。誤りあり。作業の中身の手がかり）:\n");
+                int size = 0;
+                foreach (var g in lines.GroupBy(l => l.Proc + "\t" + l.Title))
+                {
+                    TextLine first = g.First();
+                    string t = first.Title;
+                    foreach (string w in s.MaskWords) if (w.Length > 0) t = t.Replace(w, "＊＊");
+                    string line = first.Time.ToString("HH:mm") + " [" + first.Proc + "] " + t + ": " + string.Join(" ", g.SelectMany(l => l.Words).Distinct().Take(40)) + "\n";
+                    if (size + line.Length > 3000) break;
+                    size += line.Length;
+                    b.Append(line);
+                }
+            }
+            string know = Knowledge.For(procs.Concat(lines.Select(l => l.Proc)));
+            if (know.Length > 0) b = new StringBuilder(b.ToString().TrimEnd('\n')).Append("\n\n覚えている手がかり（ブーストで画面を見て作ったもの。当てはまれば作業名・工程名に使う）:\n" + know);
+            return b.ToString().TrimEnd('\n');
+        }
+    }
+
+    // Windows の文字認識（Windows.Media.Ocr）。WinRT を名前で呼ぶので、ビルドに追加の参照はいらない
+    static class WinOcr
+    {
+        public const int MaxSize = 2600;   // OcrEngine.MaxImageDimension より少し小さく
+        static MethodInfo asTask;
+        static readonly object gate = new object();
+
+        static Type T(string name)
+        {
+            foreach (string asm in new[] { "Windows.Foundation", "Windows.Media", "Windows.Storage", "Windows.Graphics", "Windows" })
+            {
+                Type t = Type.GetType(name + ", " + asm + ", ContentType=WindowsRuntime");
+                if (t != null) return t;
+            }
+            throw new Exception("Windows の文字認識が使えません（" + name + "）");
+        }
+
+        static object Await(object op, Type result)
+        {
+            if (asTask == null)
+            {
+                Assembly a;
+                try { a = Assembly.Load("System.Runtime.WindowsRuntime, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"); }
+                catch { a = Assembly.LoadFrom(Path.Combine(RuntimeEnvironment.GetRuntimeDirectory(), "System.Runtime.WindowsRuntime.dll")); }
+                asTask = a.GetType("System.WindowsRuntimeSystemExtensions").GetMethods()
+                    .First(m => m.Name == "AsTask" && m.IsGenericMethod && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType.Name == "IAsyncOperation`1");
+            }
+            var task = (System.Threading.Tasks.Task)asTask.MakeGenericMethod(result).Invoke(null, new[] { op });
+            if (!task.Wait(30000)) throw new TimeoutException("文字認識が終わりません");
+            return task.GetType().GetProperty("Result").GetValue(task, null);
+        }
+
+        // 画像ファイルの文字（行ごと）。日本語のあいだの空白は詰める
+        public static string Read(string path)
+        {
+            lock (gate)
+            {
+                Type tFile = T("Windows.Storage.StorageFile"), tMode = T("Windows.Storage.FileAccessMode"), tStream = T("Windows.Storage.Streams.IRandomAccessStream");
+                Type tDec = T("Windows.Graphics.Imaging.BitmapDecoder"), tBmp = T("Windows.Graphics.Imaging.SoftwareBitmap");
+                Type tEng = T("Windows.Media.Ocr.OcrEngine"), tRes = T("Windows.Media.Ocr.OcrResult");
+                object engine = tEng.GetMethod("TryCreateFromUserProfileLanguages").Invoke(null, null);
+                if (engine == null) throw new Exception("文字認識の言語が入っていません");
+                object file = Await(tFile.GetMethod("GetFileFromPathAsync").Invoke(null, new object[] { path }), tFile);
+                object stream = Await(tFile.GetMethod("OpenAsync", new[] { tMode }).Invoke(file, new[] { Enum.ToObject(tMode, 0) }), tStream);
+                try
+                {
+                    object dec = Await(tDec.GetMethod("CreateAsync", new[] { tStream }).Invoke(null, new[] { stream }), tDec);
+                    object bmp = Await(tDec.GetMethod("GetSoftwareBitmapAsync", Type.EmptyTypes).Invoke(dec, null), tBmp);
+                    try
+                    {
+                        object res = Await(tEng.GetMethod("RecognizeAsync").Invoke(engine, new[] { bmp }), tRes);
+                        var lines = new List<string>();
+                        foreach (object line in (IEnumerable)tRes.GetProperty("Lines").GetValue(res, null))
+                            lines.Add((string)line.GetType().GetProperty("Text").GetValue(line, null));
+                        return Regex.Replace(string.Join("\n", lines), @"(?<=[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}ー々])[ \t]+(?=[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}ー々])", "");
+                    }
+                    finally { var d = bmp as IDisposable; if (d != null) d.Dispose(); }
+                }
+                finally { var d = stream as IDisposable; if (d != null) d.Dispose(); }
+            }
+        }
+    }
+
+    // 知識.md: ブーストで AI が書いた「文字だけで作業を見分ける手がかり」（1行に1つ。「- [アプリ] 手がかり → 作業」。手で直してよい）
+    static class Knowledge
+    {
+        static readonly Regex LineRe = new Regex(@"^\s*[-・*]\s*\[([^\]]+)\]\s*(.+?)\s*(?:→|->|⇒)\s*(.+)$");
+
+        public static List<string> Lines()
+        {
+            if (!File.Exists(Shots.KnowPath)) return new List<string>();
+            return Core.ReadText(Shots.KnowPath).Split('\n').Select(l => l.TrimEnd('\r')).Where(l => LineRe.IsMatch(l)).ToList();
+        }
+
+        // その日に使ったアプリの手がかりだけ（多すぎるときは 2000 文字まで）
+        public static string For(IEnumerable<string> procs)
+        {
+            var set = new HashSet<string>(procs, StringComparer.OrdinalIgnoreCase);
+            var b = new StringBuilder();
+            foreach (string l in Lines())
+            {
+                Match m = LineRe.Match(l);
+                if (!set.Contains(m.Groups[1].Value.Trim())) continue;
+                if (b.Length + l.Length > 2000) break;
+                b.Append(l.Trim() + "\n");
+            }
+            return b.ToString();
+        }
+
+        // AI の返事から知識の行だけを取り出す（すでにある行は除く）
+        public static List<string> Parse(string text, IEnumerable<string> existing)
+        {
+            var have = new HashSet<string>(existing.Select(Norm));
+            var list = new List<string>();
+            foreach (string raw in (text ?? "").Split('\n'))
+            {
+                Match m = LineRe.Match(raw.Trim());
+                if (!m.Success) continue;
+                string l = "- [" + m.Groups[1].Value.Trim() + "] " + m.Groups[2].Value.Trim() + " → " + m.Groups[3].Value.Trim();
+                if (have.Add(Norm(l))) list.Add(l);
+            }
+            return list;
+        }
+
+        static string Norm(string l) { return Regex.Replace(l, @"\s+", "").ToLowerInvariant(); }
+
+        public static void Append(List<string> lines)
+        {
+            if (lines.Count == 0) return;
+            bool isNew = !File.Exists(Shots.KnowPath);
+            string head = isNew ? "# 知識（ブーストで画面を見て作った手がかり。1行に1つ「- [アプリ] 手がかり → 作業」。手で直したり消したりしてよい）\r\n\r\n" : "";
+            File.AppendAllText(Shots.KnowPath, head + "<!-- " + DateTime.Now.ToString("yyyy-MM-dd HH:mm") + " -->\r\n" + string.Join("\r\n", lines) + "\r\n", new UTF8Encoding(isNew));
+        }
+
+        // ブーストのフォルダ（001.jpg … と meta.tsv）を AI に見せて、手がかりを 知識.md に足す。足した数を返す
+        public static int Learn(string dir, Settings s)
+        {
+            string meta = Path.Combine(dir, "meta.tsv");
+            if (!File.Exists(meta)) return 0;
+            var items = new List<KeyValuePair<string, string>>();
+            var procs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string raw in Core.ReadText(meta).Split('\n'))
+            {
+                string[] c = raw.TrimEnd('\r').Split('\t');
+                if (c.Length < 5) continue;
+                string img = Path.Combine(dir, c[0] + ".jpg");
+                if (!File.Exists(img)) continue;
+                string title = c[3];
+                foreach (string w in s.MaskWords) if (w.Length > 0) title = title.Replace(w, "＊＊");
+                procs.Add(c[2]);
+                items.Add(new KeyValuePair<string, string>("画像" + c[0] + ": " + c[1] + " [" + c[2] + "] " + title + (c[4].Length > 0 ? "\n画面の文字: " + c[4] : ""), img));
+            }
+            if (items.Count == 0) return 0;
+            List<string> have = Lines();
+            List<string> tasks = Tasks.Load().Where(t => !t.Done && t.Name.Trim().Length > 0).Select(t => t.Name.Trim()).ToList();
+            string prompt =
+                "日報づくりのために、画面の画像から「次からは文字だけで作業を見分けるための手がかり」を作ってください。\n" +
+                "各画像の前に、時刻・[アプリ]・ウィンドウタイトル・画面の文字（PC で読み取ったもの。誤りあり）を付けます。\n" +
+                "出力は1行に1つ、次の形だけ（ほかの文は書かない）:\n- [アプリ名] 手がかり（タイトルや画面に出る語） → 何の作業か（業務名・工程名）\n" +
+                "決まり:\n・手がかりは、タイトルか画面の文字に実際に出る語にする（ふだんは画像を見ず、文字だけで判断するため）\n" +
+                "・私用と思われるものは「→ 私用（日報に入れない）」\n・人名・顧客名・メールアドレス・金額などは書かない\n" +
+                "・すでにある手がかりと同じものは書かない\n・最大15行\n\n" +
+                (tasks.Count > 0 ? "登録しているタスク（作業名に使ってよい）: " + string.Join("、", tasks) + "\n\n" : "") +
+                (have.Count > 0 ? "すでにある手がかり:\n" + string.Join("\n", have.Take(80)) + "\n\n" : "") +
+                "画像:";
+            string problem = ImageAi.Problem(s);
+            if (problem != null) throw new Exception("画像を AI に送りませんでした: " + problem);
+            string text = ClaudeCli.AskImages(prompt, items, s, DateTime.Today.ToString("yyyy-MM-dd"), "（ブースト " + items.Count + "枚）", s.Model);
+            List<string> add = Parse(text, have);
+            Append(add);
+            return add.Count;
+        }
+    }
+
+    // マニュアル作成: 撮った画像から手順書を作る（AI が手順の文を書く。AI が使えないときはウィンドウの名前だけで作る）
+    static class Manual
+    {
+        public class Step { public int Image; public string Head = "", Body = ""; }
+        public class Doc { public string Title = "", Summary = ""; public List<Step> Steps = new List<Step>(); }
+
+        public class Shot { public string No, Time, Proc, Title, Text, Path; }
+
+        public static List<Shot> Shots(string dir)
+        {
+            var list = new List<Shot>();
+            string meta = Path.Combine(dir, "meta.tsv");
+            if (!File.Exists(meta)) return list;
+            foreach (string raw in Core.ReadText(meta).Split('\n'))
+            {
+                string[] c = raw.TrimEnd('\r').Split('\t');
+                if (c.Length < 5) continue;
+                string p = Path.Combine(dir, c[0] + ".png");
+                if (File.Exists(p)) list.Add(new Shot { No = c[0], Time = c[1], Proc = c[2], Title = c[3], Text = c[4], Path = p });
+            }
+            return list;
+        }
+
+        static readonly Regex StepRe = new Regex("<手順\\s+画像\\s*=\\s*\"?(\\d+)\"?\\s*>(.*?)</手順>", RegexOptions.Singleline);
+
+        public static Doc Parse(string text, string title)
+        {
+            var d = new Doc { Title = title };
+            Match m = Regex.Match(text ?? "", "<題>(.*?)</題>", RegexOptions.Singleline);
+            if (m.Success && m.Groups[1].Value.Trim().Length > 0) d.Title = m.Groups[1].Value.Trim();
+            m = Regex.Match(text ?? "", "<概要>(.*?)</概要>", RegexOptions.Singleline);
+            if (m.Success) d.Summary = m.Groups[1].Value.Trim();
+            foreach (Match s in StepRe.Matches(text ?? ""))
+            {
+                string body = s.Groups[2].Value.Trim().Replace("\r\n", "\n");
+                int nl = body.IndexOf('\n');
+                d.Steps.Add(new Step { Image = int.Parse(s.Groups[1].Value), Head = (nl < 0 ? body : body.Substring(0, nl)).Trim(), Body = nl < 0 ? "" : body.Substring(nl + 1).Trim() });
+            }
+            return d;
+        }
+
+        // AI を使わない手順書（ウィンドウの名前と画面の語だけ）
+        public static Doc Plain(List<Shot> shots, string title)
+        {
+            var d = new Doc { Title = title, Summary = "画面の記録から作った手順書（説明は AI を使わずに作ったもの）" };
+            foreach (Shot s in shots)
+                d.Steps.Add(new Step { Image = int.Parse(s.No), Head = s.Proc + "（" + s.Time + "）", Body = s.Title });
+            return d;
+        }
+
+        // 手順書を作ってファイルの場所を返す。slides: PowerPoint（でなければ Word）
+        public static string Build(string imageDir, string title, bool slides, Settings s, out string note)
+        {
+            note = "";
+            List<Shot> shots = Shots(imageDir);
+            if (shots.Count == 0) throw new Exception("撮った画像がありません");
+            Doc doc;
+            try { doc = Ask(shots, title, s); }
+            catch (Exception ex) { note = "AI を使えなかったため、画面の名前だけで作りました: " + ex.Message; doc = Plain(shots, title); }
+            var byNo = shots.ToDictionary(x => int.Parse(x.No), x => x.Path);
+            doc.Steps = doc.Steps.Where(x => byNo.ContainsKey(x.Image)).ToList();
+            if (doc.Steps.Count == 0) { note = "AI の返事に手順がなかったため、画面の名前だけで作りました"; doc = Plain(shots, title); }
+            string root = Path.GetDirectoryName(imageDir);
+            string name = Regex.Replace(doc.Title, "[\\\\/:*?\"<>|]", "_");
+            if (name.Length == 0) name = "手順書";
+            string path = Path.Combine(root, name + (slides ? ".pptx" : ".docx"));
+            if (slides) Office.Pptx(path, doc, byNo); else Office.Docx(path, doc, byNo);
+            Core.WriteText(Path.Combine(root, name + ".md"), Markdown(doc));
+            return path;
+        }
+
+        public static string Markdown(Doc d)
+        {
+            var b = new StringBuilder("# " + d.Title + "\r\n\r\n" + d.Summary + "\r\n");
+            int n = 0;
+            foreach (Step s in d.Steps) b.Append("\r\n## " + (++n) + ". " + s.Head + "\r\n\r\n![](画像/" + s.Image.ToString("000") + ".png)\r\n\r\n" + s.Body + "\r\n");
+            return b.ToString();
+        }
+
+        static Doc Ask(List<Shot> shots, string title, Settings s)
+        {
+            // 多いときは間を飛ばして ManualAiMax 枚にする（最初と最後は入れる）
+            string problem = ImageAi.Problem(s);
+            if (problem != null) throw new Exception("画像を AI に送りませんでした: " + problem);
+            List<Shot> pick = shots;
+            if (shots.Count > WorkLog.Shots.ManualAiMax)
+                pick = Enumerable.Range(0, WorkLog.Shots.ManualAiMax).Select(i => shots[(int)Math.Round(i * (shots.Count - 1) / (double)(WorkLog.Shots.ManualAiMax - 1))]).Distinct().ToList();
+            string tmp = Path.Combine(Path.GetDirectoryName(shots[0].Path), "ai");
+            Directory.CreateDirectory(tmp);
+            try
+            {
+                var items = new List<KeyValuePair<string, string>>();
+                foreach (Shot x in pick)
+                {
+                    string jpg = Path.Combine(tmp, x.No + ".jpg");
+                    using (var b = new Bitmap(x.Path))
+                    using (Bitmap fit = WorkLog.Shots.Fit(b, WorkLog.Shots.ManualAiWidth)) WorkLog.Shots.SaveJpeg(fit, jpg, 80);
+                    string t = x.Title;
+                    foreach (string w in s.MaskWords) if (w.Length > 0) t = t.Replace(w, "＊＊");
+                    items.Add(new KeyValuePair<string, string>("画像" + int.Parse(x.No) + ": " + x.Time + " [" + x.Proc + "] " + t + (x.Text.Length > 0 ? "\n画面の文字: " + x.Text : ""), jpg));
+                }
+                string prompt =
+                    "次の画面の画像（操作した順）から、ほかの人が同じ作業をできる手順書を作ってください。題の案: " + title + "\n" +
+                    "出力は次の形だけ（ほかの文は書かない）:\n<題>手順書の題</題>\n<概要>この手順でできること（1〜3文）</概要>\n" +
+                    "<手順 画像=\"番号\">見出し（短く）\n説明（何をどうするか。1〜4文。画面の項目名は「」で囲む）</手順>\n…\n" +
+                    "決まり:\n・1つの手順に画像は1枚。同じような画面・関係のない画面は省いてよい\n" +
+                    "・人名・メールアドレス・顧客名などは書かない\n\n画像:";
+                return Parse(ClaudeCli.AskImages(prompt, items, s, DateTime.Today.ToString("yyyy-MM-dd"), "（マニュアル " + items.Count + "枚）", s.Model), title);
+            }
+            finally { try { Directory.Delete(tmp, true); } catch { } }
+        }
+    }
+
+    // Word（.docx）と PowerPoint（.pptx）を、Office がなくても作る（必要な最小限の部品だけ）
+    static class Office
+    {
+        static string X(string s) { return System.Security.SecurityElement.Escape(s ?? "") ?? ""; }
+
+        static void Entry(System.IO.Compression.ZipArchive z, string name, string text)
+        {
+            using (var w = new StreamWriter(z.CreateEntry(name).Open(), new UTF8Encoding(false))) w.Write(text);
+        }
+
+        static void EntryFile(System.IO.Compression.ZipArchive z, string name, string file)
+        {
+            using (Stream o = z.CreateEntry(name).Open())
+            using (FileStream i = File.OpenRead(file)) i.CopyTo(o);
+        }
+
+        static Size ImageSize(string file)
+        {
+            using (var b = Image.FromFile(file)) return b.Size;
+        }
+
+        const string Xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n";
+        const string NsR = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        const string NsA = "http://schemas.openxmlformats.org/drawingml/2006/main";
+        const string NsP = "http://schemas.openxmlformats.org/presentationml/2006/main";
+        const string RelImage = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
+
+        static string Rels(IEnumerable<string[]> rels)
+        {
+            return Xml + "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                string.Concat(rels.Select(r => "<Relationship Id=\"" + r[0] + "\" Type=\"" + r[1] + "\" Target=\"" + r[2] + "\"/>")) + "</Relationships>";
+        }
+
+        // ---- Word ----
+        static string Para(string text, int halfPt, bool bold, string color)
+        {
+            var b = new StringBuilder("<w:p><w:pPr><w:spacing w:after=\"120\"/></w:pPr>");
+            string[] lines = (text ?? "").Replace("\r\n", "\n").Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                b.Append("<w:r><w:rPr><w:rFonts w:ascii=\"Meiryo UI\" w:hAnsi=\"Meiryo UI\" w:eastAsia=\"Meiryo UI\"/>" + (bold ? "<w:b/>" : "") +
+                    (color != null ? "<w:color w:val=\"" + color + "\"/>" : "") + "<w:sz w:val=\"" + halfPt + "\"/><w:szCs w:val=\"" + halfPt + "\"/></w:rPr>");
+                if (i > 0) b.Append("<w:br/>");
+                b.Append("<w:t xml:space=\"preserve\">" + X(lines[i]) + "</w:t></w:r>");
+            }
+            return b.Append("</w:p>").ToString();
+        }
+
+        static string Drawing(int id, string rel, long cx, long cy)
+        {
+            return "<w:p><w:pPr><w:spacing w:after=\"240\"/></w:pPr><w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\"><wp:extent cx=\"" + cx + "\" cy=\"" + cy + "\"/>" +
+                "<wp:docPr id=\"" + id + "\" name=\"図 " + id + "\"/><a:graphic xmlns:a=\"" + NsA + "\"><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">" +
+                "<pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"><pic:nvPicPr><pic:cNvPr id=\"" + id + "\" name=\"image" + id + ".png\"/><pic:cNvPicPr/></pic:nvPicPr>" +
+                "<pic:blipFill><a:blip r:embed=\"" + rel + "\"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>" +
+                "<pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"" + cx + "\" cy=\"" + cy + "\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>" +
+                "</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>";
+        }
+
+        public static void Docx(string path, Manual.Doc doc, Dictionary<int, string> images)
+        {
+            if (File.Exists(path)) File.Delete(path);
+            using (var z = System.IO.Compression.ZipFile.Open(path, System.IO.Compression.ZipArchiveMode.Create))
+            {
+                Entry(z, "[Content_Types].xml", Xml + "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
+                    "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/>" +
+                    "<Default Extension=\"png\" ContentType=\"image/png\"/>" +
+                    "<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/></Types>");
+                Entry(z, "_rels/.rels", Rels(new[] { new[] { "rId1", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument", "word/document.xml" } }));
+                var body = new StringBuilder();
+                body.Append(Para(doc.Title, 40, true, "1F4E79"));
+                if (doc.Summary.Length > 0) body.Append(Para(doc.Summary, 22, false, null));
+                var rels = new List<string[]>();
+                const long maxW = 5760720, maxH = 4320000;   // 幅 16cm・高さ 12cm まで
+                int n = 0;
+                foreach (Manual.Step s in doc.Steps)
+                {
+                    n++;
+                    body.Append(Para(n + ". " + s.Head, 28, true, "1F4E79"));
+                    if (s.Body.Length > 0) body.Append(Para(s.Body, 22, false, null));
+                    string rel = "rIdImg" + n, media = "image" + n + ".png";
+                    EntryFile(z, "word/media/" + media, images[s.Image]);
+                    rels.Add(new[] { rel, RelImage, "media/" + media });
+                    Size sz = ImageSize(images[s.Image]);
+                    double k = Math.Min(maxW / (double)sz.Width, maxH / (double)sz.Height);
+                    body.Append(Drawing(n, rel, (long)(sz.Width * k), (long)(sz.Height * k)));
+                }
+                Entry(z, "word/_rels/document.xml.rels", Rels(rels));
+                Entry(z, "word/document.xml", Xml + "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" xmlns:r=\"" + NsR + "\" " +
+                    "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\"><w:body>" + body +
+                    "<w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/><w:pgMar w:top=\"1134\" w:right=\"1134\" w:bottom=\"1134\" w:left=\"1134\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/></w:sectPr></w:body></w:document>");
+            }
+        }
+
+        // ---- PowerPoint（16:9）----
+        const long SlideW = 12192000, SlideH = 6858000;
+
+        static string TextBox(int id, string name, long x, long y, long cx, long cy, string text, int size, bool bold, string color)
+        {
+            var paras = new StringBuilder();
+            foreach (string line in (text ?? "").Replace("\r\n", "\n").Split('\n'))
+                paras.Append("<a:p><a:r><a:rPr lang=\"ja-JP\" sz=\"" + size + "\"" + (bold ? " b=\"1\"" : "") + "><a:solidFill><a:srgbClr val=\"" + color + "\"/></a:solidFill>" +
+                    "<a:latin typeface=\"Meiryo UI\"/><a:ea typeface=\"Meiryo UI\"/></a:rPr><a:t>" + X(line) + "</a:t></a:r></a:p>");
+            return "<p:sp><p:nvSpPr><p:cNvPr id=\"" + id + "\" name=\"" + name + "\"/><p:cNvSpPr txBox=\"1\"/><p:nvPr/></p:nvSpPr>" +
+                "<p:spPr><a:xfrm><a:off x=\"" + x + "\" y=\"" + y + "\"/><a:ext cx=\"" + cx + "\" cy=\"" + cy + "\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>" +
+                "<p:txBody><a:bodyPr wrap=\"square\" rtlCol=\"0\"><a:normAutofit/></a:bodyPr><a:lstStyle/>" + paras + "</p:txBody></p:sp>";
+        }
+
+        static string Picture(int id, string rel, long x, long y, long cx, long cy)
+        {
+            return "<p:pic><p:nvPicPr><p:cNvPr id=\"" + id + "\" name=\"画像 " + id + "\"/><p:cNvPicPr><a:picLocks noChangeAspect=\"1\"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>" +
+                "<p:blipFill><a:blip r:embed=\"" + rel + "\"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>" +
+                "<p:spPr><a:xfrm><a:off x=\"" + x + "\" y=\"" + y + "\"/><a:ext cx=\"" + cx + "\" cy=\"" + cy + "\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>" +
+                "<a:ln w=\"9525\"><a:solidFill><a:srgbClr val=\"BFBFBF\"/></a:solidFill></a:ln></p:spPr></p:pic>";
+        }
+
+        static string Slide(string shapes)
+        {
+            return Xml + "<p:sld xmlns:a=\"" + NsA + "\" xmlns:r=\"" + NsR + "\" xmlns:p=\"" + NsP + "\"><p:cSld><p:spTree>" +
+                "<p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/><a:chOff x=\"0\" y=\"0\"/><a:chExt cx=\"0\" cy=\"0\"/></a:xfrm></p:grpSpPr>" +
+                shapes + "</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>";
+        }
+
+        const string EmptyTree = "<p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/></p:spTree></p:cSld>";
+
+        static string Theme()
+        {
+            Func<string, string, string> sys = (n, v) => "<a:" + n + "><a:srgbClr val=\"" + v + "\"/></a:" + n + ">";
+            string fill = "<a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill>";
+            string line = "<a:ln w=\"9525\"><a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill></a:ln>";
+            return Xml + "<a:theme xmlns:a=\"" + NsA + "\" name=\"WorkLog\"><a:themeElements><a:clrScheme name=\"WorkLog\">" +
+                sys("dk1", "000000") + sys("lt1", "FFFFFF") + sys("dk2", "1F4E79") + sys("lt2", "EEECE1") + sys("accent1", "4472C4") + sys("accent2", "ED7D31") +
+                sys("accent3", "A5A5A5") + sys("accent4", "FFC000") + sys("accent5", "5B9BD5") + sys("accent6", "70AD47") + sys("hlink", "0563C1") + sys("folHlink", "954F72") +
+                "</a:clrScheme><a:fontScheme name=\"WorkLog\"><a:majorFont><a:latin typeface=\"Meiryo UI\"/><a:ea typeface=\"Meiryo UI\"/><a:cs typeface=\"\"/></a:majorFont>" +
+                "<a:minorFont><a:latin typeface=\"Meiryo UI\"/><a:ea typeface=\"Meiryo UI\"/><a:cs typeface=\"\"/></a:minorFont></a:fontScheme>" +
+                "<a:fmtScheme name=\"WorkLog\"><a:fillStyleLst>" + fill + fill + fill + "</a:fillStyleLst><a:lnStyleLst>" + line + line + line + "</a:lnStyleLst>" +
+                "<a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>" +
+                "<a:bgFillStyleLst>" + fill + fill + fill + "</a:bgFillStyleLst></a:fmtScheme></a:themeElements><a:objectDefaults/><a:extraClrSchemeLst/></a:theme>";
+        }
+
+        public static void Pptx(string path, Manual.Doc doc, Dictionary<int, string> images)
+        {
+            if (File.Exists(path)) File.Delete(path);
+            int count = doc.Steps.Count + 1;   // 1枚目は題
+            using (var z = System.IO.Compression.ZipFile.Open(path, System.IO.Compression.ZipArchiveMode.Create))
+            {
+                var ct = new StringBuilder(Xml + "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
+                    "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/>" +
+                    "<Default Extension=\"png\" ContentType=\"image/png\"/>" +
+                    "<Override PartName=\"/ppt/presentation.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml\"/>" +
+                    "<Override PartName=\"/ppt/slideMasters/slideMaster1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml\"/>" +
+                    "<Override PartName=\"/ppt/slideLayouts/slideLayout1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml\"/>" +
+                    "<Override PartName=\"/ppt/theme/theme1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/>");
+                for (int i = 1; i <= count; i++)
+                    ct.Append("<Override PartName=\"/ppt/slides/slide" + i + ".xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slide+xml\"/>");
+                Entry(z, "[Content_Types].xml", ct + "</Types>");
+                Entry(z, "_rels/.rels", Rels(new[] { new[] { "rId1", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument", "ppt/presentation.xml" } }));
+
+                const string RelSlide = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide";
+                const string RelLayout = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout";
+                const string RelMaster = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster";
+                const string RelTheme = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme";
+                var presRels = new List<string[]> { new[] { "rId1", RelMaster, "slideMasters/slideMaster1.xml" }, new[] { "rId2", RelTheme, "theme/theme1.xml" } };
+                var ids = new StringBuilder();
+                for (int i = 1; i <= count; i++)
+                {
+                    presRels.Add(new[] { "rId" + (i + 2), RelSlide, "slides/slide" + i + ".xml" });
+                    ids.Append("<p:sldId id=\"" + (255 + i) + "\" r:id=\"rId" + (i + 2) + "\"/>");
+                }
+                Entry(z, "ppt/_rels/presentation.xml.rels", Rels(presRels));
+                Entry(z, "ppt/presentation.xml", Xml + "<p:presentation xmlns:a=\"" + NsA + "\" xmlns:r=\"" + NsR + "\" xmlns:p=\"" + NsP + "\">" +
+                    "<p:sldMasterIdLst><p:sldMasterId id=\"2147483648\" r:id=\"rId1\"/></p:sldMasterIdLst><p:sldIdLst>" + ids + "</p:sldIdLst>" +
+                    "<p:sldSz cx=\"" + SlideW + "\" cy=\"" + SlideH + "\"/><p:notesSz cx=\"6858000\" cy=\"9144000\"/></p:presentation>");
+                Entry(z, "ppt/slideMasters/_rels/slideMaster1.xml.rels", Rels(new[] { new[] { "rId1", RelLayout, "../slideLayouts/slideLayout1.xml" }, new[] { "rId2", RelTheme, "../theme/theme1.xml" } }));
+                Entry(z, "ppt/slideMasters/slideMaster1.xml", Xml + "<p:sldMaster xmlns:a=\"" + NsA + "\" xmlns:r=\"" + NsR + "\" xmlns:p=\"" + NsP + "\">" + EmptyTree +
+                    "<p:clrMap bg1=\"lt1\" tx1=\"dk1\" bg2=\"lt2\" tx2=\"dk2\" accent1=\"accent1\" accent2=\"accent2\" accent3=\"accent3\" accent4=\"accent4\" accent5=\"accent5\" accent6=\"accent6\" hlink=\"hlink\" folHlink=\"folHlink\"/>" +
+                    "<p:sldLayoutIdLst><p:sldLayoutId id=\"2147483649\" r:id=\"rId1\"/></p:sldLayoutIdLst></p:sldMaster>");
+                Entry(z, "ppt/slideLayouts/_rels/slideLayout1.xml.rels", Rels(new[] { new[] { "rId1", RelMaster, "../slideMasters/slideMaster1.xml" } }));
+                Entry(z, "ppt/slideLayouts/slideLayout1.xml", Xml + "<p:sldLayout xmlns:a=\"" + NsA + "\" xmlns:r=\"" + NsR + "\" xmlns:p=\"" + NsP + "\" type=\"blank\" preserve=\"1\">" +
+                    EmptyTree.Replace("<p:cSld>", "<p:cSld name=\"白紙\">") + "<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sldLayout>");
+                Entry(z, "ppt/theme/theme1.xml", Theme());
+
+                const long M = 457200;   // 余白 0.5 インチ
+                var layoutRel = new[] { "rId1", RelLayout, "../slideLayouts/slideLayout1.xml" };
+                Entry(z, "ppt/slides/_rels/slide1.xml.rels", Rels(new[] { layoutRel }));
+                Entry(z, "ppt/slides/slide1.xml", Slide(
+                    TextBox(2, "題", M, 2000000, SlideW - 2 * M, 1200000, doc.Title, 4000, true, "1F4E79") +
+                    TextBox(3, "概要", M, 3300000, SlideW - 2 * M, 1800000, doc.Summary + "\n\n手順: " + doc.Steps.Count, 2000, false, "404040")));
+                int n = 0;
+                foreach (Manual.Step s in doc.Steps)
+                {
+                    n++;
+                    int slide = n + 1;
+                    string media = "image" + n + ".png";
+                    EntryFile(z, "ppt/media/" + media, images[s.Image]);
+                    Entry(z, "ppt/slides/_rels/slide" + slide + ".xml.rels", Rels(new[] { layoutRel, new[] { "rId2", RelImage, "../media/" + media } }));
+                    // 左に画像（幅 64%）、右に説明
+                    long top = 1150000, boxW = (long)(SlideW * 0.64), boxH = SlideH - top - M;
+                    Size sz = ImageSize(images[s.Image]);
+                    double k = Math.Min(boxW / (double)sz.Width, boxH / (double)sz.Height);
+                    long cx = (long)(sz.Width * k), cy = (long)(sz.Height * k);
+                    long textX = M + boxW + 250000;
+                    Entry(z, "ppt/slides/slide" + slide + ".xml", Slide(
+                        TextBox(2, "見出し", M, 300000, SlideW - 2 * M, 750000, n + ". " + s.Head, 2800, true, "1F4E79") +
+                        Picture(3, "rId2", M, top, cx, cy) +
+                        TextBox(4, "説明", textX, top, SlideW - textX - M, boxH, s.Body, 1600, false, "262626")));
+                }
+            }
+        }
+    }
+
+    // 画像の AI 解析の確認: 画像を送る前に毎回、AI の設定を確かめる。本人の許可（アカウント・プラン・モデル）とも合わなければ送らない
+    static class ImageAi
+    {
+        public class Item { public string Name, Value; public bool Ok; }
+        public static readonly string[] Models = { "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5" };
+        public const string PrivacyUrl = "https://claude.ai/settings/data-privacy-controls";
+
+        // 許可を覚えておくときの鍵（どれかが変わったら、もう一度確かめてもらう）
+        public static string Key(ClaudeCli.Auth a, Settings s)
+        {
+            return a == null ? "" : a.Email + "|" + a.Org + "|" + a.Plan + "|" + s.Model;
+        }
+
+        // 確かめた項目の一覧（数秒かかるので画面のスレッドでは呼ばない）
+        public static List<Item> Run(Settings s, out string key)
+        {
+            var list = new List<Item>();
+            key = "";
+            Action<string, bool, string> add = (n, ok, v) => list.Add(new Item { Name = n, Ok = ok, Value = v });
+            string exe;
+            ClaudeCli.Auth a;
+            string problem = ClaudeCli.Problem(s, out exe, out a);
+            add("Claude Code", exe != null, exe ?? "見つかりません");
+            if (exe != null)
+            {
+                string v = ClaudeCli.Version(exe).Trim();
+                add("本物の Claude Code か（--version）", v.IndexOf("Claude Code", StringComparison.OrdinalIgnoreCase) >= 0, v);
+            }
+            add("ログイン", a != null && a.LoggedIn, a == null ? (problem ?? "確かめられません") : a.LoggedIn ? "している" : "していない");
+            if (a != null && a.LoggedIn)
+            {
+                add("ログインの種類", a.Method == "claude.ai", a.Method == "claude.ai" ? "claude.ai のプラン（API の従量課金ではない）" : a.Method + "（API の従量課金になるため使わない）");
+                add("アカウント", a.Email.Length > 0, a.Email + (a.Org.Length > 0 ? "（" + a.Org + "）" : ""));
+                add("プラン", a.Plan.Length > 0, a.Plan.Length > 0 ? a.Plan : "分かりません");
+            }
+            bool envKey = ClaudeCli.StripEnv.Any(n => !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(n)) || !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(n, EnvironmentVariableTarget.User)));
+            add("API キーの環境変数", true, envKey ? "あり（外して呼ぶので使わない）" : "なし");
+            add("モデル", Models.Contains(s.Model), s.Model + (Models.Contains(s.Model) ? "" : "（一覧にない名前）"));
+            add("ツール", true, "使わせない（画像と文を渡して、返事の文だけを受け取る）");
+            add("送る画像", true, "ブースト: 長い辺 " + Shots.BoostWidth + "・最大 " + Shots.BoostMax + " 枚／マニュアル作成: 長い辺 " + Shots.ManualAiWidth + "・最大 " + Shots.ManualAiMax + " 枚。送ったら消す（マニュアル作成の画像は残す）");
+            add("伏せ字", true, "タイトルと読んだ文字は伏せる語を外す。画像の中は伏せられない。「タイトルを伏せるプロセス」「集計しないプロセス」はブーストで撮らない");
+            if (a != null) key = Key(a, s);
+            return list;
+        }
+
+        // 画像を送ってよいか（よければ null）。本人の許可とアカウント・プラン・モデルが合っていて、ほかの項目もすべてよいとき
+        public static string Problem(Settings s)
+        {
+            if (s.ImageAiOk.Length == 0) return "画像の AI 解析の確認がまだです（設定のタブ「画面」）";
+            string key;
+            List<Item> list = Run(s, out key);
+            Item bad = list.FirstOrDefault(x => !x.Ok);
+            if (bad != null) return bad.Name + ": " + bad.Value;
+            if (key != s.ImageAiOk) return "許可したときとアカウント・プラン・モデルが変わりました。もう一度確かめてください（設定のタブ「画面」）";
+            return null;
+        }
+    }
+
+    // 画像の AI 解析の確認の画面: 項目をすべて確かめ、本人が Claude のデータの設定も見たら許可する
+    class ImageAiForm : Form
+    {
+        readonly ListView list = new ListView();
+        readonly CheckBox seen = new CheckBox { Text = "上の内容と、Claude のデータの設定（モデルの改善への協力など）を確かめた", AutoSize = true, Margin = new Padding(3, 8, 3, 3) };
+        readonly Button ok, recheck;
+        readonly Label status = new Label { AutoSize = true, Margin = new Padding(3, 8, 3, 3) };
+        string key = "";
+        bool allOk;
+
+        public ImageAiForm(Icon icon)
+        {
+            Text = "画像の AI 解析の確認";
+            Icon = icon;
+            AutoScaleDimensions = new SizeF(96f, 96f);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            Font = new Font("Meiryo UI", 10f);
+            ClientSize = new Size(820, 470);
+            MinimumSize = new Size(600, 380);
+            StartPosition = FormStartPosition.CenterScreen;
+            TopMost = true;
+
+            var head = new Label { Dock = DockStyle.Top, Height = 48, Padding = new Padding(8, 6, 8, 0),
+                Text = "ブーストとマニュアル作成では、画面の画像を AI（Claude）に送ります。送る前に毎回この項目を確かめ、どれかが違うときは送りません。" };
+            list.View = View.Details;
+            list.FullRowSelect = true;
+            list.Dock = DockStyle.Fill;
+            list.Columns.Add("No", 45, HorizontalAlignment.Right);
+            list.Columns.Add("結果", 60);
+            list.Columns.Add("項目", 220);
+            list.Columns.Add("内容", 470);
+            ListSorter.Enable(list);
+
+            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false, Padding = new Padding(6) };
+            var privacy = new LinkLabel { Text = "Claude のデータの設定を開く（" + ImageAi.PrivacyUrl + "）", AutoSize = true, Margin = new Padding(3, 6, 3, 0) };
+            privacy.LinkClicked += (o, e) => { try { Process.Start(ImageAi.PrivacyUrl); } catch (Exception ex) { status.Text = "開けませんでした: " + ex.Message; } };
+            bottom.Controls.Add(privacy);
+            bottom.Controls.Add(seen);
+            bottom.Controls.Add(status);
+            var bar = new FlowLayoutPanel { AutoSize = true, WrapContents = false };
+            ok = new Button { Text = "画像の AI 解析を許可", AutoSize = true, Enabled = false, Padding = new Padding(8, 2, 8, 2) };
+            ok.Click += (o, e) => { Settings.SetImageAiOk(key); DialogResult = DialogResult.OK; Close(); };
+            var no = new Button { Text = "許可しない", AutoSize = true, Padding = new Padding(8, 2, 8, 2) };
+            no.Click += (o, e) => { if (Settings.Get().ImageAiOk.Length > 0) Settings.SetImageAiOk(""); DialogResult = DialogResult.Cancel; Close(); };
+            recheck = new Button { Text = "再確認", AutoSize = true, Padding = new Padding(8, 2, 8, 2) };
+            recheck.Click += (o, e) => Check();
+            bar.Controls.Add(ok);
+            bar.Controls.Add(no);
+            bar.Controls.Add(recheck);
+            bottom.Controls.Add(bar);
+            seen.CheckedChanged += (o, e) => ok.Enabled = allOk && seen.Checked;
+
+            Controls.Add(list);
+            Controls.Add(head);
+            Controls.Add(bottom);
+            Shown += (o, e) => Check();
+        }
+
+        void Check()
+        {
+            recheck.Enabled = ok.Enabled = false;
+            status.ForeColor = SystemColors.ControlText;
+            status.Text = "確かめています…";
+            Settings s = Settings.Get();
+            var t = new Thread(() =>
+            {
+                string k;
+                List<ImageAi.Item> items;
+                try { items = ImageAi.Run(s, out k); }
+                catch (Exception ex) { items = new List<ImageAi.Item> { new ImageAi.Item { Name = "確認", Ok = false, Value = ex.Message } }; k = ""; }
+                if (IsDisposed) return;
+                BeginInvoke((Action)(() =>
+                {
+                    list.BeginUpdate();
+                    list.Items.Clear();
+                    foreach (ImageAi.Item x in items)
+                    {
+                        var it = new ListViewItem(new[] { (list.Items.Count + 1).ToString(), x.Ok ? "OK" : "NG", x.Name, x.Value });
+                        if (!x.Ok) it.ForeColor = Color.Firebrick;
+                        list.Items.Add(it);
+                    }
+                    list.EndUpdate();
+                    key = k;
+                    allOk = items.All(x => x.Ok) && k.Length > 0;
+                    bool same = allOk && s.ImageAiOk == k;
+                    status.ForeColor = allOk ? SystemColors.ControlText : Color.Firebrick;
+                    status.Text = !allOk ? "NG の項目があるため、画像は送りません" : same ? "許可済み（このアカウント・プラン・モデル）" : s.ImageAiOk.Length > 0 ? "許可したときから変わりました。確かめて許可してください" : "未許可";
+                    recheck.Enabled = true;
+                    ok.Enabled = allOk && seen.Checked;
+                }));
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+    }
+
+    // 記録中の表示: ブーストとマニュアル作成のあいだ、画面の右下に小さく出す（撮る画像には写らないようにする）
+    class RecIndicator : Form
+    {
+        [DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr h, uint affinity);
+        readonly Label text = new Label { AutoSize = true, ForeColor = Color.White, Padding = new Padding(8, 4, 8, 4), Font = new Font("Meiryo UI", 9.5f, FontStyle.Bold) };
+
+        public RecIndicator(Action click)
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            BackColor = Color.FromArgb(200, 40, 40);
+            Controls.Add(text);
+            text.Click += (o, e) => click();
+            Click += (o, e) => click();
+        }
+
+        protected override bool ShowWithoutActivation { get { return true; } }
+        protected override CreateParams CreateParams
+        {
+            get { CreateParams p = base.CreateParams; p.ExStyle |= 0x08000000 | 0x80; return p; }   // WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+        }
+
+        public void SetText(string s)
+        {
+            if (text.Text == s) return;
+            text.Text = s;
+            Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+            Location = new Point(wa.Right - PreferredSize.Width - 12, wa.Bottom - PreferredSize.Height - 12);
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            try { SetWindowDisplayAffinity(Handle, 0x11); } catch { }   // WDA_EXCLUDEFROMCAPTURE（Windows 10 2004 以降）
+        }
+    }
+
+    // 使用量の目安: ai_calls.log のトークンを、種類（日報・ブースト・マニュアル）ごとに、直近5時間と7日で合計する
+    // Pro の枠はトークン数が公開されていないので、settings.ini の UsageLimit5h・UsageLimitWeek（Sonnet に換算したトークン）を目安にする
+    static class Usage
+    {
+        public class Row { public string Kind; public long Tokens5h, TokensWeek; public double Eq5h, EqWeek; }
+
+        // モデルの重み（Sonnet を 1 とした料金の比）
+        public static double Weight(string models)
+        {
+            string m = (models ?? "").ToLowerInvariant();
+            if (m.Contains("opus")) return 5.0 / 3.0;
+            if (m.Contains("haiku")) return 1.0 / 3.0;
+            return 1.0;
+        }
+
+        public static string Kind(string result)
+        {
+            if (result.Contains("ブースト")) return "ブースト";
+            if (result.Contains("マニュアル")) return "マニュアル作成";
+            if (result.Contains("直す") || result.Contains("会話")) return "AIで直す";
+            return "日報";
+        }
+
+        public static List<Row> Sum(IEnumerable<string[]> log, DateTime now)
+        {
+            var rows = new Dictionary<string, Row>();
+            foreach (string k in new[] { "日報", "AIで直す", "ブースト", "マニュアル作成" }) rows[k] = new Row { Kind = k };
+            foreach (string[] p in log)
+            {
+                DateTime t;
+                long n;
+                if (p.Length < 8 || !DateTime.TryParseExact(p[0], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out t) || !long.TryParse(p[6], out n)) continue;
+                if (t < now.AddDays(-7) || t > now) continue;
+                Row r = rows[Kind(p[7])];
+                double eq = n * Weight(p[5]);
+                r.TokensWeek += n; r.EqWeek += eq;
+                if (t >= now.AddHours(-5)) { r.Tokens5h += n; r.Eq5h += eq; }
+            }
+            var list = rows.Values.ToList();
+            list.Add(new Row { Kind = "合計", Tokens5h = list.Sum(x => x.Tokens5h), TokensWeek = list.Sum(x => x.TokensWeek), Eq5h = list.Sum(x => x.Eq5h), EqWeek = list.Sum(x => x.EqWeek) });
+            return list;
         }
     }
 
@@ -5852,6 +7423,39 @@ namespace WorkLog
                 "2026-01-05 13:40:00\t2026-01-05\ta.csv\tclaude\tx\tm\t1\t失敗: 利用枠\r\n" +
                 "2026-01-05 16:50:00\t2026-01-05\ta.csv\tclaude\tx\tm\t1\t成功（追記）\r\n", new UTF8Encoding(true));
             return date;
+        }
+
+        // マニュアルの見本（AI を使わない。Word と PowerPoint を作る）。作ったファイルを返す
+        public static string[] ManualSample(string dir)
+        {
+            string img = Path.Combine(dir, "画像");
+            Directory.CreateDirectory(img);
+            var images = new Dictionary<int, string>();
+            Color[] colors = { Color.SteelBlue, Color.SeaGreen, Color.IndianRed };
+            for (int i = 1; i <= 3; i++)
+            {
+                string p = Path.Combine(img, i.ToString("000") + ".png");
+                using (var b = new Bitmap(i == 2 ? 600 : 1280, i == 2 ? 900 : 720))
+                {
+                    using (Graphics g = Graphics.FromImage(b))
+                    {
+                        g.Clear(Color.White);
+                        g.FillRectangle(new SolidBrush(colors[i - 1]), 0, 0, b.Width, 60);
+                        using (var f = new Font(FontFamily.GenericSansSerif, 28f)) g.DrawString("画面 " + i + "  Sample window", f, Brushes.Black, 20, 100);
+                    }
+                    b.Save(p, System.Drawing.Imaging.ImageFormat.Png);
+                }
+                images[i] = p;
+            }
+            var doc = new Manual.Doc { Title = "図面の出し方（見本）", Summary = "図面を PDF にして共有フォルダに置く手順。\n& < > \" ' を含む文" };
+            doc.Steps.Add(new Manual.Step { Image = 1, Head = "印刷を開く", Body = "「ファイル」→「印刷」を押す。" });
+            doc.Steps.Add(new Manual.Step { Image = 2, Head = "縦長の画面", Body = "縦長の画像も枠に収まる。\n2行目" });
+            doc.Steps.Add(new Manual.Step { Image = 3, Head = "保存する", Body = "" });
+            string docx = Path.Combine(dir, "見本.docx"), pptx = Path.Combine(dir, "見本.pptx");
+            Office.Docx(docx, doc, images);
+            Office.Pptx(pptx, doc, images);
+            Core.WriteText(Path.Combine(dir, "見本.md"), Manual.Markdown(doc));
+            return new[] { docx, pptx };
         }
 
         public static int Run()
@@ -5939,6 +7543,65 @@ namespace WorkLog
             // ログからタスクを提案: 返事の読み取り
             List<TaskItem> sug = Tasks.ParseSuggest("雄冬ひび割れ解析\t雄冬,楢舘\n- つくば試験解析 | 三要素試験、性能試験結果まとめ\n\n「メール対応」\tOUTLOOK");
             eq("タスクの提案の読み取り", string.Join(" | ", sug.Select(t => t.Name + "=" + t.Keywords)), "雄冬ひび割れ解析=雄冬,楢舘 | つくば試験解析=三要素試験,性能試験結果まとめ | メール対応=OUTLOOK");
+
+            // 画面の文字（0.24.0）: 語の取り出し（日本語の空白を詰める・数字だけ・短いひらがな・伏せる語は除く）
+            Settings ws = Settings.FromText("MaskWords=〇〇建設");
+            eq("画面の語", string.Join(" ", Shots.Words("図 面 配 置 設 定  Layer01\n2026 の 12.5 〇〇建設 Layer01", ws)), "図面配置設定 Layer01");
+            // 知識: 返事の読み取り（形の違う矢印もそろえる・すでにあるものは除く）
+            List<string> kn = Knowledge.Parse("- [TREND-ONE] 図面配置設定 → 雄冬ひび割れ解析（図面作成）\nわかったこと:\n・[CRACK DETECTOR] 安倍修正 -> ひび割れ修正",
+                new[] { "- [TREND-ONE]  図面配置設定 →  雄冬ひび割れ解析（図面作成）" });
+            eq("知識の読み取り", string.Join(" | ", kn), "- [CRACK DETECTOR] 安倍修正 → ひび割れ修正");
+            Core.WriteText(Shots.KnowPath, "# 知識\r\n- [TREND-ONE] 図面配置設定 → 図面作成\r\n- [mspaint] 落書き → 私用（日報に入れない）\r\n");
+            eq("知識: その日のアプリの分だけ", Knowledge.For(new[] { "trend-one", "EXCEL" }).Trim(), "- [TREND-ONE] 図面配置設定 → 図面作成");
+            Core.WriteText(Shots.TextPath("2026-01-05"), "\"time\",\"process\",\"title\",\"words\"\r\n" +
+                "\"2026-01-05 09:10:00\",\"TREND-ONE\",\"雄冬.tdx\",\"図面配置設定 レイヤ\"\r\n\"2026-01-05 09:30:00\",\"TREND-ONE\",\"雄冬.tdx\",\"レイヤ 寸法\"\r\n" +
+                "\"2026-01-05 10:00:00\",\"OUTLOOK\",\"受信トレイ\",\"秘密\"\r\n");
+            eq("日報に渡す画面の語", Shots.Prompt("2026-01-05", Settings.FromText(""), new[] { "TREND-ONE" }, null).Replace("\n", " | "),
+                " |  | 画面に出ていた語（PC の中で読み取ったもの。誤りあり。作業の中身の手がかり）: | 09:10 [TREND-ONE] 雄冬.tdx: 図面配置設定 レイヤ 寸法 |  | " +
+                "覚えている手がかり（ブーストで画面を見て作ったもの。当てはまれば作業名・工程名に使う）: | - [TREND-ONE] 図面配置設定 → 図面作成");
+            eq("日報に渡す画面の語（より後）", Shots.Prompt("2026-01-05", Settings.FromText(""), new string[0], new DateTime(2026, 1, 5, 9, 20, 0)).Contains("レイヤ 寸法").ToString(), "True");
+            // 同じ画面かどうか
+            using (var b1 = new Bitmap(64, 48))
+            using (var b2 = new Bitmap(64, 48))
+            {
+                using (Graphics g = Graphics.FromImage(b1)) g.Clear(Color.White);
+                using (Graphics g = Graphics.FromImage(b2)) { g.Clear(Color.White); g.FillRectangle(Brushes.Black, 0, 0, 32, 48); }
+                eq("同じ画面", Shots.Same(Shots.Thumb(b1), Shots.Thumb(b1)) + " " + Shots.Same(Shots.Thumb(b1), Shots.Thumb(b2)), "True False");
+            }
+            // 画像の AI 解析: 許可がなければ送らない・許可の鍵はアカウント・組織・プラン・モデル
+            eq("画像の AI 解析: 許可なし", ImageAi.Problem(Settings.FromText("")), "画像の AI 解析の確認がまだです（設定のタブ「画面」）");
+            eq("画像の AI 解析: 許可の鍵", ImageAi.Key(new ClaudeCli.Auth { Email = "a@example.com", Org = "Org", Plan = "pro" }, Settings.FromText("Model=claude-haiku-5-5")), "a@example.com|Org|pro|claude-haiku-5-5");
+            eq("撮る状態: 聞く前は撮らない", Shots.State(Settings.FromText("ScreenRead=1")) + " " + Shots.State(Settings.FromText("ScreenRead=1\nScreenAsked=1")) + " " + Shots.State(Settings.FromText("ScreenRead=0\nScreenAsked=1")), "0 1 0");
+            // マニュアル: 返事の読み取り
+            Manual.Doc md = Manual.Parse("<題>図面の出し方</題>\n<概要>図面を PDF にする</概要>\n<手順 画像=\"2\">印刷を開く\n「ファイル」→「印刷」</手順>\n<手順 画像=3>PDF を選ぶ</手順>", "手順書");
+            eq("マニュアルの読み取り", md.Title + " / " + md.Summary + " / " + string.Join(" | ", md.Steps.Select(x => x.Image + ":" + x.Head + ":" + x.Body)),
+                "図面の出し方 / 図面を PDF にする / 2:印刷を開く:「ファイル」→「印刷」 | 3:PDF を選ぶ:");
+            // stream-json の結果の行
+            eq("画像つきの返事の読み取り", Convert.ToString(ClaudeCli.ParseResultLine("{\"type\":\"system\"}\n{\"type\":\"assistant\",\"message\":{}}\n{\"type\":\"result\",\"result\":\"赤\",\"is_error\":false}\n")["result"]), "赤");
+            // 使用量の目安（Haiku は Sonnet の 1/3 と数える。5時間より前は週だけ）
+            List<Usage.Row> ur = Usage.Sum(new[] {
+                new[] { "2026-01-05 09:00:00", "", "", "", "", "claude-haiku-5-5", "9000", "成功" },
+                new[] { "2026-01-05 09:30:00", "", "", "", "", "claude-haiku-5-5", "30000", "成功（ブースト 20枚）" },
+                new[] { "2026-01-04 09:00:00", "", "", "", "", "claude-sonnet-5-5", "1000", "成功（マニュアル 3枚）" },
+                new[] { "2025-12-01 09:00:00", "", "", "", "", "claude-haiku-5-5", "5000", "成功" } }, new DateTime(2026, 1, 5, 10, 0, 0));
+            eq("使用量の目安", string.Join(" | ", ur.Select(r => r.Kind + " " + r.Tokens5h + "/" + r.TokensWeek + " " + Math.Round(r.Eq5h) + "/" + Math.Round(r.EqWeek))),
+                "日報 9000/9000 3000/3000 | AIで直す 0/0 0/0 | ブースト 30000/30000 10000/10000 | マニュアル作成 0/1000 0/1000 | 合計 39000/40000 13000/14000");
+            // Word・PowerPoint の部品（XML として読めるか）
+            string sample = Path.Combine(Core.Dir, "manual_sample");
+            string[] made = ManualSample(sample);
+            foreach (string f in made)
+            {
+                string bad = null;
+                int parts = 0;
+                using (var z = System.IO.Compression.ZipFile.OpenRead(f))
+                    foreach (var en in z.Entries.Where(x => x.FullName.EndsWith(".xml") || x.FullName.EndsWith(".rels")))
+                    {
+                        parts++;
+                        try { using (Stream st = en.Open()) new System.Xml.XmlDocument().Load(st); }
+                        catch (Exception ex) { bad = en.FullName + ": " + ex.Message; }
+                    }
+                eq(Path.GetExtension(f) + " の部品", bad ?? (parts > 0 ? "OK" : "空"), "OK");
+            }
 
             // AIで直す（会話）: 返事と日報の案に分ける
             string reply, rep;
@@ -6071,6 +7734,38 @@ namespace WorkLog
                         }
                     }
                 }
+                return 0;
+            }
+
+            // テスト用: マニュアルの見本（Word・PowerPoint）を作り、文字認識も試して終わる（文字認識の結果は ocr.txt。使えなくても失敗にしない）
+            if (args.Length >= 2 && args[0] == "--manual-sample" && Core.Test)
+            {
+                SelfTest.ManualSample(args[1]);
+                string ocr;
+                try
+                {
+                    using (var b = new Bitmap(900, 200))
+                    {
+                        using (Graphics g = Graphics.FromImage(b))
+                        {
+                            g.Clear(Color.White);
+                            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                            using (var f = new Font("Segoe UI", 36f)) g.DrawString("WorkLog OCR test 2026", f, Brushes.Black, 20, 60);
+                        }
+                        string png = Path.Combine(args[1], "ocr.png");
+                        b.Save(png, System.Drawing.Imaging.ImageFormat.Png);
+                        // 常駐中と同じく、STA でないスレッドで読む
+                        string got = null;
+                        Exception err = null;
+                        var th = new Thread(() => { try { got = WinOcr.Read(png); } catch (Exception ex) { err = ex; } });
+                        th.Start();
+                        th.Join(60000);
+                        if (err != null) throw err;
+                        ocr = got ?? "（終わりません）";
+                    }
+                }
+                catch (Exception ex) { ocr = "（使えません）" + ex.ToString(); }
+                Core.WriteText(Path.Combine(args[1], "ocr.txt"), ocr);
                 return 0;
             }
 

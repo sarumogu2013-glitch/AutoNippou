@@ -49,7 +49,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.24.2";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.25.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -1598,6 +1598,14 @@ namespace WorkLog
         // 「AIで直す」（会話）: 利用者の頼みと、これまでの会話・真ん中の日報・md・作業ログを渡す。返事と、直した日報の案（直さないときは null）を返す
         public static string Chat(string date, string current, List<KeyValuePair<bool, string>> history, string message, string notes, Settings s, out string reply)
         {
+            string raw, ask;
+            return Chat(date, current, history, message, notes, s, out reply, out raw, out ask);
+        }
+
+        // raw: 整える前の案（勤務予定を広げたら TidyText で整え直す）。ask: 勤務予定の外の時刻があるときに利用者に聞く文
+        public static string Chat(string date, string current, List<KeyValuePair<bool, string>> history, string message, string notes, Settings s, out string reply, out string raw, out string ask)
+        {
+            raw = ask = null;
             string[] lines = current.Replace("\r\n", "\n").Split('\n');
             bool hasHeader = lines.Length > 0 && lines[0].StartsWith("日報");
             string header = hasHeader ? lines[0] : null;
@@ -1632,6 +1640,9 @@ namespace WorkLog
             if (report == null) return null;
             List<string> result = SplitLines((header != null ? header + "\n\n" : "") + Unnumber(StripHeader(report)));
             if (!message.Contains("休憩")) EnsureBreak(result, date, s);   // AI がうっかり休憩の行を落としたとき
+            raw = string.Join("\n", result);
+            TimeSpan nf, nt;
+            ask = OutsideQuestion(result, date, s, out nf, out nt);
             Tidy(result, date, s);
             return Number(string.Join("\n", result).TrimEnd() + "\n");
         }
@@ -1922,20 +1933,92 @@ namespace WorkLog
         static int Tidy(List<string> lines, string date, Settings s, string extra = null)
         {
             DateTime day = DateTime.ParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture);
-            bool plan = s.PlanOn(day);
+            TimeSpan pf, pt;
+            bool plan = PlanFor(date, s, out pf, out pt);
             TimeSpan? off = OffTime(date);   // 退勤した日は、終わりを退勤の時刻にする
+            if (off.HasValue && plan && pt > s.PlanTo && pt > off.Value) off = pt;   // その日だけ終業を延ばしたときは、そちらを優先
             // 退勤していない今日は、まだ終わっていないので終業までのすき間は埋めない（時刻を終業までに収めるだけ）
             bool fillEnd = off.HasValue || day < DateTime.Today;
-            return ConnectProcesses(lines, FixedLines(date, s, extra), plan ? s.PlanFrom : (TimeSpan?)null, off ?? (plan ? s.PlanTo : (TimeSpan?)null), fillEnd);
+            return ConnectProcesses(lines, FixedLines(date, s, extra), plan ? pf : (TimeSpan?)null, off ?? (plan ? pt : (TimeSpan?)null), fillEnd);
+        }
+
+        // ---- その日だけの勤務予定（0.25.0。AIで直す・手で追記で勤務予定の外の時刻を書いたとき、利用者が「はい」と言ったら広げる）----
+        static string PlanDayPath { get { return Path.Combine(Core.Dir, "勤務予定_日ごと.txt"); } }
+
+        // その日の勤務予定（勤務予定の日でなければ false）。その日だけの変更があればそちら
+        public static bool PlanFor(string date, Settings s, out TimeSpan from, out TimeSpan to)
+        {
+            from = s.PlanFrom; to = s.PlanTo;
+            DateTime day = DateTime.ParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture);
+            if (!s.PlanOn(day)) return false;
+            try
+            {
+                if (!File.Exists(PlanDayPath)) return true;
+                foreach (string raw in Core.ReadText(PlanDayPath).Split('\n'))
+                {
+                    string[] c = raw.Trim().Split('\t');
+                    TimeSpan a, b;
+                    if (c.Length >= 3 && c[0] == date && TimeSpan.TryParse(c[1], out a) && TimeSpan.TryParse(c[2], out b) && b > a) { from = a; to = b; }
+                }
+            }
+            catch (Exception ex) { Core.Error("勤務予定", ex.Message); }
+            return true;
+        }
+
+        public static void SetPlanDay(string date, TimeSpan from, TimeSpan to)
+        {
+            File.AppendAllText(PlanDayPath, date + "\t" + Hm(from) + "\t" + Hm(to) + "\r\n", new UTF8Encoding(false));
+        }
+
+        static readonly Regex TimeLineRe = new Regex(@"^\s*・\s*(?:\[\d+\]\s*)?(\d{1,2}):(\d{2})(?:\s*[〜~～\-]\s*(\d{1,2}):(\d{2}))?");
+
+        // 勤務予定の外の時刻（勤務予定の日だけ）。始業より早い始め・終業より遅い終わりを返す。なければ false
+        public static bool OutsidePlan(IEnumerable<string> lines, string date, Settings s, out TimeSpan? early, out TimeSpan? late)
+        {
+            early = late = null;
+            TimeSpan pf, pt;
+            if (!PlanFor(date, s, out pf, out pt)) return false;
+            foreach (string l in lines)
+            {
+                Match m = TimeLineRe.Match(l);
+                if (!m.Success) continue;
+                TimeSpan a = new TimeSpan(int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value), 0);
+                TimeSpan b = m.Groups[3].Success ? new TimeSpan(int.Parse(m.Groups[3].Value), int.Parse(m.Groups[4].Value), 0) : a;
+                if (a < pf && (!early.HasValue || a < early.Value)) early = a;
+                if (b > pt && (!late.HasValue || b > late.Value)) late = b;
+            }
+            return early.HasValue || late.HasValue;
+        }
+
+        // 勤務予定の外の時刻があるとき、利用者に聞く文（なければ null）
+        public static string OutsideQuestion(IEnumerable<string> lines, string date, Settings s, out TimeSpan from, out TimeSpan to)
+        {
+            TimeSpan? e, l;
+            PlanFor(date, s, out from, out to);
+            if (!OutsidePlan(lines, date, s, out e, out l)) return null;
+            string now = Hm(from) + "〜" + Hm(to);
+            if (e.HasValue) from = e.Value;
+            if (l.HasValue) to = l.Value;
+            DateTime day = DateTime.ParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture);
+            return "勤務予定（" + now + "）の外の時刻があります（" + (e.HasValue ? "始め " + Hm(e.Value) : "") + (e.HasValue && l.HasValue ? "・" : "") + (l.HasValue ? "終わり " + Hm(l.Value) : "") + "）。\n\n" +
+                day.ToString("M/d") + " だけ、勤務予定を " + Hm(from) + "〜" + Hm(to) + " にしますか？\n（いいえ: " + now + " の中に収めます）";
+        }
+
+        // 整える前の日報の文を整えて番号を付ける（勤務予定を広げたあとに整え直す）
+        public static string TidyText(string raw, string date)
+        {
+            List<string> lines = SplitLines(raw);
+            Tidy(lines, date, Settings.Get());
+            return Number(string.Join("\n", lines).TrimEnd() + "\n");
         }
 
         // AI への指示（勤務予定の日だけ）
         static string PlanRule(string date, Settings s)
         {
-            DateTime day = DateTime.ParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture);
             TimeSpan? off = OffTime(date);
-            return (s.PlanOn(day)
-                ? "- 勤務予定は " + s.PlanText + "。この外の時刻は書かない。始業から最初の PC の作業まで・最後の作業から終業までに操作がない時間は「" + OutsideWork + "」の工程として書く\n"
+            TimeSpan pf, pt;
+            return (PlanFor(date, s, out pf, out pt)
+                ? "- 勤務予定は " + Hm(pf) + "〜" + Hm(pt) + "。この外の時刻は書かない（利用者が勤務予定の外の時刻を頼んだときは、その時刻で書く）。始業から最初の PC の作業まで・最後の作業から終業までに操作がない時間は「" + OutsideWork + "」の工程として書く\n"
                 : "") +
                 (off.HasValue ? "- 退勤は " + Hm(off.Value) + "。最後の工程の終わりは退勤の時刻にする（終業の時刻より優先）\n" : "");
         }
@@ -2213,7 +2296,7 @@ namespace WorkLog
             lines.Insert(pos >= 0 ? pos : lastItem + 1, item);
         }
 
-        static List<string> SplitLines(string text) { return text.Replace("\r\n", "\n").Split('\n').ToList(); }
+        public static List<string> SplitLines(string text) { return text.Replace("\r\n", "\n").Split('\n').ToList(); }
 
         static readonly Regex RangeRe = new Regex(@"^・(\d{1,2}:\d{2})〜(\d{1,2}:\d{2})(.*)$");
 
@@ -4733,6 +4816,12 @@ namespace WorkLog
             SaveQuiet();   // 手で直していた本文を先に保存
             bool light;
             string item = Reporter.ManualItem(a, b, what, out light);
+            {
+                TimeSpan nf, nt;
+                string ask = Reporter.OutsideQuestion(new[] { item }, current, Settings.Get(), out nf, out nt);
+                if (ask != null && MessageBox.Show(this, ask, "勤務予定", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                    Reporter.SetPlanDay(current, nf, nt);
+            }
             bool inReport;
             try { inReport = Reporter.AddManual(current, item, light); }
             catch (Exception ex) { message.Text = "追記できませんでした: " + ex.Message; return; }
@@ -5336,15 +5425,26 @@ namespace WorkLog
             SetAiStatus("AI が応答中…", false);
             var t = new Thread(() =>
             {
-                string result = null, reply = null, error = null;
-                try { result = Reporter.Chat(date, sent, history, inst, noteText, Settings.Get(), out reply); }
+                string result = null, reply = null, error = null, raw = null, ask = null;
+                try { result = Reporter.Chat(date, sent, history, inst, noteText, Settings.Get(), out reply, out raw, out ask); }
                 catch (NeedLoginException ex) { error = ex.Message + "（ツール → AIの接続先）"; }
                 catch (Exception ex) { error = "AI エラー: " + ex.Message; Core.Error("AIで直す " + date, ex.Message); }
                 if (IsDisposed) return;
-                BeginInvoke((Action)(() => AiDone(date, sent, inst, result, reply, error)));
+                BeginInvoke((Action)(() => AiDone(date, sent, inst, AskPlan(date, result, raw, ask), reply, error)));
             });
             t.IsBackground = true;
             t.Start();
+        }
+
+        // 勤務予定の外の時刻があれば、その日だけ勤務予定を広げるか聞く。「はい」なら広げて整え直した案を返す
+        string AskPlan(string date, string result, string raw, string ask)
+        {
+            if (result == null || ask == null || raw == null) return result;
+            TimeSpan nf, nt;
+            Reporter.OutsideQuestion(Reporter.SplitLines(raw), date, Settings.Get(), out nf, out nt);
+            if (MessageBox.Show(this, ask, "勤務予定", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return result;
+            try { Reporter.SetPlanDay(date, nf, nt); return Reporter.TidyText(raw, date); }
+            catch (Exception ex) { Core.Error("勤務予定", ex.Message); return result; }
         }
 
         void AiDone(string date, string sent, string inst, string result, string reply, string error)
@@ -7978,6 +8078,24 @@ namespace WorkLog
             Core.MoveToFolders();
             eq("フォルダへ移す", File.Exists(Core.CsvPath("2026-01-04")) + " " + File.Exists(Core.ReportPath("2026-01-04")) + " " +
                File.Exists(Path.Combine(Core.Dir, "2026-01-04.csv")) + " " + File.Exists(Path.Combine(Core.Dir, "日報_2026-01-04.txt")), "True True False False");
+
+            // その日だけの勤務予定（0.25.0）: 勤務予定の外の時刻を見つけて聞き、広げたらその日だけその中で整える
+            Settings ps2 = Settings.FromText("PlanHours=08:30-17:30\nPlanDays=月火水木金");
+            string q;
+            TimeSpan qf, qt;
+            q = Reporter.OutsideQuestion(new[] { "■工程", "・[1] 07:30〜09:00 雄冬ひび割れ解析", "・[2] 09:00〜18:10 図面作成" }, "2026-01-07", ps2, out qf, out qt);
+            eq("勤務予定の外の時刻", (q != null) + " " + qf + " " + qt, "True 07:30:00 18:10:00");
+            eq("勤務予定の中なら聞かない", (Reporter.OutsideQuestion(new[] { "・08:30〜12:00 A" }, "2026-01-07", ps2, out qf, out qt) == null).ToString(), "True");
+            eq("勤務予定の日でなければ聞かない", (Reporter.OutsideQuestion(new[] { "・07:00〜12:00 A" }, "2026-01-10", ps2, out qf, out qt) == null).ToString(), "True");
+            Reporter.SetPlanDay("2026-01-07", new TimeSpan(7, 30, 0), new TimeSpan(17, 30, 0));
+            TimeSpan pf7, pt7;
+            Reporter.PlanFor("2026-01-07", ps2, out pf7, out pt7);
+            TimeSpan pf8, pt8;
+            Reporter.PlanFor("2026-01-08", ps2, out pf8, out pt8);
+            eq("その日だけの勤務予定", pf7 + "-" + pt7 + " / " + pf8 + "-" + pt8, "07:30:00-17:30:00 / 08:30:00-17:30:00");
+            var early = new List<string> { "■工程", "・07:30〜09:00 A", "・09:00〜17:30 B" };
+            Reporter.ConnectProcesses(early, new HashSet<string>(), pf7, pt7);
+            eq("広げた日は早い時刻を残す", string.Join(" | ", early), "■工程 | ・07:30〜09:00 A | ・09:00〜17:30 B");
 
             // 退勤の時刻: 見出しに入れる（同じ日にまた出勤したら外す）
             File.WriteAllText(Path.Combine(Core.Dir, "勤務履歴.log"), "on\t2026-01-05 08:05:00\r\noff\t2026-01-05 17:42:00\r\n", new UTF8Encoding(false));

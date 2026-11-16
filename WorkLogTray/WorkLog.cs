@@ -47,7 +47,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.22.1";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.23.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -693,6 +693,45 @@ namespace WorkLog
                 Predict(titles, s);
             }
             catch (Exception ex) { Core.Error("タスクの予測", ex.Message); }
+        }
+
+        // ログからタスクを提案する（AI）: 最近14日のウィンドウタイトルを渡し、業務のタスクの名前と「タイトルに出る語」を考えさせる。
+        // 今あるタスクは名前を変えず、語が空なら語を付ける。返すのは提案（名前・語）だけで、保存はしない
+        public static List<TaskItem> Suggest(Settings s)
+        {
+            List<KeyValuePair<TitleTask, int>> recent = RecentTitles(14, s).Where(x => x.Key.Title.Length > 0 && x.Value >= Math.Max(2, s.MinMinutes)).Take(150).ToList();
+            if (recent.Count == 0) throw new Exception("最近14日の記録がありません");
+            List<TaskItem> now = Load();
+            string prompt =
+                "以下は、ある人の最近14日の PC の作業記録（アプリとウィンドウタイトルごとの使った時間）です。\n" +
+                "日報に書く「業務のタスク」を整理して、タスクの名前と、そのタスクのウィンドウタイトルに出る語を考えてください。\n\n" +
+                "条件:\n" +
+                "- タスクは5〜15個。案件・現場・業務のまとまりごとに分け、名前は20文字程度で具体的に（例:「雄冬ひび割れ解析」「つくば試験解析」）\n" +
+                "- 語は、そのタスクのウィンドウタイトルにだけ出る言葉（ファイル名・フォルダ名・案件名・現場名の一部）を1〜4個。ほかのタスクにも出る語（Excel・Chrome・Claude など）は使わない。アプリ全体をそのタスクにするときだけアプリ名（例: OUTLOOK）を語にする\n" +
+                "- 私用・ニュース・天気・買い物・趣味と思われるものはタスクにしない\n" +
+                "- 今あるタスクは名前を変えずに出し、語を付ける（今の語があればそれも残す）\n" +
+                "- 出力は1行に1つ「名前<TAB>語,語」だけ（前置き・説明は不要）\n\n" +
+                "今あるタスク:\n" + (now.Count > 0 ? string.Concat(now.Where(t => !t.Done).Select(t => t.Name + "\t" + t.Keywords + "\n")) : "（なし）\n") + "\n" +
+                "作業記録（分 | アプリ | ウィンドウタイトル）:\n" + string.Concat(recent.Select(x => x.Value + " | " + Shown(x.Key, s) + "\n"));
+            string answer = ClaudeCli.Ask(prompt, s, DateTime.Today.ToString("yyyy-MM-dd"), "（タスクの提案）");
+            return ParseSuggest(answer);
+        }
+
+        // 「名前<TAB>語,語」（「名前 | 語,語」でもよい）の行を読む
+        public static List<TaskItem> ParseSuggest(string answer)
+        {
+            var list = new List<TaskItem>();
+            foreach (string raw in (answer ?? "").Replace("\r\n", "\n").Split('\n'))
+            {
+                string l = raw.Trim().TrimStart('-', '・', '*').Trim();
+                if (l.Length == 0) continue;
+                string[] c = l.Contains("\t") ? l.Split(new[] { '\t' }, 2) : l.Split(new[] { '|' }, 2);
+                string name = Clean(c[0]).Trim('「', '」');
+                if (name.Length == 0 || name.Length > 40) continue;
+                string words = c.Length > 1 ? string.Join(",", c[1].Split(',', '、', '，').Select(w => Clean(w)).Where(w => w.Length > 0)) : "";
+                if (!list.Any(x => x.Name == name)) list.Add(new TaskItem { Name = name, Keywords = words });
+            }
+            return list;
         }
 
         // AI に渡す決まり（終わっていないタスクがあるときだけ）
@@ -1767,6 +1806,8 @@ namespace WorkLog
 
         static string Hm(TimeSpan t) { return ((int)t.TotalHours).ToString("00") + ":" + t.Minutes.ToString("00"); }
 
+        static string WorkBase(string rest) { return Regex.Replace(rest ?? "", @"（[^）]*）|\([^)]*\)", "").Trim(); }
+
         // 動かさない工程の行（休憩・離席メモ・手で追記した行）
         static HashSet<string> FixedLines(string date, Settings s, string extra = null)
         {
@@ -1786,7 +1827,9 @@ namespace WorkLog
             DateTime day = DateTime.ParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture);
             bool plan = s.PlanOn(day);
             TimeSpan? off = OffTime(date);   // 退勤した日は、終わりを退勤の時刻にする
-            return ConnectProcesses(lines, FixedLines(date, s, extra), plan ? s.PlanFrom : (TimeSpan?)null, off ?? (plan ? s.PlanTo : (TimeSpan?)null));
+            // 退勤していない今日は、まだ終わっていないので終業までのすき間は埋めない（時刻を終業までに収めるだけ）
+            bool fillEnd = off.HasValue || day < DateTime.Today;
+            return ConnectProcesses(lines, FixedLines(date, s, extra), plan ? s.PlanFrom : (TimeSpan?)null, off ?? (plan ? s.PlanTo : (TimeSpan?)null), fillEnd);
         }
 
         // AI への指示（勤務予定の日だけ）
@@ -1801,7 +1844,8 @@ namespace WorkLog
         }
 
         // from・to（勤務予定）があれば、工程・軽作業の時刻をその中に収め、始業・終業までのすき間を埋める
-        public static int ConnectProcesses(List<string> lines, ICollection<string> fixedLines, TimeSpan? from = null, TimeSpan? to = null)
+        // 自動で入れた埋めの行（「現場（外勤）」「軽作業」）は、そろえるたびに外して入れ直す（動かさない行は除く）
+        public static int ConnectProcesses(List<string> lines, ICollection<string> fixedLines, TimeSpan? from = null, TimeSpan? to = null, bool fillEnd = true)
         {
             int clamped = from.HasValue || to.HasValue ? ClampLight(lines, from, to) : 0;
             int h = lines.FindIndex(l => l.Trim().StartsWith("■") && l.Contains("工程"));
@@ -1810,12 +1854,18 @@ namespace WorkLog
             while (end < lines.Count && !lines[end].Trim().StartsWith("■")) end++;
             var items = new List<Proc>();
             var others = new List<string>();
-            int blanks = 0;
+            int blanks = 0, removed = 0;
             for (int i = h + 1; i < end; i++)
             {
                 string l = Unnumber(lines[i]).Trim();
                 Match m = RangeRe.Match(l);
-                if (m.Success) items.Add(new Proc { A = Clock(m.Groups[1].Value), B = Clock(m.Groups[2].Value), Rest = m.Groups[3].Value, Orig = l, Fixed = fixedLines.Contains(l) });
+                if (m.Success)
+                {
+                    string rest = m.Groups[3].Value.Trim();
+                    bool fixd = fixedLines.Contains(l);
+                    if (!fixd && (rest == OutsideWork || rest == LightOnly)) { removed++; continue; }   // 埋めの行は入れ直す
+                    items.Add(new Proc { A = Clock(m.Groups[1].Value), B = Clock(m.Groups[2].Value), Rest = " " + rest, Orig = l, Fixed = fixd });
+                }
                 else if (l.Length == 0) blanks++;
                 else if (l != "・なし") others.Add(l);
             }
@@ -1826,10 +1876,10 @@ namespace WorkLog
             }
             if (items.Count == 0)
             {
-                if (clamped == 0) return 0;
+                if (clamped == 0 && removed == 0) return 0;
                 lines.RemoveRange(h + 1, end - h - 1);
                 lines.InsertRange(h + 1, others.Concat(Enumerable.Repeat("", blanks)));
-                return clamped;
+                return clamped + removed;
             }
             items = items.OrderBy(x => x.A).ThenBy(x => x.B).ToList();
             var result = new List<Proc> { items[0] };
@@ -1837,7 +1887,10 @@ namespace WorkLog
             {
                 Proc prev = result[result.Count - 1], next = items[i];
                 TimeSpan gap = next.A - prev.B;
-                if (gap >= TimeSpan.FromMinutes(GapLight))
+                // 前後が同じ作業（（ ）の補足は除いて比べる）なら、すき間があっても前の工程を延ばしてつなげる
+                if (gap > TimeSpan.Zero && !prev.Fixed && !next.Fixed && WorkBase(prev.Rest) == WorkBase(next.Rest))
+                    prev.B = next.A;
+                else if (gap >= TimeSpan.FromMinutes(GapLight))
                     result.Add(new Proc { A = prev.B, B = next.A, Rest = " " + LightOnly });
                 else if (gap != TimeSpan.Zero)
                 {
@@ -1854,14 +1907,15 @@ namespace WorkLog
                     if (first.A - from.Value >= TimeSpan.FromMinutes(GapLight)) result.Insert(0, new Proc { A = from.Value, B = first.A, Rest = " " + OutsideWork });
                     else if (!first.Fixed) first.A = from.Value;
                 }
-                if (to.HasValue && last.B < to.Value)
+                if (fillEnd && to.HasValue && last.B < to.Value)
                 {
                     if (to.Value - last.B >= TimeSpan.FromMinutes(GapLight)) result.Add(new Proc { A = last.B, B = to.Value, Rest = " " + OutsideWork });
                     else if (!last.Fixed) last.B = to.Value;
                 }
             }
             var built = result.Select(x => "・" + Hm(x.A) + "〜" + Hm(x.B) + x.Rest).ToList();
-            int changed = clamped + result.Count(x => x.Orig == null) + result.Count(x => x.Orig != null && x.Orig != "・" + Hm(x.A) + "〜" + Hm(x.B) + x.Rest);
+            int changed = clamped + result.Count(x => x.Orig != null && x.Orig != "・" + Hm(x.A) + "〜" + Hm(x.B) + x.Rest) +
+                          Math.Abs(result.Count(x => x.Orig == null) - removed);
             lines.RemoveRange(h + 1, end - h - 1);
             lines.InsertRange(h + 1, built.Concat(others).Concat(Enumerable.Repeat("", blanks)));
             return changed;
@@ -3710,6 +3764,71 @@ namespace WorkLog
         }
     }
 
+    // ログからタスクを提案（AI）の結果: 印を付けたものをタスクに足す（今あるタスクは、語が空なら語を入れる）
+    class TaskSuggestForm : Form
+    {
+        readonly DataGridView grid = new DataGridView();
+        public int Added;
+
+        public TaskSuggestForm(Icon icon, List<TaskItem> proposals)
+        {
+            Text = "ログからタスクを提案";
+            Icon = icon;
+            AutoScaleDimensions = new SizeF(96f, 96f);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            Font = new Font("Meiryo UI", 10f);
+            ClientSize = new Size(760, 460);
+            StartPosition = FormStartPosition.CenterParent;
+            List<TaskItem> now = Tasks.Load();
+            grid.Dock = DockStyle.Fill;
+            grid.BackgroundColor = SystemColors.Window;
+            grid.RowHeadersVisible = false;
+            grid.AllowUserToAddRows = false;
+            grid.AllowUserToResizeRows = false;
+            grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            grid.Columns.Add(GridSort.NoColumn());
+            grid.Columns.Add(new DataGridViewCheckBoxColumn { HeaderText = "追加", AutoSizeMode = DataGridViewAutoSizeColumnMode.ColumnHeader });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タスク", FillWeight = 40 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "タイトルに出る語", FillWeight = 50 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "", ReadOnly = true, AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells });
+            GridSort.Enable(grid);
+            int no = 0;
+            foreach (TaskItem p in proposals)
+            {
+                TaskItem cur = now.FirstOrDefault(t => t.Name == p.Name);
+                string note = cur == null ? "新しい" : cur.Keywords.Length == 0 ? "語を付ける" : "あり";
+                int i = grid.Rows.Add(null, cur == null || cur.Keywords.Length == 0, p.Name, p.Keywords, note);
+                GridSort.Set(grid.Rows[i].Cells[0], ++no, no);
+            }
+            var bar = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, Padding = new Padding(6, 6, 6, 4), FlowDirection = FlowDirection.RightToLeft };
+            var close = new Button { Text = "閉じる", AutoSize = true, DialogResult = DialogResult.Cancel };
+            var add = new Button { Text = "印を付けたものを追加", AutoSize = true };
+            add.Font = new Font(Font, FontStyle.Bold);
+            add.Click += (o, e) => { Apply(); DialogResult = DialogResult.OK; Close(); };
+            bar.Controls.Add(close);
+            bar.Controls.Add(add);
+            Controls.Add(grid);
+            Controls.Add(bar);
+            CancelButton = close;
+        }
+
+        void Apply()
+        {
+            grid.EndEdit();
+            List<TaskItem> list = Tasks.Load();
+            foreach (DataGridViewRow r in grid.Rows)
+            {
+                if (!(r.Cells[1].Value is bool && (bool)r.Cells[1].Value)) continue;
+                string name = Convert.ToString(r.Cells[2].Value).Trim(), words = Convert.ToString(r.Cells[3].Value).Trim();
+                if (name.Length == 0) continue;
+                TaskItem cur = list.FirstOrDefault(t => t.Name == name);
+                if (cur == null) { list.Add(new TaskItem { Name = name, Keywords = words }); Added++; }
+                else if (cur.Keywords.Length == 0 && words.Length > 0) { cur.Keywords = words; Added++; }
+            }
+            Tasks.Save(list);
+        }
+    }
+
     // 表の並べ替え: 見出しのクリックで並べ替える。No 列（元の並び順）の見出しで元に戻せる。
     // セルの Tag に値（分・日時など）があればそれで比べる。チェックの列は印の有無で比べる
     static class GridSort
@@ -4119,7 +4238,9 @@ namespace WorkLog
             taskGrid.CellValueChanged += (o, e) => { if (e.ColumnIndex == 1 || e.ColumnIndex == 2 || e.ColumnIndex == 5) SaveTasks(); };
             taskGrid.UserDeletedRow += (o, e) => SaveTasks();
             taskInfo.MaximumSize = new Size(0, 0);
-            Control[] rows = { title, titlesBtn, taskGrid, taskInfo };
+            var suggestBtn = new Button { Text = "ログからタスクを提案（AI）…", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(6, 2, 6, 2), Margin = new Padding(3, 0, 3, 4) };
+            suggestBtn.Click += (o, e) => SuggestTasks(suggestBtn);
+            Control[] rows = { title, titlesBtn, suggestBtn, taskGrid, taskInfo };
             foreach (Control c in rows)
             {
                 p.RowStyles.Add(c == taskGrid ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.AutoSize));
@@ -4127,6 +4248,32 @@ namespace WorkLog
             }
             LoadTasks();
             return p;
+        }
+
+        // ログからタスクを提案（AI。数十秒かかるので別スレッドで）
+        void SuggestTasks(Button b)
+        {
+            b.Enabled = false;
+            taskInfo.ForeColor = Color.DimGray;
+            taskInfo.Text = "AI が提案中…";
+            var th = new Thread(() =>
+            {
+                List<TaskItem> list = null;
+                string error = null;
+                try { list = Tasks.Suggest(Settings.Get()); }
+                catch (Exception ex) { error = ex.Message; Core.Error("タスクの提案", ex.Message); }
+                if (IsDisposed) return;
+                BeginInvoke((Action)(() =>
+                {
+                    b.Enabled = true;
+                    if (error != null || list == null || list.Count == 0) { UpdateTaskInfo(); taskInfo.ForeColor = Color.Firebrick; taskInfo.Text = "提案できません: " + (error ?? "提案がありません"); return; }
+                    using (var f = new TaskSuggestForm(Icon, list))
+                        if (f.ShowDialog(this) == DialogResult.OK) LoadTasks();
+                    UpdateTaskInfo();
+                }));
+            });
+            th.IsBackground = true;
+            th.Start();
         }
 
         void LoadTasks()
@@ -5778,6 +5925,20 @@ namespace WorkLog
             Settings ps = Settings.FromText("PlanHours=09:00-18:00\r\nPlanDays=月水金\r\n");
             eq("勤務予定の設定", ps.PlanText + " " + ps.PlanDaysText + " " + ps.PlanOn(new DateTime(2026, 11, 11)) + " " + ps.PlanOn(new DateTime(2026, 11, 12)), "09:00〜18:00 月水金 True False");
             eq("勤務予定の既定", new Settings().PlanText + " " + new Settings().PlanDaysText, "08:30〜17:30 月火水木金");
+
+            // 今日の日報（11-16 の例）: 自動で入れた外勤・軽作業の行は入れ直す・終業までは埋めない・同じ作業のすき間はつなげる
+            var today1 = new List<string> { "■工程", "・08:30〜08:44 軽作業", "・08:44〜09:09 つくば試験解析", "・09:09〜09:28 雄冬ひび割れ解析", "・09:28〜10:23 現場（外勤）",
+                "・10:23〜10:27 軽作業", "・10:27〜10:35 現場（外勤）", "・10:35〜11:28 雄冬ひび割れ解析（座標・レベル設定）", "・11:28〜12:00 軽作業", "・12:00〜13:00 休憩", "・13:00〜17:30 現場（外勤）" };
+            Reporter.ConnectProcesses(today1, new HashSet<string> { "・12:00〜13:00 休憩" }, new TimeSpan(8, 30, 0), new TimeSpan(17, 30, 0), false);
+            eq("今日の日報: 外勤を入れ直す", string.Join(" | ", today1),
+               "■工程 | ・08:30〜09:09 つくば試験解析 | ・09:09〜10:35 雄冬ひび割れ解析 | ・10:35〜11:28 雄冬ひび割れ解析（座標・レベル設定） | ・11:28〜12:00 軽作業 | ・12:00〜13:00 休憩");
+            var nospace = new List<string> { "■工程", "・09:42〜12:00雄冬ひび割れ解析" };
+            Reporter.ConnectProcesses(nospace, new HashSet<string>());
+            eq("時刻と内容のあいだの空白", string.Join(" | ", nospace), "■工程 | ・09:42〜12:00 雄冬ひび割れ解析");
+
+            // ログからタスクを提案: 返事の読み取り
+            List<TaskItem> sug = Tasks.ParseSuggest("雄冬ひび割れ解析\t雄冬,楢舘\n- つくば試験解析 | 三要素試験、性能試験結果まとめ\n\n「メール対応」\tOUTLOOK");
+            eq("タスクの提案の読み取り", string.Join(" | ", sug.Select(t => t.Name + "=" + t.Keywords)), "雄冬ひび割れ解析=雄冬,楢舘 | つくば試験解析=三要素試験,性能試験結果まとめ | メール対応=OUTLOOK");
 
             // AIで直す（会話）: 返事と日報の案に分ける
             string reply, rep;

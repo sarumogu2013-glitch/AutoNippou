@@ -116,6 +116,11 @@ jobs:
           $null = $p.Handle
           if (-not $p.WaitForExit(60000)) { throw '終わらない' }
           if ($p.ExitCode -ne 0) { throw "設定画面の画像を作れなかった（$($p.ExitCode)）" }
+          # 使用量の計測の画面
+          $p = Start-Process WorkLogTray/WorkLog.exe -ArgumentList '--screenshot-usage', (Join-Path $env:RUNNER_TEMP 'usage.png') -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(60000)) { throw '終わらない' }
+          if ($p.ExitCode -ne 0) { throw "使用量の画面の画像を作れなかった（$($p.ExitCode)）" }
           # マニュアルの見本（Word・PowerPoint）と文字認識の結果
           $p = Start-Process WorkLogTray/WorkLog.exe -ArgumentList '--manual-sample', (Join-Path $env:RUNNER_TEMP 'manual') -PassThru
           $null = $p.Handle
@@ -130,6 +135,7 @@ jobs:
           path: |
             ${{ runner.temp }}/about.png
             ${{ runner.temp }}/timeline.png
+            ${{ runner.temp }}/usage.png
             ${{ runner.temp }}/settings/*.png
             ${{ runner.temp }}/manual/*.docx
             ${{ runner.temp }}/manual/*.pptx
@@ -142,7 +148,7 @@ jobs:
         run: |
           $d = Join-Path $env:RUNNER_TEMP 'shots-repo'
           New-Item -ItemType Directory -Force $d | Out-Null
-          Copy-Item (Join-Path $env:RUNNER_TEMP 'about.png'), (Join-Path $env:RUNNER_TEMP 'timeline.png') $d
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'about.png'), (Join-Path $env:RUNNER_TEMP 'timeline.png'), (Join-Path $env:RUNNER_TEMP 'usage.png') $d
           Copy-Item (Join-Path $env:RUNNER_TEMP 'settings\*.png') $d
           Copy-Item (Join-Path $env:RUNNER_TEMP 'manual\*.docx'), (Join-Path $env:RUNNER_TEMP 'manual\*.pptx'), (Join-Path $env:RUNNER_TEMP 'manual\ocr.txt') $d
           Set-Location $d

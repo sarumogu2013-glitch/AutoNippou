@@ -14,6 +14,7 @@
 //   --screenshot-settings <dir>  テスト中だけ: 設定画面の各タブを画像にして終わる
 //   --screenshot-timeline <png>  テスト中だけ: 日報画面の帯（テスト用の日）を画像にして終わる
 //   --manual-sample <dir>  テスト中だけ: マニュアルの見本（Word・PowerPoint）と文字認識の結果（ocr.txt）を作って終わる
+//   --screenshot-usage <png>  テスト中だけ: 使用量の計測の画面を画像にして終わる
 //   --selftest           テスト中だけ: 日報の書式を直す処理を確かめる（0=期待どおり 1=違う）
 //   --check-update [--apply]  テスト中（WORKLOG_TEST）だけ: 更新を確かめて落とす（--apply で入れ替えも）。0=最新 10=更新あり 2=失敗
 // 動作確認用の環境変数: WORKLOG_TEST=保存先フォルダ（二重起動防止を本番と分け、スタートアップ登録を無効にする）
@@ -48,7 +49,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.24.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.24.1";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -222,6 +223,16 @@ namespace WorkLog
             lock (cacheLock) s = Parse(File.Exists(FilePath) ? Core.ReadText(FilePath) : "");
             s.ScreenRead = on;
             s.ScreenAsked = true;
+            Save(s);
+        }
+
+        // 使用量の目安の枠だけを書き換える（使用量の計測から）
+        public static void SetUsageLimits(long l5, long lw)
+        {
+            Settings s;
+            lock (cacheLock) s = Parse(File.Exists(FilePath) ? Core.ReadText(FilePath) : "");
+            s.UsageLimit5h = l5;
+            s.UsageLimitWeek = lw;
             Save(s);
         }
 
@@ -2722,7 +2733,8 @@ namespace WorkLog
         readonly SynchronizationContext ui;
         readonly System.Windows.Forms.Timer afkTimer = new System.Windows.Forms.Timer();
         readonly System.Windows.Forms.Timer shotTimer = new System.Windows.Forms.Timer();   // 画面の文字・ブースト・マニュアル作成（1秒ごと）
-        ToolStripMenuItem boostItem, manualItem, screenItem;
+        ToolStripMenuItem boostItem, manualItem, screenItem, usageItem;
+        UsageForm usageForm;
         RecIndicator indicator;
         int shotState = -1;
         readonly Dictionary<string, Icon> icons = new Dictionary<string, Icon>();
@@ -2757,6 +2769,8 @@ namespace WorkLog
             menu.Items.Add(boostItem);
             manualItem = new ToolStripMenuItem("マニュアル作成を始める", null, (o, e) => ToggleManual()) { Visible = false };   // Shift を押しながら開いたときだけ出す
             menu.Items.Add(manualItem);
+            usageItem = new ToolStripMenuItem("使用量の計測…", null, (o, e) => ShowUsage()) { Visible = false };   // Shift を押しながら開いたときだけ出す
+            menu.Items.Add(usageItem);
             menu.Items.Add(new ToolStripSeparator());
             dutyItem = new ToolStripMenuItem("退勤", null, (o, e) => ToggleDuty());
             menu.Items.Add(dutyItem);
@@ -2773,6 +2787,7 @@ namespace WorkLog
                 boostItem.Enabled = !Shots.ManualOn;
                 screenItem.Checked = Settings.Get().ScreenRead && Settings.Get().ScreenAsked;
                 manualItem.Visible = Shots.ManualOn || (Control.ModifierKeys & Keys.Shift) != 0;
+                usageItem.Visible = (Control.ModifierKeys & Keys.Shift) != 0;
                 manualItem.Text = Shots.ManualOn ? "マニュアル作成を終える…" : "マニュアル作成を始める";
             };
 
@@ -3306,6 +3321,13 @@ namespace WorkLog
             UpdateShotUi(true);
         }
 
+        void ShowUsage()
+        {
+            if (usageForm == null || usageForm.IsDisposed) usageForm = new UsageForm(icon);
+            usageForm.Show();
+            usageForm.Activate();
+        }
+
         // 画面を撮る（文字を読む）のオン・オフ
         void ToggleScreen()
         {
@@ -3467,6 +3489,7 @@ namespace WorkLog
             if (aiForm != null && !aiForm.IsDisposed) aiForm.Dispose();
             if (settingsForm != null && !settingsForm.IsDisposed) settingsForm.Dispose();
             if (askForm != null && !askForm.IsDisposed) askForm.Dispose();
+            if (usageForm != null && !usageForm.IsDisposed) usageForm.Dispose();
             afkTimer.Stop();
             shotTimer.Stop();
             if (indicator != null && !indicator.IsDisposed) indicator.Dispose();
@@ -7357,6 +7380,289 @@ namespace WorkLog
         }
     }
 
+    // 使用量の計測（隠しメニュー）: 日ごと・種類ごとの量と、/usage の % から Pro の枠を逆算する
+    static class UsageMeter
+    {
+        public class Call { public DateTime Time; public string Kind, Model; public long Tokens; public double Eq; }
+        public class Day { public string Date; public int Calls; public Dictionary<string, long> ByKind = new Dictionary<string, long>(); public long Tokens; public double Eq; }
+        public class Measure { public DateTime From, To; public double P5From, P5To, PwFrom, PwTo; public long Tokens; public double Eq; }
+
+        static string PathOf { get { return Path.Combine(Core.Dir, "使用量の計測.txt"); } }
+
+        public static List<Call> Calls(IEnumerable<string[]> log)
+        {
+            var list = new List<Call>();
+            foreach (string[] p in log)
+            {
+                DateTime t;
+                long n;
+                if (p.Length < 8 || !DateTime.TryParseExact(p[0], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out t) || !long.TryParse(p[6], out n) || n <= 0) continue;
+                list.Add(new Call { Time = t, Kind = Usage.Kind(p[7]), Model = p[5], Tokens = n, Eq = n * Usage.Weight(p[5]) });
+            }
+            return list.OrderBy(c => c.Time).ToList();
+        }
+
+        public static List<Day> Days(List<Call> calls, int days, DateTime today)
+        {
+            var list = new List<Day>();
+            for (int i = 0; i < days; i++)
+            {
+                DateTime d = today.Date.AddDays(-i);
+                var day = new Day { Date = d.ToString("yyyy-MM-dd") };
+                foreach (Call c in calls.Where(x => x.Time.Date == d))
+                {
+                    day.Calls++;
+                    long v;
+                    day.ByKind.TryGetValue(c.Kind, out v);
+                    day.ByKind[c.Kind] = v + c.Tokens;
+                    day.Tokens += c.Tokens;
+                    day.Eq += c.Eq;
+                }
+                list.Add(day);
+            }
+            return list;
+        }
+
+        // 種類ごとの1回あたりの平均（回数・トークン）
+        public static List<KeyValuePair<string, double[]>> Average(List<Call> calls)
+        {
+            return calls.GroupBy(c => c.Kind).Select(g => new KeyValuePair<string, double[]>(g.Key, new[] { g.Count(), g.Average(c => (double)c.Tokens) })).ToList();
+        }
+
+        // 計測の結果: 始めと終わりの % と、そのあいだの量から、枠の大きさ（Sonnet に換算したトークン）を出す。% が増えていなければ 0
+        public static long Limit(double eq, double pFrom, double pTo)
+        {
+            double d = pTo - pFrom;
+            return d <= 0 ? 0 : (long)Math.Round(eq * 100 / d);
+        }
+
+        // 計測中なら始めた時刻と % を返す
+        public static bool Running(out DateTime from, out double p5, out double pw)
+        {
+            from = DateTime.MinValue; p5 = pw = 0;
+            try
+            {
+                if (!File.Exists(PathOf)) return false;
+                string last = Core.ReadText(PathOf).Split('\n').Select(l => l.Trim()).LastOrDefault(l => l.Length > 0);
+                if (last == null) return false;
+                string[] c = last.Split('\t');
+                if (c[0] != "start" || c.Length < 4) return false;
+                from = DateTime.ParseExact(c[1], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+                p5 = double.Parse(c[2], CultureInfo.InvariantCulture);
+                pw = double.Parse(c[3], CultureInfo.InvariantCulture);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        public static void Start(double p5, double pw)
+        {
+            File.AppendAllText(PathOf, string.Join("\t", "start", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), p5.ToString(CultureInfo.InvariantCulture), pw.ToString(CultureInfo.InvariantCulture)) + "\r\n", new UTF8Encoding(false));
+        }
+
+        public static Measure Stop(double p5, double pw, List<Call> calls)
+        {
+            DateTime from;
+            double f5, fw;
+            if (!Running(out from, out f5, out fw)) return null;
+            DateTime to = DateTime.Now;
+            var m = new Measure { From = from, To = to, P5From = f5, P5To = p5, PwFrom = fw, PwTo = pw };
+            foreach (Call c in calls.Where(x => x.Time >= from && x.Time <= to)) { m.Tokens += c.Tokens; m.Eq += c.Eq; }
+            File.AppendAllText(PathOf, string.Join("\t", "stop", to.ToString("yyyy-MM-dd HH:mm:ss"), p5.ToString(CultureInfo.InvariantCulture), pw.ToString(CultureInfo.InvariantCulture),
+                m.Tokens.ToString(), ((long)m.Eq).ToString()) + "\r\n", new UTF8Encoding(false));
+            return m;
+        }
+
+        // これまでの計測（始め・終わりの組）
+        public static List<Measure> History()
+        {
+            var list = new List<Measure>();
+            try
+            {
+                if (!File.Exists(PathOf)) return list;
+                Measure cur = null;
+                foreach (string raw in Core.ReadText(PathOf).Split('\n'))
+                {
+                    string[] c = raw.Trim().Split('\t');
+                    if (c.Length < 4) continue;
+                    DateTime t = DateTime.ParseExact(c[1], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+                    double a = double.Parse(c[2], CultureInfo.InvariantCulture), b = double.Parse(c[3], CultureInfo.InvariantCulture);
+                    if (c[0] == "start") cur = new Measure { From = t, P5From = a, PwFrom = b };
+                    else if (c[0] == "stop" && cur != null && c.Length >= 6)
+                    {
+                        cur.To = t; cur.P5To = a; cur.PwTo = b; cur.Tokens = long.Parse(c[4]); cur.Eq = double.Parse(c[5], CultureInfo.InvariantCulture);
+                        list.Add(cur);
+                        cur = null;
+                    }
+                }
+            }
+            catch (Exception ex) { Core.Error("使用量の計測", ex.Message); }
+            return list;
+        }
+    }
+
+    // 使用量の計測の画面
+    class UsageForm : Form
+    {
+        readonly NumericUpDown p5 = Pct(), pw = Pct();
+        readonly Button startStop;
+        readonly Label state = new Label { AutoSize = true, Margin = new Padding(3, 8, 3, 3) };
+        static readonly string[] Kinds = { "日報", "AIで直す", "ブースト", "マニュアル作成" };
+
+        static NumericUpDown Pct() { return new NumericUpDown { Minimum = 0, Maximum = 100, DecimalPlaces = 1, Width = 80, TextAlign = HorizontalAlignment.Right }; }
+
+        static ListView List(params string[] cols)
+        {
+            var l = new ListView { View = View.Details, FullRowSelect = true, Dock = DockStyle.Fill };
+            l.Columns.Add("No", 45, HorizontalAlignment.Right);
+            foreach (string c in cols) l.Columns.Add(c, c.Length > 6 ? 150 : 100, HorizontalAlignment.Right);
+            ListSorter.Enable(l);
+            return l;
+        }
+
+        public UsageForm(Icon icon)
+        {
+            Text = "使用量の計測";
+            Icon = icon;
+            AutoScaleDimensions = new SizeF(96f, 96f);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            Font = new Font("Meiryo UI", 10f);
+            ClientSize = new Size(940, 680);
+            MinimumSize = new Size(700, 520);
+            StartPosition = FormStartPosition.CenterScreen;
+
+            var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(8) };
+            t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+            t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 20));
+            t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 30));
+            Controls.Add(t);
+
+            t.Controls.Add(Head("■ 日ごとの使用量（トークン。ai_calls.log から）"));
+            daysList = List(new[] { "日付", "回数" }.Concat(Kinds).Concat(new[] { "合計", "Sonnet換算" }).ToArray());
+            daysList.Columns[1].TextAlign = HorizontalAlignment.Left;
+            t.Controls.Add(daysList);
+            t.Controls.Add(Head("■ 1回あたりの平均"));
+            avgList = List("種類", "回数", "平均トークン");
+            avgList.Columns[1].TextAlign = HorizontalAlignment.Left;
+            t.Controls.Add(avgList);
+
+            t.Controls.Add(Head("■ 計測（Claude Code の /usage の % を、始めと終わりに入れる）"));
+            var row = new FlowLayoutPanel { AutoSize = true, WrapContents = true, Dock = DockStyle.Fill };
+            row.Controls.Add(new Label { Text = "5時間の枠", AutoSize = true, Margin = new Padding(3, 8, 3, 3) });
+            row.Controls.Add(p5);
+            row.Controls.Add(new Label { Text = "%　1週間の枠", AutoSize = true, Margin = new Padding(3, 8, 3, 3) });
+            row.Controls.Add(pw);
+            row.Controls.Add(new Label { Text = "%", AutoSize = true, Margin = new Padding(3, 8, 12, 3) });
+            startStop = new Button { AutoSize = true, Padding = new Padding(8, 2, 8, 2) };
+            startStop.Click += (o, e) => StartStop();
+            row.Controls.Add(startStop);
+            var open = new Button { Text = "Claude Code を開く（/usage）", AutoSize = true, Padding = new Padding(8, 2, 8, 2) };
+            open.Click += (o, e) => OpenClaude();
+            row.Controls.Add(open);
+            row.Controls.Add(state);
+            t.Controls.Add(row);
+            histList = List("始め", "終わり", "5時間 %", "1週間 %", "トークン", "Sonnet換算", "5時間の枠", "1週間の枠");
+            histList.Columns[1].TextAlign = histList.Columns[2].TextAlign = HorizontalAlignment.Left;
+            var use = new ContextMenuStrip();
+            use.Items.Add("この計測の枠を目安に使う", null, (o, e) => UseSelected());
+            histList.ContextMenuStrip = use;
+            histList.DoubleClick += (o, e) => UseSelected();
+            t.Controls.Add(histList);
+
+            Shown += (o, e) => Reload();
+        }
+
+        ListView daysList, avgList, histList;
+
+        static Label Head(string s) { return new Label { Text = s, AutoSize = true, Margin = new Padding(0, 8, 0, 2) }; }
+
+        List<UsageMeter.Call> Load() { return UsageMeter.Calls(ClaudeCli.RecentLog(100000)); }
+
+        void Reload()
+        {
+            List<UsageMeter.Call> calls = Load();
+            daysList.BeginUpdate();
+            daysList.Items.Clear();
+            foreach (UsageMeter.Day d in UsageMeter.Days(calls, 14, DateTime.Today))
+            {
+                var cells = new List<string> { (daysList.Items.Count + 1).ToString(), d.Date, d.Calls.ToString() };
+                foreach (string k in Kinds) { long v; d.ByKind.TryGetValue(k, out v); cells.Add(v.ToString("N0")); }
+                cells.Add(d.Tokens.ToString("N0"));
+                cells.Add(((long)d.Eq).ToString("N0"));
+                daysList.Items.Add(new ListViewItem(cells.ToArray()));
+            }
+            daysList.EndUpdate();
+            avgList.BeginUpdate();
+            avgList.Items.Clear();
+            foreach (var kv in UsageMeter.Average(calls.Where(c => c.Time > DateTime.Now.AddDays(-14)).ToList()))
+                avgList.Items.Add(new ListViewItem(new[] { (avgList.Items.Count + 1).ToString(), kv.Key, kv.Value[0].ToString("N0"), kv.Value[1].ToString("N0") }));
+            avgList.EndUpdate();
+            histList.BeginUpdate();
+            histList.Items.Clear();
+            foreach (UsageMeter.Measure m in UsageMeter.History())
+            {
+                long l5 = UsageMeter.Limit(m.Eq, m.P5From, m.P5To), lw = UsageMeter.Limit(m.Eq, m.PwFrom, m.PwTo);
+                histList.Items.Add(new ListViewItem(new[] { (histList.Items.Count + 1).ToString(), m.From.ToString("MM/dd HH:mm"), m.To.ToString("MM/dd HH:mm"),
+                    m.P5From + "→" + m.P5To, m.PwFrom + "→" + m.PwTo, m.Tokens.ToString("N0"), ((long)m.Eq).ToString("N0"),
+                    l5 > 0 ? l5.ToString("N0") : "—", lw > 0 ? lw.ToString("N0") : "—" }) { Tag = new[] { l5, lw } });
+            }
+            histList.EndUpdate();
+            DateTime from;
+            double a, b;
+            bool run = UsageMeter.Running(out from, out a, out b);
+            startStop.Text = run ? "計測を終える" : "計測を始める";
+            Settings s = Settings.Get();
+            state.Text = (run ? "計測中（" + from.ToString("MM/dd HH:mm") + " から。始め " + a + "% / " + b + "%）　" : "") +
+                "今の目安の枠: 5時間 " + s.UsageLimit5h.ToString("N0") + "・1週間 " + s.UsageLimitWeek.ToString("N0");
+        }
+
+        void StartStop()
+        {
+            DateTime from;
+            double a, b;
+            if (!UsageMeter.Running(out from, out a, out b))
+            {
+                UsageMeter.Start((double)p5.Value, (double)pw.Value);
+                Reload();
+                return;
+            }
+            UsageMeter.Measure m = UsageMeter.Stop((double)p5.Value, (double)pw.Value, Load());
+            Reload();
+            if (m == null) return;
+            long l5 = UsageMeter.Limit(m.Eq, m.P5From, m.P5To), lw = UsageMeter.Limit(m.Eq, m.PwFrom, m.PwTo);
+            if (l5 <= 0 && lw <= 0) { MessageBox.Show(this, "% が増えていないため、枠を計算できません。", Text, MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            Offer(l5, lw);
+        }
+
+        void UseSelected()
+        {
+            if (histList.SelectedItems.Count == 0) return;
+            var v = (long[])histList.SelectedItems[0].Tag;
+            Offer(v[0], v[1]);
+        }
+
+        void Offer(long l5, long lw)
+        {
+            Settings s = Settings.Get();
+            if (MessageBox.Show(this, "この計測から出した枠（Sonnet に換算したトークン）:\n5時間 " + (l5 > 0 ? l5.ToString("N0") : "—") + "（今 " + s.UsageLimit5h.ToString("N0") + "）\n1週間 " +
+                (lw > 0 ? lw.ToString("N0") : "—") + "（今 " + s.UsageLimitWeek.ToString("N0") + "）\n\n使用量の目安の枠に入れますか？", Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            Settings.SetUsageLimits(l5 > 0 ? l5 : s.UsageLimit5h, lw > 0 ? lw : s.UsageLimitWeek);
+            Reload();
+        }
+
+        void OpenClaude()
+        {
+            string exe = ClaudeCli.FindExe(Settings.Get());
+            if (exe == null) { state.Text = "Claude Code（claude.exe）が見つかりません"; return; }
+            try { Process.Start(new ProcessStartInfo("cmd.exe", "/k \"\"" + exe + "\"\"") { UseShellExecute = true }); }
+            catch (Exception ex) { state.Text = "開けませんでした: " + ex.Message; }
+        }
+    }
+
     // 使用量の目安: ai_calls.log のトークンを、種類（日報・ブースト・マニュアル）ごとに、直近5時間と7日で合計する
     // Pro の枠はトークン数が公開されていないので、settings.ini の UsageLimit5h・UsageLimitWeek（Sonnet に換算したトークン）を目安にする
     static class Usage
@@ -7586,6 +7892,15 @@ namespace WorkLog
                 new[] { "2025-12-01 09:00:00", "", "", "", "", "claude-haiku-5-5", "5000", "成功" } }, new DateTime(2026, 1, 5, 10, 0, 0));
             eq("使用量の目安", string.Join(" | ", ur.Select(r => r.Kind + " " + r.Tokens5h + "/" + r.TokensWeek + " " + Math.Round(r.Eq5h) + "/" + Math.Round(r.EqWeek))),
                 "日報 9000/9000 3000/3000 | AIで直す 0/0 0/0 | ブースト 30000/30000 10000/10000 | マニュアル作成 0/1000 0/1000 | 合計 39000/40000 13000/14000");
+            // 使用量の計測: 日ごと・枠の逆算（Haiku 30000 = Sonnet 換算 10000 で 5時間の枠が 10% 増えたら 100000）
+            List<UsageMeter.Call> uc = UsageMeter.Calls(new[] {
+                new[] { "2026-01-05 09:00:00", "", "", "", "", "claude-haiku-5-5", "30000", "成功" },
+                new[] { "2026-01-05 10:00:00", "", "", "", "", "claude-opus-5-5", "3000", "成功（AIで直す）" },
+                new[] { "2026-01-04 09:00:00", "", "", "", "", "claude-haiku-5-5", "6000", "成功（追記）" } });
+            List<UsageMeter.Day> ud = UsageMeter.Days(uc, 2, new DateTime(2026, 1, 5));
+            eq("使用量の計測: 日ごと", string.Join(" | ", ud.Select(d => d.Date + " " + d.Calls + "回 " + d.Tokens + " " + Math.Round(d.Eq))), "2026-01-05 2回 33000 15000 | 2026-01-04 1回 6000 2000");
+            eq("使用量の計測: 枠の逆算", UsageMeter.Limit(10000, 20, 30) + " " + UsageMeter.Limit(10000, 30, 30), "100000 0");
+
             // Word・PowerPoint の部品（XML として読めるか）
             string sample = Path.Combine(Core.Dir, "manual_sample");
             string[] made = ManualSample(sample);
@@ -7766,6 +8081,25 @@ namespace WorkLog
                 }
                 catch (Exception ex) { ocr = "（使えません）" + ex.ToString(); }
                 Core.WriteText(Path.Combine(args[1], "ocr.txt"), ocr);
+                return 0;
+            }
+
+            // テスト用: 使用量の計測の画面（テスト用の AI の呼び出し）を画像にして終わる（見た目の確認）
+            if (args.Length >= 2 && args[0] == "--screenshot-usage" && Core.Test)
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                SelfTest.MakeDay();
+                using (var f = new UsageForm(SystemIcons.Application))
+                {
+                    f.Show();
+                    Application.DoEvents();
+                    using (var bmp = new Bitmap(f.Width, f.Height))
+                    {
+                        f.DrawToBitmap(bmp, new Rectangle(0, 0, f.Width, f.Height));
+                        bmp.Save(args[1], System.Drawing.Imaging.ImageFormat.Png);
+                    }
+                }
                 return 0;
             }
 

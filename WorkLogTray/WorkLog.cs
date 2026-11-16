@@ -49,7 +49,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.24.1";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.24.2";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -141,7 +141,7 @@ namespace WorkLog
         public bool ScreenRead = true;   // 前面のウィンドウの文字を PC の中で読む（画像は残さない・AI に見せない）
         public bool ScreenAsked = false; // 画面の文字・ブーストを使うか、本人に聞いたか（聞くまでは撮らない）
         public string ImageAiOk = "";    // 画像の AI 解析を本人が確かめて許可したときのアカウント・プラン・モデル（変わったらもう一度確かめる。空なら画像を送らない）
-        public bool BoostAuto = true;    // 新しいアプリを使い始めたら自動でブーストする（false は手で始めたときだけ）
+        public bool BoostAuto = true;    // まだ覚えていない画面（アプリ＋タイトル）を5分使ったら自動でブーストする（false は手で始めたときだけ）
         public int BoostPerDay = 2, BoostMinutes = 15;   // 自動のブーストは1日にこの回数まで・1回の分数
         public long UsageLimit5h = 88000, UsageLimitWeek = 800000;   // 使用量の目安に使う Pro の枠（Sonnet に換算したトークン。公開されていないので目安）
 
@@ -183,7 +183,7 @@ namespace WorkLog
             add("前面のウィンドウの文字を PC の中で読む（1=読む 0=読まない。画像は残さず AI にも見せない）", "ScreenRead", ScreenRead ? "1" : "0");
             add("画面の文字・ブーストを使うか聞いた（1=聞いた。0 なら次の起動で聞く。聞くまでは撮らない）", "ScreenAsked", ScreenAsked ? "1" : "0");
             add("画像の AI 解析を許可したアカウント・プラン・モデル（設定のタブ「画面」の「画像の AI 解析の確認」で入る。空なら画像を送らない）", "ImageAiOk", ImageAiOk);
-            add("新しいアプリを使い始めたら自動でブーストする（1=自動 0=手で始めたときだけ）", "BoostAuto", BoostAuto ? "1" : "0");
+            add("まだ覚えていない画面（アプリ＋タイトル）を5分使ったら自動でブーストする（1=自動 0=手で始めたときだけ）", "BoostAuto", BoostAuto ? "1" : "0");
             add("自動のブーストは1日にこの回数まで", "BoostPerDay", BoostPerDay.ToString());
             add("ブースト1回の分数", "BoostMinutes", BoostMinutes.ToString());
             add("使用量の目安に使う Pro の5時間の枠（Sonnet に換算したトークン）", "UsageLimit5h", UsageLimit5h.ToString());
@@ -2854,7 +2854,7 @@ namespace WorkLog
                 Settings s = Settings.Get();
                 string msg = "画面の文字を読む機能を使いますか？\n\n" +
                     "・前面のウィンドウを撮って、PC の中で文字を読みます（画像はすぐ消します）。読んだ語は日報を作るときに AI に渡します。\n" +
-                    (s.BoostAuto ? "・初めて使うアプリでは、自動で「ブースト」します（" + s.BoostMinutes + "分・1日" + s.BoostPerDay + "回まで）。ブーストでは画面の画像を AI（Claude）に送ります。" +
+                    (s.BoostAuto ? "・まだ覚えていない画面（アプリ＋タイトル）を5分使うと、自動で「ブースト」します（" + s.BoostMinutes + "分・1日" + s.BoostPerDay + "回まで）。ブーストでは画面の画像を AI（Claude）に送ります。" +
                         "画像を送るのは「画像の AI 解析の確認」で AI の設定を確かめて許可したあとだけです。\n" : "") +
                     "\n撮っているあいだは、トレイのアイコンに印が付きます。トレイのメニュー「画面を撮る」や設定のタブ「画面」で、いつでも切り替えられます。";
                 bool on = MessageBox.Show(msg, "作業ログ", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes;
@@ -5667,7 +5667,7 @@ namespace WorkLog
         readonly ComboBox model = new ComboBox { Width = 260 }, fixModel = new ComboBox { Width = 260 };
         readonly TextBox claudePath = new TextBox { Width = 360 };
         readonly CheckBox screenRead = new CheckBox { Text = "前面のウィンドウの文字を読む（PC の中だけ）", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
-        readonly CheckBox boostAuto = new CheckBox { Text = "新しいアプリを使い始めたら自動でブーストする", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
+        readonly CheckBox boostAuto = new CheckBox { Text = "まだ覚えていない画面で自動でブーストする", AutoSize = true, Margin = new Padding(3, 10, 3, 3) };
         readonly NumericUpDown boostPerDay = Num(0, 20), boostMinutes = Num(1, 120);
         readonly TextBox linkName = new TextBox { Width = 200 }, linkUrl = new TextBox { Dock = DockStyle.Fill, MinimumSize = new Size(300, 0) };
 
@@ -6232,7 +6232,8 @@ namespace WorkLog
         public static string RootDir { get { string d = Path.Combine(Core.Dir, "画面"); Directory.CreateDirectory(d); return d; } }
         public static string TextPath(string date) { return Path.Combine(RootDir, "文字_" + date + ".csv"); }
         public static string KnowPath { get { return Path.Combine(Core.Dir, "知識.md"); } }
-        static string SeenPath { get { return Path.Combine(RootDir, "ブースト済みのアプリ.txt"); } }
+        static string SeenPath { get { return Path.Combine(RootDir, "ブースト済みの画面.txt"); } }   // 0.24.1 までの「ブースト済みのアプリ.txt」（アプリごと）は使わない
+        public const int BoostAfterSec = 300;   // まだ覚えていない画面を、今日あわせてこの秒数使ったら自動でブーストする
         static string CountPath { get { return Path.Combine(RootDir, "ブースト回数.txt"); } }
         public static string ManualRoot { get { string d = Path.Combine(Core.Dir, "マニュアル"); Directory.CreateDirectory(d); return d; } }
 
@@ -6354,15 +6355,19 @@ namespace WorkLog
                     return;
                 }
                 if (!s.ScreenRead || !s.ScreenAsked) return;
-                if (s.BoostAuto && stable >= StableSec && !SeenApp(proc) && BoostsToday() < s.BoostPerDay && s.ImageAiOk.Length == 0)
+                // 自動のブースト: まだ覚えていない画面（アプリ＋タイトル）を、今日あわせて BoostAfterSec 使ったとき
+                if (s.BoostAuto && BoostsToday() < s.BoostPerDay && NeedBoost(proc, title, now))
                 {
-                    if (!askedConfirm && NeedImageConfirm != null) { askedConfirm = true; NeedImageConfirm(); }   // 確かめるまでは自動でブーストしない
-                }
-                else if (s.BoostAuto && stable >= StableSec && !SeenApp(proc) && BoostsToday() < s.BoostPerDay)
-                {
-                    AddSeenApp(proc);
-                    StartBoost(true, s);
-                    return;
+                    if (s.ImageAiOk.Length == 0)
+                    {
+                        if (!askedConfirm && NeedImageConfirm != null) { askedConfirm = true; NeedImageConfirm(); }   // 確かめるまでは自動でブーストしない
+                    }
+                    else
+                    {
+                        AddSeen(proc, title);
+                        StartBoost(true, s);
+                        return;
+                    }
                 }
                 DateTime last;
                 if (stable < StableSec || (lastShot.TryGetValue(key, out last) && now - last < TimeSpan.FromMinutes(PerWindowMin))) return;
@@ -6560,22 +6565,39 @@ namespace WorkLog
             catch { return 0; }
         }
 
-        static HashSet<string> seenApps;
-        static bool SeenApp(string proc)
+        static HashSet<string> seen;
+        static readonly Dictionary<string, int> useSec = new Dictionary<string, int>();   // 今日、画面ごとに前面で使った秒数（1秒ごとに数える）
+        static DateTime useDay;
+
+        static HashSet<string> Seen()
         {
-            if (seenApps == null)
+            if (seen == null)
             {
-                seenApps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                try { if (File.Exists(SeenPath)) foreach (string l in Core.ReadText(SeenPath).Split('\n')) if (l.Trim().Length > 0) seenApps.Add(l.Trim()); } catch { }
+                seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                try { if (File.Exists(SeenPath)) foreach (string l in Core.ReadText(SeenPath).Split('\n')) if (l.Trim().Length > 0) seen.Add(l.TrimEnd('\r')); } catch { }
             }
-            return seenApps.Contains(proc);
+            return seen;
         }
 
-        static void AddSeenApp(string proc)
+        static void AddSeen(string proc, string title)
         {
-            SeenApp(proc);
-            if (!seenApps.Add(proc)) return;
-            try { File.AppendAllText(SeenPath, proc + "\r\n", new UTF8Encoding(false)); } catch { }
+            string k = Tasks.Key(proc, title);
+            if (!Seen().Add(k)) return;
+            try { File.AppendAllText(SeenPath, k + "\r\n", new UTF8Encoding(false)); } catch { }
+        }
+
+        // ブーストするか: その画面（アプリ＋タイトル）を今日あわせて BoostAfterSec 使い、まだブーストしておらず、知識の手がかりもタイトルに当てはまらない
+        // （Chrome や Excel のように、同じアプリでも開いているページやファイルで作業が変わるため、アプリではなく画面ごとに見る）
+        static bool NeedBoost(string proc, string title, DateTime now)
+        {
+            if (useDay != now.Date) { useSec.Clear(); useDay = now.Date; }
+            string k = Tasks.Key(proc, title);
+            int n;
+            useSec.TryGetValue(k, out n);
+            useSec[k] = ++n;
+            if (n < BoostAfterSec || Seen().Contains(k)) return false;
+            if (Knowledge.Covers(proc, title)) { AddSeen(proc, title); return false; }
+            return true;
         }
 
         public static void StartBoost(bool auto, Settings s)
@@ -6589,7 +6611,7 @@ namespace WorkLog
             boostLast.Clear();
             BoostUntil = now.AddMinutes(Math.Max(1, s.BoostMinutes));
             try { Core.WriteText(CountPath, now.ToString("yyyy-MM-dd") + "\t" + (BoostsToday() + 1)); } catch { }
-            if (Notify != null) Notify("ブースト開始（" + BoostUntil.ToString("HH:mm") + " まで）", auto ? "新しいアプリ: " + curProc : "");
+            if (Notify != null) Notify("ブースト開始（" + BoostUntil.ToString("HH:mm") + " まで）", auto ? "まだ覚えていない画面: " + curProc + " " + (curTitle.Length > 40 ? curTitle.Substring(0, 40) + "…" : curTitle) : "");
         }
 
         public static void StopBoost() { if (Boosting) BoostUntil = DateTime.Now; }
@@ -6795,6 +6817,24 @@ namespace WorkLog
                 b.Append(l.Trim() + "\n");
             }
             return b.ToString();
+        }
+
+        // そのアプリの手がかりのどれかがタイトルに出ていれば、覚えている画面とみなす（手がかりは「、」「＋」「+」「/」や空白で区切った語。2文字以上）
+        public static bool Covers(string proc, string title)
+        {
+            return Covers(Lines(), proc, title);
+        }
+
+        public static bool Covers(IEnumerable<string> lines, string proc, string title)
+        {
+            foreach (string l in lines)
+            {
+                Match m = LineRe.Match(l);
+                if (!m.Success || !m.Groups[1].Value.Trim().Equals(proc, StringComparison.OrdinalIgnoreCase)) continue;
+                foreach (string w in Regex.Split(m.Groups[2].Value, @"[\s、,，＋+/／「」『』（）()]+"))
+                    if (w.Length >= 2 && (title ?? "").IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            }
+            return false;
         }
 
         // AI の返事から知識の行だけを取り出す（すでにある行は除く）
@@ -7878,6 +7918,10 @@ namespace WorkLog
             eq("画像の AI 解析: 許可なし", ImageAi.Problem(Settings.FromText("")), "画像の AI 解析の確認がまだです（設定のタブ「画面」）");
             eq("画像の AI 解析: 許可の鍵", ImageAi.Key(new ClaudeCli.Auth { Email = "a@example.com", Org = "Org", Plan = "pro" }, Settings.FromText("Model=claude-haiku-5-5")), "a@example.com|Org|pro|claude-haiku-5-5");
             eq("撮る状態: 聞く前は撮らない", Shots.State(Settings.FromText("ScreenRead=1")) + " " + Shots.State(Settings.FromText("ScreenRead=1\nScreenAsked=1")) + " " + Shots.State(Settings.FromText("ScreenRead=0\nScreenAsked=1")), "0 1 0");
+            // 自動のブースト: 知識の手がかりがタイトルに出ていれば覚えている画面（アプリが同じでもタイトルで変わる）
+            var kl = new[] { "- [EXCEL] 雄冬、ひび割れ集計 → 雄冬ひび割れ解析", "- [chrome] みてね → 私用（日報に入れない）" };
+            eq("覚えている画面", Knowledge.Covers(kl, "excel", "雄冬_ひび割れ集計表.xlsx - Excel") + " " + Knowledge.Covers(kl, "EXCEL", "見積書.xlsx - Excel") + " " +
+                Knowledge.Covers(kl, "chrome", "雄冬 - Google Chrome"), "True False False");
             // マニュアル: 返事の読み取り
             Manual.Doc md = Manual.Parse("<題>図面の出し方</題>\n<概要>図面を PDF にする</概要>\n<手順 画像=\"2\">印刷を開く\n「ファイル」→「印刷」</手順>\n<手順 画像=3>PDF を選ぶ</手順>", "手順書");
             eq("マニュアルの読み取り", md.Title + " / " + md.Summary + " / " + string.Join(" | ", md.Steps.Select(x => x.Image + ":" + x.Head + ":" + x.Body)),

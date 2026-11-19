@@ -49,7 +49,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.27.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.28.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -375,7 +375,7 @@ namespace WorkLog
 
         // ---- 開いているウィンドウ（開いた・閉じたときを ログ\窓_日付.csv に書く。閉じるまでその作業をしていたとみなす）----
         static readonly TimeSpan WinGap = TimeSpan.FromMinutes(5);   // これ以上記録があいたら（スリープ・電源オフ・再起動）、いったん閉じたとみなす
-        HashSet<string> openWins;   // 前の記録のときに開いていたウィンドウ（アプリ<TAB>タイトル）
+        HashSet<string> openWins;   // 前の記録のときに開いていたウィンドウ（アプリ<TAB>タイトル<TAB>ウィンドウの番号。番号は 0.28.0 から）
         DateTime openAt = DateTime.MinValue;
 
         static string StatePath { get { return Path.Combine(Core.LogDir, "窓_開いている.txt"); } }
@@ -408,7 +408,7 @@ namespace WorkLog
                     names[pid] = proc;
                 }
                 if (proc.Length == 0 || s.ExcludeProc.Contains(proc) || proc.Equals("WorkLog", StringComparison.OrdinalIgnoreCase)) return true;
-                set.Add(proc + "\t" + title);
+                set.Add(proc + "\t" + title + "\t" + h.ToInt64());   // ウィンドウの番号: 名前が変わっても同じウィンドウだと分かるように
                 return true;
             }, IntPtr.Zero);
             return set;
@@ -423,11 +423,11 @@ namespace WorkLog
             using (var fs = new FileStream(file, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
             using (var w = new StreamWriter(fs, new UTF8Encoding(isNew)))
             {
-                if (isNew) w.WriteLine("\"time\",\"event\",\"process\",\"title\"");
+                if (isNew) w.WriteLine("\"time\",\"event\",\"process\",\"title\",\"hwnd\"");
                 foreach (string k in list)
                 {
-                    string[] c = k.Split(new[] { '\t' }, 2);
-                    w.WriteLine(string.Format("\"{0}\",\"{1}\",\"{2}\",\"{3}\"", at.ToString("yyyy-MM-dd HH:mm:ss"), kind, c[0], c.Length > 1 ? c[1] : ""));
+                    string[] c = k.Split(new[] { '\t' }, 3);
+                    w.WriteLine(string.Format("\"{0}\",\"{1}\",\"{2}\",\"{3}\",\"{4}\"", at.ToString("yyyy-MM-dd HH:mm:ss"), kind, c[0], c.Length > 1 ? c[1] : "", c.Length > 2 ? c[2] : ""));
                 }
             }
         }
@@ -700,7 +700,71 @@ namespace WorkLog
         }
 
         // その日の、名前のないタイトルの手がかり: あとで保存して付いた名前（同じアプリで、閉じたのと同時に開いた名前付きのタイトル）と、画面の語
-        public class Hints { public Dictionary<string, string> Renamed = new Dictionary<string, string>(); public Dictionary<string, string> Screen = new Dictionary<string, string>(); }
+        public class Hints
+        {
+            public Dictionary<string, string> Renamed = new Dictionary<string, string>(), Screen = new Dictionary<string, string>();
+            public Dictionary<string, string> App = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // 1つの作業専用のアプリ → タスク
+        }
+
+        // ---- 1つの作業専用のアプリ（0.28.0）: 最近14日の記録で、タイトルから当てはまった時間のほとんどが1つのタスクのアプリ ----
+        public const int AppMinMinutes = 60, AppMinTitles = 3;
+        public const double AppShare = 0.9, AppCovered = 0.5;
+
+        // rows から、アプリ → タスク（タイトルの対応とタイトルの語だけで当てはめた時間で数える。アプリ名の語・アプリ:名前は使わない）
+        public static Dictionary<string, string> AppTasks(IEnumerable<Row> rows, Dictionary<string, TitleTask> map, List<TaskItem> tasks)
+        {
+            var total = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var byTask = new Dictionary<string, Dictionary<string, int>>(StringComparer.OrdinalIgnoreCase);
+            var titles = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+            foreach (Row r in rows)
+            {
+                int n;
+                total.TryGetValue(r.Proc, out n);
+                total[r.Proc] = n + 1;
+                TitleTask m;
+                string t = null;
+                if (map.TryGetValue(Key(r.Proc, r.Title), out m)) { if (m.Task != NoTask && !tasks.Any(x => x.Done && x.Name.Trim() == m.Task)) t = m.Task; }
+                else t = MatchTitle(tasks, r.Proc, r.Title);
+                if (t == null) continue;
+                Dictionary<string, int> d;
+                if (!byTask.TryGetValue(r.Proc, out d)) byTask[r.Proc] = d = new Dictionary<string, int>();
+                d.TryGetValue(t, out n);
+                d[t] = n + 1;
+                HashSet<string> ts;
+                if (!titles.TryGetValue(r.Proc, out ts)) titles[r.Proc] = ts = new HashSet<string>();
+                ts.Add(Key(r.Proc, r.Title));
+            }
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in byTask)
+            {
+                int covered = kv.Value.Values.Sum();
+                KeyValuePair<string, int> top = kv.Value.OrderByDescending(x => x.Value).First();
+                if (covered >= AppMinMinutes && top.Value >= covered * AppShare && covered >= total[kv.Key] * AppCovered && titles[kv.Key].Count >= AppMinTitles)
+                    result[kv.Key] = top.Key;
+            }
+            return result;
+        }
+
+        static Dictionary<string, string> appCache;
+        static string appCacheKey;
+
+        // 最近14日の記録から（日付とタスク・タイトルの対応が変わるまで覚えておく）
+        public static Dictionary<string, string> AppTasks()
+        {
+            string key = DateTime.Today.ToString("yyyyMMdd") + "|" + (File.Exists(PathOf) ? File.GetLastWriteTime(PathOf).Ticks : 0) + "|" + (File.Exists(MapPath) ? File.GetLastWriteTime(MapPath).Ticks : 0);
+            lock (mapLock)
+                if (appCache != null && appCacheKey == key) return appCache;
+            var rows = new List<Row>();
+            Settings s = Settings.Get();
+            for (int i = 0; i < 14; i++)
+            {
+                List<Row> r = Reporter.ReadActive(DateTime.Today.AddDays(-i).ToString("yyyy-MM-dd"), s);
+                if (r != null) rows.AddRange(r);
+            }
+            Dictionary<string, string> d = AppTasks(rows, LoadMap(), Load());
+            lock (mapLock) { appCache = d; appCacheKey = key; }
+            return d;
+        }
 
         public static Hints DayHints(string date)
         {
@@ -710,10 +774,14 @@ namespace WorkLog
                 List<Reporter.WinSpan> spans = Reporter.WindowSpans(date);
                 foreach (Reporter.WinSpan g in spans.Where(x => IsGeneric(x.Title)))
                 {
-                    Reporter.WinSpan n = spans.Where(x => x.Proc.Equals(g.Proc, StringComparison.OrdinalIgnoreCase) && !IsGeneric(x.Title) && Math.Abs((x.Start - g.End).TotalSeconds) <= 90)
-                        .OrderBy(x => Math.Abs((x.Start - g.End).TotalSeconds)).FirstOrDefault();
+                    // ウィンドウの番号があれば（0.28.0 から）、同じウィンドウの次の名前付きのタイトル。なければ、同じアプリで閉じたのと同時に開いた名前付きのタイトル
+                    Reporter.WinSpan n = g.Hwnd != 0
+                        ? spans.Where(x => x.Hwnd == g.Hwnd && !IsGeneric(x.Title) && x.Start >= g.End.AddSeconds(-90)).OrderBy(x => x.Start).FirstOrDefault()
+                        : spans.Where(x => x.Proc.Equals(g.Proc, StringComparison.OrdinalIgnoreCase) && !IsGeneric(x.Title) && Math.Abs((x.Start - g.End).TotalSeconds) <= 90)
+                            .OrderBy(x => Math.Abs((x.Start - g.End).TotalSeconds)).FirstOrDefault();
                     if (n != null) h.Renamed[Key(g.Proc, g.Title)] = n.Title;
                 }
+                h.App = AppTasks();
                 foreach (var grp in Shots.ReadLines(date).Where(l => IsGeneric(l.Title)).GroupBy(l => Key(l.Proc, l.Title)))
                     h.Screen[grp.Key] = string.Join(" ", grp.SelectMany(l => l.Words).Distinct());
             }
@@ -724,7 +792,9 @@ namespace WorkLog
         // Resolve に、名前のないタイトルの手がかりを足したもの（あとで付いた名前 → 画面の語の順）
         public static string Resolve(Dictionary<string, TitleTask> map, List<TaskItem> tasks, string proc, string title, Hints hints)
         {
-            if (hints == null || !IsGeneric(title)) return Resolve(map, tasks, proc, title);
+            string at;
+            if (hints == null) return Resolve(map, tasks, proc, title);
+            if (!IsGeneric(title)) return Resolve(map, tasks, proc, title) ?? (hints.App.TryGetValue(proc, out at) ? at : null);
             // 名前のないタイトル: タイトルの対応 → タイトルの語 → あとで付いた名前 → 画面の語 → アプリ全体
             TitleTask m;
             string k = Key(proc, title), v, t;
@@ -732,7 +802,7 @@ namespace WorkLog
             if ((t = MatchTitle(tasks, proc, title)) != null) return t;
             if (hints.Renamed.TryGetValue(k, out v) && (t = Resolve(map, tasks, proc, v)) != null) return t;
             if (hints.Screen.TryGetValue(k, out v) && (t = MatchTitle(tasks, proc, v)) != null) return t;
-            return MatchApp(tasks, proc);
+            return MatchApp(tasks, proc) ?? (hints.App.TryGetValue(proc, out at) ? at : null);
         }
 
         // 最近 days 日の記録の、アプリ×タイトルごとの使った時間（分。多い順）
@@ -1431,8 +1501,8 @@ namespace WorkLog
 
         // アプリ×タイトル別の合計と、時刻順のまとまり（同じアプリ×タイトルが続いた区間）
         // ---- 開いていたウィンドウ（ログ\窓_日付.csv）----
-        public class WinSpan { public string Proc, Title; public DateTime Start, End; }
-        static readonly Regex WinRe = new Regex("^\"([^\"]*)\",\"(open|close)\",\"([^\"]*)\",\"([^\"]*)\"");
+        public class WinSpan { public string Proc, Title; public DateTime Start, End; public long Hwnd; }   // Hwnd: ウィンドウの番号（0.28.0 より前の記録は 0）
+        static readonly Regex WinRe = new Regex("^\"([^\"]*)\",\"(open|close)\",\"([^\"]*)\",\"([^\"]*)\"(?:,\"(\\d*)\")?");
         public const int WinMinMinutes = 10;   // これより短く開いていたものは AI に渡さない
 
         // 開いていた区間（開いた〜閉じた）。閉じていないものは、今日なら今まで、ほかの日はその日の最後の記録まで
@@ -1441,7 +1511,7 @@ namespace WorkLog
             var list = new List<WinSpan>();
             string path = Core.WindowsPath(date);
             if (!File.Exists(path)) return list;
-            var open = new Dictionary<string, KeyValuePair<DateTime, string[]>>();
+            var open = new Dictionary<string, KeyValuePair<DateTime, string[]>>();   // 値: 開いた時刻と アプリ・タイトル・番号
             DateTime last = DateTime.MinValue;
             foreach (string raw in Core.ReadText(path).Split('\n'))
             {
@@ -1449,19 +1519,26 @@ namespace WorkLog
                 DateTime t;
                 if (!m.Success || !DateTime.TryParseExact(m.Groups[1].Value, "yyyy-MM-dd HH:mm:ss", Inv, DateTimeStyles.None, out t)) continue;
                 if (t > last) last = t;
-                string key = m.Groups[3].Value + "\t" + m.Groups[4].Value;
+                string hw = m.Groups[5].Success ? m.Groups[5].Value : "";
+                string key = m.Groups[3].Value + "\t" + m.Groups[4].Value + "\t" + hw;
                 KeyValuePair<DateTime, string[]> o;
-                if (m.Groups[2].Value == "open") { if (!open.ContainsKey(key)) open[key] = new KeyValuePair<DateTime, string[]>(t, new[] { m.Groups[3].Value, m.Groups[4].Value }); }
+                if (m.Groups[2].Value == "open") { if (!open.ContainsKey(key)) open[key] = new KeyValuePair<DateTime, string[]>(t, new[] { m.Groups[3].Value, m.Groups[4].Value, hw }); }
                 else if (open.TryGetValue(key, out o))
                 {
-                    if (t > o.Key) list.Add(new WinSpan { Proc = o.Value[0], Title = o.Value[1], Start = o.Key, End = t });
+                    if (t > o.Key) list.Add(Span(o.Value, o.Key, t));
                     open.Remove(key);
                 }
             }
             DateTime end = date == DateTime.Today.ToString("yyyy-MM-dd") ? DateTime.Now : last;
             foreach (var kv in open)
-                if (end > kv.Value.Key) list.Add(new WinSpan { Proc = kv.Value.Value[0], Title = kv.Value.Value[1], Start = kv.Value.Key, End = end });
+                if (end > kv.Value.Key) list.Add(Span(kv.Value.Value, kv.Value.Key, end));
             return list.OrderBy(x => x.Start).ToList();
+        }
+
+        static WinSpan Span(string[] v, DateTime a, DateTime b)
+        {
+            long h;
+            return new WinSpan { Proc = v[0], Title = v[1], Start = a, End = b, Hwnd = long.TryParse(v[2], out h) ? h : 0 };
         }
 
         // AI に渡す「開いていたウィンドウ」（since があればそれより後の分だけ）
@@ -4791,7 +4868,9 @@ namespace WorkLog
                     if (last.TryGetValue(name, out d)) GridSort.Set(row.Cells[4], d.ToString("MM/dd HH:mm"), d); else GridSort.Set(row.Cells[4], "", null);
                 }
                 taskLoading = false;
-                taskInfo.Text = "今日 タスク外: " + DayStatus.Span(Reporter.Minutes(none));
+                Dictionary<string, string> apps = Tasks.AppTasks();
+                taskInfo.Text = "今日 タスク外: " + DayStatus.Span(Reporter.Minutes(none)) +
+                    (apps.Count > 0 ? "\r\n専用のアプリ: " + string.Join("、", apps.OrderBy(x => x.Key).Select(x => x.Key + " → " + x.Value)) : "");
             }
             catch (Exception ex) { taskLoading = false; taskInfo.Text = "集計できません: " + ex.Message; }
         }
@@ -8041,6 +8120,29 @@ namespace WorkLog
             Tasks.Hints dh = Tasks.DayHints("2026-01-09");
             string rn;
             eq("保存して付いた名前を見つける", dh.Renamed.TryGetValue(Tasks.Key("TrendOne", "新規 - TREND-ONE"), out rn) ? rn : "(なし)", "雄冬_図面.tdx - TREND-ONE");
+            // 0.28.0: ウィンドウの番号で、同じウィンドウの名前が変わったのを見つける（同時に別の名前付きのウィンドウが開いても取り違えない）
+            File.WriteAllText(Core.WindowsPath("2026-01-13"), "\"time\",\"event\",\"process\",\"title\",\"hwnd\"\r\n" +
+                "\"2026-01-13 09:00:00\",\"open\",\"EXCEL\",\"Book1 - Excel\",\"111\"\r\n\"2026-01-13 09:30:00\",\"close\",\"EXCEL\",\"Book1 - Excel\",\"111\"\r\n" +
+                "\"2026-01-13 09:30:00\",\"open\",\"EXCEL\",\"見積書.xlsx - Excel\",\"222\"\r\n" +
+                "\"2026-01-13 09:31:00\",\"open\",\"EXCEL\",\"東雲工区_集計.xlsx - Excel\",\"111\"\r\n\"2026-01-13 10:00:00\",\"close\",\"EXCEL\",\"東雲工区_集計.xlsx - Excel\",\"111\"\r\n", new UTF8Encoding(true));
+            Tasks.Hints dh2 = Tasks.DayHints("2026-01-13");
+            eq("同じウィンドウの名前が変わった", dh2.Renamed.TryGetValue(Tasks.Key("EXCEL", "Book1 - Excel"), out rn) ? rn : "(なし)", "東雲工区_集計.xlsx - Excel");
+            eq("ウィンドウの番号を読む", string.Join(" ", Reporter.WindowSpans("2026-01-13").Select(x => x.Hwnd)), "111 222 111");
+            // 0.28.0: 1つの作業専用のアプリ（タイトルから当てはまった時間の9割以上が1つのタスク・60分以上・タイトル3つ以上・アプリの時間の半分以上）
+            var arows = new List<Row>();
+            DateTime at0 = new DateTime(2026, 1, 13, 9, 0, 0);
+            for (int i = 0; i < 90; i++) arows.Add(new Row { Time = at0.AddMinutes(i), Proc = "OUTLOOK", Title = "件名" + (i % 5) + " - メッセージ" });
+            for (int i = 0; i < 40; i++) arows.Add(new Row { Time = at0.AddMinutes(i), Proc = "TrendOne", Title = "雄冬" + (i % 4) + ".tdx - TREND-ONE" });
+            for (int i = 0; i < 40; i++) arows.Add(new Row { Time = at0.AddMinutes(i), Proc = "TrendOne", Title = "東雲工区" + (i % 4) + ".tdx - TREND-ONE" });
+            var amap = new Dictionary<string, Tasks.TitleTask>();
+            for (int i = 0; i < 5; i++) amap[Tasks.Key("OUTLOOK", "件名" + i + " - メッセージ")] = new Tasks.TitleTask { Task = "メール対応" };
+            var atl = new List<TaskItem> { new TaskItem { Name = "メール対応", Keywords = "受信トレイ" }, new TaskItem { Name = "雄冬ひび割れ解析", Keywords = "雄冬" }, new TaskItem { Name = "東雲工区ひび割れ集計", Keywords = "東雲工区" } };
+            Dictionary<string, string> apps = Tasks.AppTasks(arows, amap, atl);
+            eq("1つの作業専用のアプリ", string.Join(" ", apps.OrderBy(x => x.Key).Select(x => x.Key + "=" + x.Value)), "OUTLOOK=メール対応");
+            var happ = new Tasks.Hints();
+            foreach (var kv in apps) happ.App[kv.Key] = kv.Value;
+            eq("専用のアプリは、当てはまらないタイトルもそのタスク", Tasks.Resolve(amap, atl, "OUTLOOK", "新しいメッセージ", happ) + " / " + (Tasks.Resolve(amap, atl, "TrendOne", "新規 - TREND-ONE", happ) ?? "(なし)"),
+                "メール対応 / (なし)");
             var tmap2 = new Dictionary<string, Tasks.TitleTask> { { Tasks.Key("TrendOne", "新規.tdx - TREND-ONE"), new Tasks.TitleTask { Task = "雄冬ひび割れ解析" } } };
             var tl3 = new List<TaskItem> { new TaskItem { Name = "雄冬ひび割れ解析", Keywords = "雄冬", Done = true } };
             eq("完了したタスクへの対応は使わない", Tasks.Resolve(tmap2, tl3, "TrendOne", "新規.tdx - TREND-ONE") ?? "(なし)", "(なし)");

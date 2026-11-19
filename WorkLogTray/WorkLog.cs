@@ -49,7 +49,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.26.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.27.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -598,13 +598,25 @@ namespace WorkLog
         // 「アプリ:名前」と書いた語だけ、タイトルで当てはまらなかったときにアプリ全体をそのタスクにする
         public static string Match(List<TaskItem> list, string proc, string title)
         {
-            List<TaskItem> live = list.Where(t => !t.Done && t.Name.Trim().Length > 0).ToList();
-            foreach (TaskItem t in live)
+            return MatchTitle(list, proc, title) ?? MatchApp(list, proc);
+        }
+
+        // タイトルに出る語だけで（アプリ名の語は使わない）
+        public static string MatchTitle(List<TaskItem> list, string proc, string title)
+        {
+            foreach (TaskItem t in list.Where(x => !x.Done && x.Name.Trim().Length > 0))
                 foreach (string w in t.Words)
                 {
                     if (w.StartsWith(AppPrefix) || IsAppWord(w, proc, title)) continue;
                     if ((title ?? "").IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0) return t.Name.Trim();
                 }
+            return null;
+        }
+
+        // 「アプリ:名前」の語で、アプリ全体
+        public static string MatchApp(List<TaskItem> list, string proc)
+        {
+            List<TaskItem> live = list.Where(t => !t.Done && t.Name.Trim().Length > 0).ToList();
             foreach (TaskItem t in live)
                 foreach (string w in t.Words)
                     if (w.StartsWith(AppPrefix) && string.Equals(proc, w.Substring(AppPrefix.Length).Trim(), StringComparison.OrdinalIgnoreCase)) return t.Name.Trim();
@@ -673,6 +685,54 @@ namespace WorkLog
             // 完了にしたタスクへの対応は使わない（語で当てはめ直す）
             if (map.TryGetValue(Key(proc, title), out t) && !tasks.Any(x => x.Done && x.Name.Trim() == t.Task)) return t.Task == NoTask ? null : t.Task;
             return Match(tasks, proc, title);
+        }
+
+        // ---- 名前のないタイトル（0.27.0）: 新規・無題・Book1・Sheet1 など。タイトルの語では当てはまらないので、ほかの手がかりで当てる ----
+        static readonly Regex GenericRe = new Regex(@"^(新規|新しい|無題|名称未設定|untitled|new\b|book\s*\d*$|sheet\s*\d*$|document\s*\d*$|文書\s*\d*$|ドキュメント\s*\d*$|プレゼンテーション\s*\d*$|presentation\s*\d*$|図面\s*\d*$|drawing\s*\d*$)", RegexOptions.IgnoreCase);
+
+        public static bool IsGeneric(string title)
+        {
+            string t = (title ?? "").Trim().TrimStart('*', '●', '•').Trim();
+            int i = t.LastIndexOf(" - ", StringComparison.Ordinal);
+            if (i > 0) t = t.Substring(0, i).Trim();          // 「Book1 - Excel」の「 - Excel」
+            t = Regex.Replace(t, @"\.[A-Za-z0-9]{1,5}$", "").TrimEnd('*', ' ');   // 拡張子と、保存していない印
+            return t.Length == 0 || GenericRe.IsMatch(t);
+        }
+
+        // その日の、名前のないタイトルの手がかり: あとで保存して付いた名前（同じアプリで、閉じたのと同時に開いた名前付きのタイトル）と、画面の語
+        public class Hints { public Dictionary<string, string> Renamed = new Dictionary<string, string>(); public Dictionary<string, string> Screen = new Dictionary<string, string>(); }
+
+        public static Hints DayHints(string date)
+        {
+            var h = new Hints();
+            try
+            {
+                List<Reporter.WinSpan> spans = Reporter.WindowSpans(date);
+                foreach (Reporter.WinSpan g in spans.Where(x => IsGeneric(x.Title)))
+                {
+                    Reporter.WinSpan n = spans.Where(x => x.Proc.Equals(g.Proc, StringComparison.OrdinalIgnoreCase) && !IsGeneric(x.Title) && Math.Abs((x.Start - g.End).TotalSeconds) <= 90)
+                        .OrderBy(x => Math.Abs((x.Start - g.End).TotalSeconds)).FirstOrDefault();
+                    if (n != null) h.Renamed[Key(g.Proc, g.Title)] = n.Title;
+                }
+                foreach (var grp in Shots.ReadLines(date).Where(l => IsGeneric(l.Title)).GroupBy(l => Key(l.Proc, l.Title)))
+                    h.Screen[grp.Key] = string.Join(" ", grp.SelectMany(l => l.Words).Distinct());
+            }
+            catch (Exception ex) { Core.Error("名前のないタイトル", ex.Message); }
+            return h;
+        }
+
+        // Resolve に、名前のないタイトルの手がかりを足したもの（あとで付いた名前 → 画面の語の順）
+        public static string Resolve(Dictionary<string, TitleTask> map, List<TaskItem> tasks, string proc, string title, Hints hints)
+        {
+            if (hints == null || !IsGeneric(title)) return Resolve(map, tasks, proc, title);
+            // 名前のないタイトル: タイトルの対応 → タイトルの語 → あとで付いた名前 → 画面の語 → アプリ全体
+            TitleTask m;
+            string k = Key(proc, title), v, t;
+            if (map.TryGetValue(k, out m) && !tasks.Any(x => x.Done && x.Name.Trim() == m.Task)) return m.Task == NoTask ? null : m.Task;
+            if ((t = MatchTitle(tasks, proc, title)) != null) return t;
+            if (hints.Renamed.TryGetValue(k, out v) && (t = Resolve(map, tasks, proc, v)) != null) return t;
+            if (hints.Screen.TryGetValue(k, out v) && (t = MatchTitle(tasks, proc, v)) != null) return t;
+            return MatchApp(tasks, proc);
         }
 
         // 最近 days 日の記録の、アプリ×タイトルごとの使った時間（分。多い順）
@@ -812,7 +872,8 @@ namespace WorkLog
             if (names.Count == 0) return "";
             return "今取り掛かっているタスク（利用者が登録したもの）: " + string.Join("、", names) + "\n" +
                    "作業ログの〔タスク: …〕は、ウィンドウタイトルからそのタスクと判定した作業。その作業は、作業内容にタスク名を使って書く" +
-                   "（例:「" + names[0] + "」「" + names[0] + "（図面修正）」）。同じタスクが続いているときは1つの工程にまとめる\n\n";
+                   "（例:「" + names[0] + "」「" + names[0] + "（図面修正）」）。同じタスクが続いているときは1つの工程にまとめる\n" +
+                   "タイトルが新規・無題・Book1・Sheet1 のような名前のないもので〔タスク〕のない作業は、前後の作業・同じアプリの作業・画面に出ていた語から、どのタスクか判断する\n\n";
         }
     }
 
@@ -1412,13 +1473,14 @@ namespace WorkLog
             spans = spans.Where(x => (x.End - x.Start).TotalMinutes >= Math.Max(WinMinMinutes, s.MinMinutes) && !s.ExcludeProc.Contains(x.Proc))
                 .OrderByDescending(x => x.End - x.Start).Take(60).OrderBy(x => x.Start).ToList();
             if (spans.Count == 0) return "";
+            Tasks.Hints hints = Tasks.DayHints(date);
             var b = new StringBuilder("\n\n開いていたウィンドウ（開いた〜閉じた。閉じるまでその作業をしていたとみなす。前面で使っていた作業を優先し、ほかに作業のない時間をこの作業として書く）:\n");
             foreach (WinSpan x in spans)
             {
                 string t;
                 if (!s.MaskProc.TryGetValue(x.Proc, out t)) t = x.Title;
                 foreach (string w in s.MaskWords) t = t.Replace(w, "＊＊");
-                string task = Tasks.Resolve(map, tasks, x.Proc, x.Title);
+                string task = Tasks.Resolve(map, tasks, x.Proc, x.Title, hints);
                 b.Append(x.Start.ToString("HH:mm") + "-" + x.End.ToString("HH:mm") + " [" + x.Proc + "] " + t + (task != null ? " 〔タスク: " + task + "〕" : "") + "\n");
             }
             return b.ToString().TrimEnd('\n');
@@ -1431,12 +1493,13 @@ namespace WorkLog
             List<TaskItem> tasks = Tasks.Load();
             if (tasks.Any(x => !x.Done)) Tasks.PredictFor(active, s);   // 対応のないタイトルは AI が予測しておく（手本が足りなければ何もしない）
             Dictionary<string, Tasks.TitleTask> map = Tasks.LoadMap();
+            Tasks.Hints hints = active.Count > 0 ? Tasks.DayHints(active[0].Time.ToString("yyyy-MM-dd")) : null;
             foreach (Row a in active)
             {
                 string t;
                 if (!s.MaskProc.TryGetValue(a.Proc, out t)) t = a.Title;
                 foreach (string w in s.MaskWords) t = t.Replace(w, "＊＊");
-                string task = Tasks.Resolve(map, tasks, a.Proc, a.Title);   // 伏せる前のタイトルで判定
+                string task = Tasks.Resolve(map, tasks, a.Proc, a.Title, hints);   // 伏せる前のタイトルで判定
                 string k = a.Proc + "\t" + t + (task != null ? " 〔タスク: " + task + "〕" : "");
                 int n;
                 groups.TryGetValue(k, out n);
@@ -4707,9 +4770,10 @@ namespace WorkLog
                 {
                     List<Row> rows = Reporter.ReadActive(DateTime.Today.AddDays(-i).ToString("yyyy-MM-dd"), s);
                     if (rows == null) continue;
+                    Tasks.Hints hints = Tasks.DayHints(DateTime.Today.AddDays(-i).ToString("yyyy-MM-dd"));
                     foreach (Row r in rows)
                     {
-                        string t = Tasks.Resolve(map, tasks, r.Proc, r.Title);
+                        string t = Tasks.Resolve(map, tasks, r.Proc, r.Title, hints);
                         if (t == null) { if (i == 0) none++; continue; }
                         DateTime d;
                         if (!last.TryGetValue(t, out d) || r.Time > d) last[t] = r.Time;
@@ -7962,6 +8026,21 @@ namespace WorkLog
             eq("タスク: アプリ名の語は使わない", Tasks.Match(tl2, "TrendOne", "東雲工区.tdx - TREND-ONE") + " / " + (Tasks.Match(tl2.Take(2).ToList(), "TrendOne", "新規.tdx - TREND-ONE") ?? "(なし)") +
                 " / " + Tasks.Match(tl2, "TrendOne", "雄冬.tdx - TREND-ONE") + " / " + Tasks.Match(tl2, "TrendOne", "新規.tdx - TREND-ONE"),
                 "東雲工区ひび割れ集計 / (なし) / 雄冬ひび割れ解析 / 図面");
+            // 0.27.0: 名前のないタイトル（新規・無題・Book1・Sheet1）は、あとで付いた名前・画面の語で当てる
+            eq("名前のないタイトル", string.Join(" ", new[] { "Book1 - Excel", "*新規ファイル - TREND-ONE", "新しい現場*", "Sheet1", "無題 - メモ帳", "Untitled-1.tdx", "雄冬.xlsx - Excel", "新潟現場.tdx", "Book1_雄冬.xlsx - Excel" }
+                .Select(x => Tasks.IsGeneric(x) ? "1" : "0")), "1 1 1 1 1 1 0 0 0");
+            var hints = new Tasks.Hints();
+            hints.Renamed[Tasks.Key("TrendOne", "新規 - TREND-ONE")] = "雄冬_図面.tdx - TREND-ONE";
+            hints.Screen[Tasks.Key("EXCEL", "Book1 - Excel")] = "東雲工区 集計 ひび割れ";
+            var none = new Dictionary<string, Tasks.TitleTask>();
+            eq("名前のないタイトル: あとで付いた名前・画面の語", Tasks.Resolve(none, tl2, "TrendOne", "新規 - TREND-ONE", hints) + " / " + Tasks.Resolve(none, tl2, "EXCEL", "Book1 - Excel", hints) + " / " +
+                (Tasks.Resolve(none, tl2, "EXCEL", "Book2 - Excel", hints) ?? "(なし)"), "雄冬ひび割れ解析 / 東雲工区ひび割れ集計 / (なし)");
+            File.WriteAllText(Core.WindowsPath("2026-01-09"), "\"time\",\"event\",\"process\",\"title\"\r\n" +
+                "\"2026-01-09 09:00:00\",\"open\",\"TrendOne\",\"新規 - TREND-ONE\"\r\n\"2026-01-09 09:40:00\",\"close\",\"TrendOne\",\"新規 - TREND-ONE\"\r\n" +
+                "\"2026-01-09 09:40:00\",\"open\",\"TrendOne\",\"雄冬_図面.tdx - TREND-ONE\"\r\n\"2026-01-09 10:00:00\",\"close\",\"TrendOne\",\"雄冬_図面.tdx - TREND-ONE\"\r\n", new UTF8Encoding(true));
+            Tasks.Hints dh = Tasks.DayHints("2026-01-09");
+            string rn;
+            eq("保存して付いた名前を見つける", dh.Renamed.TryGetValue(Tasks.Key("TrendOne", "新規 - TREND-ONE"), out rn) ? rn : "(なし)", "雄冬_図面.tdx - TREND-ONE");
             var tmap2 = new Dictionary<string, Tasks.TitleTask> { { Tasks.Key("TrendOne", "新規.tdx - TREND-ONE"), new Tasks.TitleTask { Task = "雄冬ひび割れ解析" } } };
             var tl3 = new List<TaskItem> { new TaskItem { Name = "雄冬ひび割れ解析", Keywords = "雄冬", Done = true } };
             eq("完了したタスクへの対応は使わない", Tasks.Resolve(tmap2, tl3, "TrendOne", "新規.tdx - TREND-ONE") ?? "(なし)", "(なし)");

@@ -49,7 +49,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.25.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.26.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -582,15 +582,32 @@ namespace WorkLog
         }
 
         // 前面のウィンドウのタイトルかアプリ名から、当てはまるタスクの名前（上にあるものから。なければ null）
+        public const string AppPrefix = "アプリ:";   // 語を「アプリ:OUTLOOK」と書いたときだけ、そのアプリ全体をそのタスクにする
+
+        // アプリ名と同じ語か（記号・大文字小文字を除いて比べる。「TREND-ONE」と TrendOne など）。タイトルの最後の「 - アプリの名前」と同じ語も
+        static string Plain(string x) { return Regex.Replace(x ?? "", @"[^\p{L}\p{N}]", "").ToLowerInvariant(); }
+        public static bool IsAppWord(string w, string proc, string title)
+        {
+            if (Plain(w).Length == 0) return false;
+            if (Plain(w) == Plain(proc)) return true;
+            int i = (title ?? "").LastIndexOf(" - ", StringComparison.Ordinal);
+            return i >= 0 && Plain(title.Substring(i + 3)) == Plain(w);
+        }
+
+        // 0.26.0: 同じアプリで別の作業を並行することが多いので、アプリ名ではタスクを決めない（タイトルに出る語だけ）。
+        // 「アプリ:名前」と書いた語だけ、タイトルで当てはまらなかったときにアプリ全体をそのタスクにする
         public static string Match(List<TaskItem> list, string proc, string title)
         {
-            foreach (TaskItem t in list)
-            {
-                if (t.Done || t.Name.Trim().Length == 0) continue;
+            List<TaskItem> live = list.Where(t => !t.Done && t.Name.Trim().Length > 0).ToList();
+            foreach (TaskItem t in live)
                 foreach (string w in t.Words)
-                    if ((title ?? "").IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0 || string.Equals(proc, w, StringComparison.OrdinalIgnoreCase))
-                        return t.Name.Trim();
-            }
+                {
+                    if (w.StartsWith(AppPrefix) || IsAppWord(w, proc, title)) continue;
+                    if ((title ?? "").IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0) return t.Name.Trim();
+                }
+            foreach (TaskItem t in live)
+                foreach (string w in t.Words)
+                    if (w.StartsWith(AppPrefix) && string.Equals(proc, w.Substring(AppPrefix.Length).Trim(), StringComparison.OrdinalIgnoreCase)) return t.Name.Trim();
             return null;
         }
 
@@ -653,7 +670,8 @@ namespace WorkLog
         public static string Resolve(Dictionary<string, TitleTask> map, List<TaskItem> tasks, string proc, string title)
         {
             TitleTask t;
-            if (map.TryGetValue(Key(proc, title), out t)) return t.Task == NoTask ? null : t.Task;
+            // 完了にしたタスクへの対応は使わない（語で当てはめ直す）
+            if (map.TryGetValue(Key(proc, title), out t) && !tasks.Any(x => x.Done && x.Name.Trim() == t.Task)) return t.Task == NoTask ? null : t.Task;
             return Match(tasks, proc, title);
         }
 
@@ -760,7 +778,7 @@ namespace WorkLog
                 "日報に書く「業務のタスク」を整理して、タスクの名前と、そのタスクのウィンドウタイトルに出る語を考えてください。\n\n" +
                 "条件:\n" +
                 "- タスクは5〜15個。案件・現場・業務のまとまりごとに分け、名前は20文字程度で具体的に（例:「雄冬ひび割れ解析」「つくば試験解析」）\n" +
-                "- 語は、そのタスクのウィンドウタイトルにだけ出る言葉（ファイル名・フォルダ名・案件名・現場名の一部）を1〜4個。ほかのタスクにも出る語（Excel・Chrome・Claude など）は使わない。アプリ全体をそのタスクにするときだけアプリ名（例: OUTLOOK）を語にする\n" +
+                "- 語は、そのタスクのウィンドウタイトルにだけ出る言葉（ファイル名・フォルダ名・案件名・現場名の一部）を1〜4個。ほかのタスクにも出る語（Excel・Chrome・Claude など）は使わない。アプリ名は語にしない（同じアプリで別の作業を並行するため）。メールのようにアプリ全体が1つの作業のときだけ「アプリ:OUTLOOK」と書く\n" +
                 "- 私用・ニュース・天気・買い物・趣味と思われるものはタスクにしない\n" +
                 "- 今あるタスクは名前を変えずに出し、語を付ける（今の語があればそれも残す）\n" +
                 "- 出力は1行に1つ「名前<TAB>語,語」だけ（前置き・説明は不要）\n\n" +
@@ -7928,12 +7946,25 @@ namespace WorkLog
                 new TaskItem { Name = "〇〇橋 詳細設計", Keywords = "〇〇橋,ﾏﾙﾏﾙ橋" },
                 new TaskItem { Name = "R8工程表", Keywords = "" },
                 new TaskItem { Name = "済んだ案件", Keywords = "数量", Done = true },
-                new TaskItem { Name = "メール", Keywords = "OUTLOOK" },
+                new TaskItem { Name = "メール", Keywords = "アプリ:OUTLOOK" },
             };
             eq("タスク: 語", Tasks.Match(tl, "EXCEL", "〇〇橋_数量計算.xlsx - Excel"), "〇〇橋 詳細設計");
             eq("タスク: 名前", Tasks.Match(tl, "EXCEL", "全体R8工程表.xlsx"), "R8工程表");
             eq("タスク: 完了は使わない", Tasks.Match(tl, "EXCEL", "数量計算.xlsx") ?? "(なし)", "(なし)");
             eq("タスク: アプリ名", Tasks.Match(tl, "OUTLOOK", "受信トレイ"), "メール");
+            // 0.26.0: アプリ名の語では決めない（同じアプリで並行する作業があるため）。タイトルの語が先
+            var tl2 = new List<TaskItem>
+            {
+                new TaskItem { Name = "雄冬ひび割れ解析", Keywords = "雄冬,TREND-ONE" },
+                new TaskItem { Name = "東雲工区ひび割れ集計", Keywords = "東雲工区" },
+                new TaskItem { Name = "図面", Keywords = "アプリ:TrendOne" },
+            };
+            eq("タスク: アプリ名の語は使わない", Tasks.Match(tl2, "TrendOne", "東雲工区.tdx - TREND-ONE") + " / " + (Tasks.Match(tl2.Take(2).ToList(), "TrendOne", "新規.tdx - TREND-ONE") ?? "(なし)") +
+                " / " + Tasks.Match(tl2, "TrendOne", "雄冬.tdx - TREND-ONE") + " / " + Tasks.Match(tl2, "TrendOne", "新規.tdx - TREND-ONE"),
+                "東雲工区ひび割れ集計 / (なし) / 雄冬ひび割れ解析 / 図面");
+            var tmap2 = new Dictionary<string, Tasks.TitleTask> { { Tasks.Key("TrendOne", "新規.tdx - TREND-ONE"), new Tasks.TitleTask { Task = "雄冬ひび割れ解析" } } };
+            var tl3 = new List<TaskItem> { new TaskItem { Name = "雄冬ひび割れ解析", Keywords = "雄冬", Done = true } };
+            eq("完了したタスクへの対応は使わない", Tasks.Resolve(tmap2, tl3, "TrendOne", "新規.tdx - TREND-ONE") ?? "(なし)", "(なし)");
 
             eq("タイトルの見出し", Tasks.Key("EXCEL", " *数量計算.xlsx - Excel "), "excel\t数量計算.xlsx - Excel");
             var tmap = new Dictionary<string, Tasks.TitleTask>

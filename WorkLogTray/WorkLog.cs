@@ -49,7 +49,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.28.1";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.28.2";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -4451,27 +4451,25 @@ namespace WorkLog
                 {
                     key = Key(g, g.Columns.Cast<DataGridViewColumn>().Select(c => c.HeaderText));
                     float k = Dpi(g);
-                    foreach (DataGridViewColumn c in g.Columns)
+                    // 0.28.2: すべての列を、表が出たときの幅で止める（表の幅に合わせて伸び縮みする列はドラッグできないため）。
+                    // 幅を変えると右へ伸び、はみ出したら横スクロール
+                    int[] now = g.Columns.Cast<DataGridViewColumn>().Select(c => Math.Max(c.Width, c.AutoSizeMode == DataGridViewAutoSizeColumnMode.Fill ? 0 : c.GetPreferredWidth(DataGridViewAutoSizeColumnMode.AllCells, true))).ToArray();
+                    g.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
+                    g.ScrollBars = ScrollBars.Both;
+                    for (int i = 0; i < g.Columns.Count; i++)
                     {
-                        c.Resizable = DataGridViewTriState.True;
-                        if (c.AutoSizeMode == DataGridViewAutoSizeColumnMode.Fill || c.AutoSizeMode == DataGridViewAutoSizeColumnMode.None ||
-                            (c.AutoSizeMode == DataGridViewAutoSizeColumnMode.NotSet && g.AutoSizeColumnsMode != DataGridViewAutoSizeColumnsMode.AllCells)) continue;
-                        int w = Math.Max(c.Width, c.GetPreferredWidth(DataGridViewAutoSizeColumnMode.AllCells, true));
+                        DataGridViewColumn c = g.Columns[i];
+                        bool fill = c.InheritedAutoSizeMode == DataGridViewAutoSizeColumnMode.Fill;
                         c.AutoSizeMode = DataGridViewAutoSizeColumnMode.None;
-                        c.Width = Math.Max(w, c.MinimumWidth);
-                        fixedCols.Add(c);
+                        c.Resizable = DataGridViewTriState.True;
+                        c.Width = Math.Max(now[i], c.MinimumWidth);
+                        if (!fill) fixedCols.Add(c);
                     }
                     int[] ws = Get(key);
                     if (ws != null && ws.Length == g.Columns.Count)
                     {
                         userSized = true;
-                        for (int i = 0; i < ws.Length; i++)
-                        {
-                            DataGridViewColumn c = g.Columns[i];
-                            int w = Math.Max(c.MinimumWidth, (int)(ws[i] * k));
-                            if (c.InheritedAutoSizeMode == DataGridViewAutoSizeColumnMode.Fill) c.FillWeight = Math.Max(1, w);
-                            else c.Width = w;
-                        }
+                        for (int i = 0; i < ws.Length; i++) g.Columns[i].Width = Math.Max(g.Columns[i].MinimumWidth, (int)(ws[i] * k));
                     }
                 }
                 catch (Exception ex) { Core.Error("列の幅", ex.Message); }
@@ -8421,8 +8419,18 @@ namespace WorkLog
                     g.Rows.Add("1", "09:00〜10:00", "テスト");
                     f.Show();
                     Application.DoEvents();
-                    int[] r = { (int)g.Columns[1].AutoSizeMode, g.Columns[1].Resizable == DataGridViewTriState.True ? 1 : 0, g.Columns[1].Width };
-                    if (firstW == null) { firstW = r; g.Columns[1].Width = 150; Application.DoEvents(); }
+                    int[] r = { (int)g.Columns[1].AutoSizeMode, g.Columns[1].Resizable == DataGridViewTriState.True ? 1 : 0, g.Columns[1].Width,
+                        (int)g.Columns[2].AutoSizeMode, g.Columns[2].Resizable == DataGridViewTriState.True ? 1 : 0, g.Columns[2].Width, g.Columns[0].Width };
+                    if (firstW == null)
+                    {
+                        firstW = r;
+                        int before = g.Columns[0].Width;
+                        g.Columns[1].Width = 150;
+                        g.Columns[2].Width = 700;   // 表より広くしても、ほかの列は縮まない（横スクロール）
+                        Application.DoEvents();
+                        r[6] = g.Columns[0].Width - before;
+                        firstW[6] = r[6];
+                    }
                     return r;
                 }
             };
@@ -8430,8 +8438,9 @@ namespace WorkLog
             int[] again = showGrid();
             float dk;
             using (var tf = new Form()) using (Graphics tg = tf.CreateGraphics()) dk = tg.DpiX / 96f;
-            eq("表の列の幅: 中身に合わせる列も変えられる", firstW[0] + " " + firstW[1], ((int)DataGridViewAutoSizeColumnMode.None) + " 1");
-            eq("表の列の幅: 次に開いたときも使う", (Math.Abs(again[2] - 150) <= Math.Max(2, (int)dk + 1)).ToString(), "True");
+            eq("表の列の幅: 中身に合わせる列も・表に合わせて伸びる列も変えられる", firstW[0] + " " + firstW[1] + " " + firstW[3] + " " + firstW[4], ((int)DataGridViewAutoSizeColumnMode.None) + " 1 " + ((int)DataGridViewAutoSizeColumnMode.None) + " 1");
+            eq("表の列の幅: 広げてもほかの列は縮まない", firstW[6].ToString(), "0");
+            eq("表の列の幅: 次に開いたときも使う", (Math.Abs(again[2] - 150) <= Math.Max(2, (int)dk + 1)) + " " + (Math.Abs(again[5] - 700) <= Math.Max(2, (int)dk + 1)), "True True");
 
             // Word・PowerPoint の部品（XML として読めるか）
             string sample = Path.Combine(Core.Dir, "manual_sample");

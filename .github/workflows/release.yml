@@ -127,6 +127,7 @@ jobs:
           if (-not $p.WaitForExit(120000)) { throw '終わらない' }
           if ($p.ExitCode -ne 0) { throw "マニュアルの見本を作れなかった（$($p.ExitCode)）" }
           Get-Content (Join-Path $env:RUNNER_TEMP 'manual\ocr.txt')
+          Get-Content (Join-Path $env:RUNNER_TEMP 'manual\rec.txt')
 
       - name: Upload screenshot
         uses: actions/upload-artifact@v4
@@ -140,6 +141,7 @@ jobs:
             ${{ runner.temp }}/manual/*.docx
             ${{ runner.temp }}/manual/*.pptx
             ${{ runner.temp }}/manual/ocr.txt
+            ${{ runner.temp }}/manual/rec.*
 
       # PR のときは、画像を ci-screenshots ブランチにも置く（成果物を落とせない環境からも git で見られるように）
       - name: Publish screenshots (PR)
@@ -150,7 +152,7 @@ jobs:
           New-Item -ItemType Directory -Force $d | Out-Null
           Copy-Item (Join-Path $env:RUNNER_TEMP 'about.png'), (Join-Path $env:RUNNER_TEMP 'timeline.png'), (Join-Path $env:RUNNER_TEMP 'usage.png') $d
           Copy-Item (Join-Path $env:RUNNER_TEMP 'settings\*.png') $d
-          Copy-Item (Join-Path $env:RUNNER_TEMP 'manual\*.docx'), (Join-Path $env:RUNNER_TEMP 'manual\*.pptx'), (Join-Path $env:RUNNER_TEMP 'manual\ocr.txt') $d
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'manual\*.docx'), (Join-Path $env:RUNNER_TEMP 'manual\*.pptx'), (Join-Path $env:RUNNER_TEMP 'manual\ocr.txt'), (Join-Path $env:RUNNER_TEMP 'manual\rec.*') $d
           Set-Location $d
           git init -q
           git add -A

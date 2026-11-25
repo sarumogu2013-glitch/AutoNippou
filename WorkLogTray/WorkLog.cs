@@ -49,7 +49,7 @@ namespace WorkLog
     static class Core
     {
         public const int IntervalSec = 60;   // 記録間隔（秒）
-        public const string Version = "0.28.2";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
+        public const string Version = "0.29.0";   // 主.機能.修正（変わったところは CHANGELOG.md に書く。リリースのノートになる）
         public static readonly bool Test = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WORKLOG_TEST"));
         public static readonly string Dir = Test ? Environment.GetEnvironmentVariable("WORKLOG_TEST")
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkLog");
@@ -3633,28 +3633,32 @@ namespace WorkLog
         {
             if (!Shots.ManualOn)
             {
-                if (MessageBox.Show("ウィンドウを切り替えるたびに画面を撮ります（終えるまで右下に「● 画面を記録中」が出ます）。始めますか？", "マニュアル作成",
+                if (MessageBox.Show("画面を動画で記録し、クリック・キー操作（打った文字は残しません）とウィンドウの切り替えを記録します（終えるまで右下に「● 画面を記録中」が出ます）。始めますか？", "マニュアル作成",
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-                Shots.StartManual();
+                string recRoot = Shots.StartManual();
+                try { ManualRec.Start(recRoot); } catch (Exception ex) { Core.Error("録画", ex.Message); }
                 UpdateShotUi(true);
-                Balloon("マニュアル作成中", "ウィンドウを切り替えるたびに撮影", ToolTipIcon.Info, null);
+                Balloon("マニュアル作成中", "録画と操作の記録", ToolTipIcon.Info, null);
                 return;
             }
+            try { ManualRec.Stop(); } catch (Exception ex) { Core.Error("録画", ex.Message); }
             int count;
             string dir = Shots.StopManual(out count);
             UpdateShotUi(true);
             if (dir == null) { Balloon("マニュアル作成", "撮った画面がありません", ToolTipIcon.Info, null); return; }
-            string title;
+            string title, summary;
             bool slides;
             using (var f = new ManualForm(icon, count))
             {
                 if (f.ShowDialog() != DialogResult.OK)
                 {
-                    Balloon("マニュアル作成", "画像だけ残しました", ToolTipIcon.Info, () => OpenPath(Path.GetDirectoryName(dir)));
+                    Balloon("マニュアル作成", "動画と画像だけ残しました", ToolTipIcon.Info, () => OpenPath(Path.GetDirectoryName(dir)));
+                    OpenPath(Path.GetDirectoryName(dir));
                     return;
                 }
                 title = f.TitleText;
                 slides = f.Slides;
+                summary = f.SummaryText;
             }
             if (Settings.Get().ImageAiOk.Length == 0 && !ConfirmImageAi())
                 Balloon("マニュアル作成", "画像を AI に送らずに作ります（ウィンドウの名前だけ）", ToolTipIcon.Info, null);
@@ -3663,16 +3667,28 @@ namespace WorkLog
             var t = new Thread(() =>
             {
                 string path = null, note = "", err = null;
-                try { path = Manual.Build(dir, title, slides, s, out note); }
+                try
+                {
+                    if (count == 0) throw new Exception("撮った画面がないため、動画だけ残しました");
+                    path = Manual.Build(dir, title, slides, summary, s, out note);
+                }
                 catch (Exception ex) { err = ex.Message; Core.Error("マニュアル作成", ex.ToString()); }
                 ui.Post(_ =>
                 {
-                    if (err != null) Balloon("マニュアルを作れませんでした", err, ToolTipIcon.Warning, () => OpenPath(Path.GetDirectoryName(dir)));
-                    else Balloon("マニュアルができました", Path.GetFileName(path) + (note.Length > 0 ? "\n" + note : ""), ToolTipIcon.Info, () => OpenPath(path));
+                    // できたら（できなくても）フォルダを開く
+                    if (err != null) { Balloon("マニュアルを作れませんでした", err, ToolTipIcon.Warning, () => OpenPath(Path.GetDirectoryName(dir))); OpenPath(Path.GetDirectoryName(dir)); }
+                    else { Balloon("マニュアルができました", Path.GetFileName(path) + (note.Length > 0 ? "\n" + note : ""), ToolTipIcon.Info, () => OpenPath(path)); ShowInFolder(path); }
                 }, null);
             });
             t.IsBackground = true;
             t.Start();
+        }
+
+        // フォルダを開いて、ファイルを選んだ状態にする
+        static void ShowInFolder(string path)
+        {
+            try { Process.Start("explorer.exe", "/select,\"" + path + "\""); }
+            catch (Exception ex) { Core.Error("開く", ex.Message); }
         }
 
         static void OpenPath(string path)
@@ -3733,6 +3749,7 @@ namespace WorkLog
             if (usageForm != null && !usageForm.IsDisposed) usageForm.Dispose();
             afkTimer.Stop();
             shotTimer.Stop();
+            try { ManualRec.Stop(); } catch { }
             if (indicator != null && !indicator.IsDisposed) indicator.Dispose();
             timer.Stop();
             tray.Visible = false;
@@ -5332,9 +5349,9 @@ namespace WorkLog
             sendBar.Controls.Add(askBtn);
             sendBar.Controls.Add(clearChatBtn);
             instruction.TextChanged += (o, e) => UpdateButtons();
-            // Enter で送る。Shift+Enter で改行
-            instruction.KeyDown += (o, e) => { if (e.KeyCode == Keys.Enter && !e.Shift) { e.Handled = e.SuppressKeyPress = true; AskAi(); } };
-            instruction.HandleCreated += (o, e) => SendMessage(instruction.Handle, 0x1501, (IntPtr)1, "AI に頼むことを書いて Enter（Shift+Enter で改行）");   // EM_SETCUEBANNER（1行のときだけ出る）
+            // Ctrl+Enter で送る。Enter で改行（0.29.0 から）
+            instruction.KeyDown += (o, e) => { if (e.KeyCode == Keys.Enter && e.Control) { e.Handled = e.SuppressKeyPress = true; AskAi(); } };
+            instruction.HandleCreated += (o, e) => SendMessage(instruction.Handle, 0x1501, (IntPtr)1, "AI に頼むことを書いて Ctrl+Enter（Enter で改行）");   // EM_SETCUEBANNER（1行のときだけ出る）
             notes.TextChanged += (o, e) => { if (!loading) notesDirty = true; };
 
             Control[] rows = { aiTitle, hint, chatView, aiStatus, previewBar, instruction, sendBar, notesHead, notes };
@@ -5969,6 +5986,8 @@ namespace WorkLog
         readonly TextBox title = new TextBox { Width = 320, Text = "手順書" };
         readonly RadioButton doc = new RadioButton { Text = "ドキュメント（Word）", AutoSize = true, Checked = true };
         readonly RadioButton ppt = new RadioButton { Text = "スライド（PowerPoint）", AutoSize = true };
+        readonly TextBox summary = new TextBox { Multiline = true, AcceptsReturn = true, ScrollBars = ScrollBars.Vertical, Width = 480, Height = 150 };
+        public string SummaryText { get { return summary.Text.Trim(); } }
         public string TitleText { get { return title.Text.Trim().Length > 0 ? title.Text.Trim() : "手順書"; } }
         public bool Slides { get { return ppt.Checked; } }
 
@@ -5995,16 +6014,23 @@ namespace WorkLog
             kinds.Controls.Add(doc);
             kinds.Controls.Add(ppt);
             t.Controls.Add(kinds, 1, 2);
+            // 作業の概要（AI がいちばん頼りにする。Enter で改行、Ctrl+Enter で作成）
+            t.Controls.Add(new Label { Text = "作業の概要", AutoSize = true, Margin = new Padding(3, 6, 8, 3) }, 0, 3);
+            t.Controls.Add(summary, 1, 3);
+            var hint = new Label { Text = "どんな作業を、どんな手順でやったか（Ctrl+Enter で作成）", AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 0, 3, 3) };
+            t.Controls.Add(hint, 1, 4);
             var bar = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, Margin = new Padding(0, 10, 0, 0) };
             var cancel = new Button { Text = "作らない", AutoSize = true, DialogResult = DialogResult.Cancel };
             var ok = new Button { Text = "作成", AutoSize = true, DialogResult = DialogResult.OK };
             bar.Controls.Add(cancel);
             bar.Controls.Add(ok);
-            t.Controls.Add(bar, 0, 3);
+            t.Controls.Add(bar, 0, 5);
             t.SetColumnSpan(bar, 2);
             Controls.Add(t);
-            AcceptButton = ok;
             CancelButton = cancel;
+            KeyPreview = true;
+            KeyDown += (o, e) => { if (e.KeyCode == Keys.Enter && e.Control) { e.Handled = e.SuppressKeyPress = true; DialogResult = DialogResult.OK; Close(); } };
+            Shown += (o, e) => summary.Focus();
         }
     }
 
@@ -6634,7 +6660,7 @@ namespace WorkLog
         public const int BoostStableSec = 5, BoostPerWindowSec = 120, BoostMax = 20, BoostWidth = 1280;
         // マニュアル作成の決まり
         public const double ManualStableSec = 1.5;
-        public const int ManualMax = 150, ManualAiMax = 60, ManualAiWidth = 1024;
+        public const int ManualMax = 300, ManualAiMax = 60, ManualAiWidth = 1024;
 
         public static string RootDir { get { string d = Path.Combine(Core.Dir, "画面"); Directory.CreateDirectory(d); return d; } }
         public static string TextPath(string date) { return Path.Combine(RootDir, "文字_" + date + ".csv"); }
@@ -6683,6 +6709,8 @@ namespace WorkLog
         static string manualDir, manualLastKey;
         static int manualCount;
         static byte[] manualLastThumb;
+        static readonly object manualLock = new object();
+        public static DateTime ManualStarted;
 
         // 撮った画像の後の処理（文字認識・保存）は1本のスレッドで順に行う
         static readonly Queue<Action> work = new Queue<Action>();
@@ -6797,9 +6825,16 @@ namespace WorkLog
         // 前面のウィンドウを撮る（最小化・小さすぎるものは撮らない）
         public static Bitmap Capture(IntPtr h)
         {
+            Rectangle rect;
+            return Capture(h, out rect);
+        }
+
+        public static Bitmap Capture(IntPtr h, out Rectangle rect)
+        {
             RECT r;
+            rect = Rectangle.Empty;
             if (h == IntPtr.Zero || IsIconic(h) || !GetWindowRect(h, out r)) return null;
-            Rectangle rect = Rectangle.Intersect(Rectangle.FromLTRB(r.L, r.T, r.R, r.B), SystemInformation.VirtualScreen);
+            rect = Rectangle.Intersect(Rectangle.FromLTRB(r.L, r.T, r.R, r.B), SystemInformation.VirtualScreen);
             if (rect.Width < 80 || rect.Height < 60) return null;
             var bmp = new Bitmap(rect.Width, rect.Height, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
             try { using (Graphics g = Graphics.FromImage(bmp)) g.CopyFromScreen(rect.Location, Point.Empty, rect.Size); }
@@ -7066,9 +7101,10 @@ namespace WorkLog
             string root = Path.Combine(ManualRoot, DateTime.Now.ToString("yyyyMMdd_HHmmss"));
             manualDir = Path.Combine(root, "画像");
             Directory.CreateDirectory(manualDir);
-            manualCount = 0;
+            lock (manualLock) manualCount = 0;
             manualLastKey = null;
             manualLastThumb = null;
+            ManualStarted = DateTime.Now;
             return root;
         }
 
@@ -7083,7 +7119,9 @@ namespace WorkLog
             var done = new ManualResetEvent(false);
             Enqueue(() => done.Set());
             done.WaitOne(15000);
-            if (count == 0) { try { Directory.Delete(Path.GetDirectoryName(dir), true); } catch { } return null; }
+            lock (manualLock) count = manualCount;
+            string root = Path.GetDirectoryName(dir);
+            if (count == 0 && !File.Exists(Path.Combine(root, ManualRec.VideoName))) { try { Directory.Delete(root, true); } catch { } return null; }
             return dir;
         }
 
@@ -7096,16 +7134,44 @@ namespace WorkLog
             byte[] thumb = Thumb(bmp);
             if (Same(manualLastThumb, thumb)) { bmp.Dispose(); return; }
             manualLastThumb = thumb;
-            int no = ++manualCount;
-            string dir = manualDir, proc = curProc, title = curTitle;
-            DateTime at = DateTime.Now;
+            SaveManual(bmp, curProc, curTitle, DateTime.Now, "画面の切り替え");
+        }
+
+        // マニュアル作成: クリックしたウィンドウを撮って、クリックした所に印を付ける（操作の記録から呼ぶ）
+        public static void ManualClickShot(IntPtr h, Point screen, string action, string proc, string title, DateTime at)
+        {
+            if (!ManualOn) return;
+            Rectangle rect;
+            Bitmap bmp = Capture(h, out rect);
+            if (bmp == null) return;
+            using (Graphics g = Graphics.FromImage(bmp))
+            using (var pen = new Pen(Color.FromArgb(230, 230, 40, 40), 4))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.DrawEllipse(pen, screen.X - rect.X - 18, screen.Y - rect.Y - 18, 36, 36);
+            }
+            SaveManual(bmp, proc, title, at, action);
+        }
+
+        // meta.tsv: 番号・時刻・アプリ・タイトル・画面の語・操作・録画の始めからの秒（0.29.0 から後ろの2つ）
+        static void SaveManual(Bitmap bmp, string proc, string title, DateTime at, string action)
+        {
+            int no;
+            string dir = manualDir;
+            lock (manualLock)
+            {
+                if (dir == null || manualCount >= ManualMax) { bmp.Dispose(); return; }
+                no = ++manualCount;
+            }
+            double sec = (at - ManualStarted).TotalSeconds;
             Enqueue(() =>
             {
                 try
                 {
                     bmp.Save(Path.Combine(dir, no.ToString("000") + ".png"), System.Drawing.Imaging.ImageFormat.Png);
                     string text = string.Join(" ", Words(Ocr(bmp), Settings.Get()));
-                    File.AppendAllText(Path.Combine(dir, "meta.tsv"), string.Join("\t", no.ToString("000"), at.ToString("HH:mm:ss"), proc, title, text) + "\r\n", new UTF8Encoding(false));
+                    File.AppendAllText(Path.Combine(dir, "meta.tsv"), string.Join("\t", no.ToString("000"), at.ToString("HH:mm:ss"), proc, title.Replace('\t', ' '), text,
+                        action.Replace('\t', ' '), ((int)sec).ToString()) + "\r\n", new UTF8Encoding(false));
                 }
                 finally { bmp.Dispose(); }
             });
@@ -7312,10 +7378,14 @@ namespace WorkLog
     // マニュアル作成: 撮った画像から手順書を作る（AI が手順の文を書く。AI が使えないときはウィンドウの名前だけで作る）
     static class Manual
     {
-        public class Step { public int Image; public string Head = "", Body = ""; }
-        public class Doc { public string Title = "", Summary = ""; public List<Step> Steps = new List<Step>(); }
+        public class Step { public int Image; public string Head = "", Body = "", Time = ""; }   // Time: 動画の時刻（mm:ss）
+        public class Doc { public string Title = "", Summary = "", Video = ""; public List<Step> Steps = new List<Step>(); }
 
-        public class Shot { public string No, Time, Proc, Title, Text, Path; }
+        // 見出しに付ける動画の時刻
+        public static string HeadText(Step s) { return s.Head + (s.Time.Length > 0 ? "（動画 " + s.Time + "）" : ""); }
+        public static string SummaryText(Doc d) { return d.Summary + (d.Video.Length > 0 ? (d.Summary.Length > 0 ? "\n" : "") + "動画: " + d.Video + "（手順の時刻は動画の時刻）" : ""); }
+
+        public class Shot { public string No, Time, Proc, Title, Text, Path, Action = ""; public int Sec = -1; }
 
         public static List<Shot> Shots(string dir)
         {
@@ -7327,7 +7397,9 @@ namespace WorkLog
                 string[] c = raw.TrimEnd('\r').Split('\t');
                 if (c.Length < 5) continue;
                 string p = Path.Combine(dir, c[0] + ".png");
-                if (File.Exists(p)) list.Add(new Shot { No = c[0], Time = c[1], Proc = c[2], Title = c[3], Text = c[4], Path = p });
+                int sec;
+                if (File.Exists(p)) list.Add(new Shot { No = c[0], Time = c[1], Proc = c[2], Title = c[3], Text = c[4], Path = p,
+                    Action = c.Length > 5 ? c[5] : "", Sec = c.Length > 6 && int.TryParse(c[6], out sec) ? sec : -1 });
             }
             return list;
         }
@@ -7355,23 +7427,36 @@ namespace WorkLog
         {
             var d = new Doc { Title = title, Summary = "画面の記録から作った手順書（説明は AI を使わずに作ったもの）" };
             foreach (Shot s in shots)
-                d.Steps.Add(new Step { Image = int.Parse(s.No), Head = s.Proc + "（" + s.Time + "）", Body = s.Title });
+                d.Steps.Add(new Step { Image = int.Parse(s.No), Head = s.Action.Length > 0 ? s.Action : s.Proc + "（" + s.Time + "）", Body = "[" + s.Proc + "] " + s.Title });
             return d;
         }
 
         // 手順書を作ってファイルの場所を返す。slides: PowerPoint（でなければ Word）
         public static string Build(string imageDir, string title, bool slides, Settings s, out string note)
         {
+            return Build(imageDir, title, slides, "", s, out note);
+        }
+
+        // summary: 録画を終えたときに利用者が書いた作業の概要（AI にいちばん大事な手がかりとして渡す）
+        public static string Build(string imageDir, string title, bool slides, string summary, Settings s, out string note)
+        {
             note = "";
             List<Shot> shots = Shots(imageDir);
             if (shots.Count == 0) throw new Exception("撮った画像がありません");
+            string root0 = Path.GetDirectoryName(imageDir);
             Doc doc;
-            try { doc = Ask(shots, title, s); }
+            try { doc = Ask(shots, title, summary ?? "", ManualRec.HistoryText(root0, 400), s); }
             catch (Exception ex) { note = "AI を使えなかったため、画面の名前だけで作りました: " + ex.Message; doc = Plain(shots, title); }
             var byNo = shots.ToDictionary(x => int.Parse(x.No), x => x.Path);
             doc.Steps = doc.Steps.Where(x => byNo.ContainsKey(x.Image)).ToList();
             if (doc.Steps.Count == 0) { note = "AI の返事に手順がなかったため、画面の名前だけで作りました"; doc = Plain(shots, title); }
-            string root = Path.GetDirectoryName(imageDir);
+            string root = root0;
+            var secOf = shots.ToDictionary(x => int.Parse(x.No), x => x.Sec);
+            if (File.Exists(Path.Combine(root, ManualRec.VideoName)))
+            {
+                doc.Video = ManualRec.VideoName;
+                foreach (Step st in doc.Steps) { int sec; if (secOf.TryGetValue(st.Image, out sec) && sec >= 0) st.Time = ManualRec.Mmss(sec); }
+            }
             string name = Regex.Replace(doc.Title, "[\\\\/:*?\"<>|]", "_");
             if (name.Length == 0) name = "手順書";
             string path = Path.Combine(root, name + (slides ? ".pptx" : ".docx"));
@@ -7382,13 +7467,13 @@ namespace WorkLog
 
         public static string Markdown(Doc d)
         {
-            var b = new StringBuilder("# " + d.Title + "\r\n\r\n" + d.Summary + "\r\n");
+            var b = new StringBuilder("# " + d.Title + "\r\n\r\n" + SummaryText(d).Replace("\n", "\r\n\r\n") + "\r\n");
             int n = 0;
-            foreach (Step s in d.Steps) b.Append("\r\n## " + (++n) + ". " + s.Head + "\r\n\r\n![](画像/" + s.Image.ToString("000") + ".png)\r\n\r\n" + s.Body + "\r\n");
+            foreach (Step s in d.Steps) b.Append("\r\n## " + (++n) + ". " + HeadText(s) + "\r\n\r\n![](画像/" + s.Image.ToString("000") + ".png)\r\n\r\n" + s.Body + "\r\n");
             return b.ToString();
         }
 
-        static Doc Ask(List<Shot> shots, string title, Settings s)
+        static Doc Ask(List<Shot> shots, string title, string summary, string history, Settings s)
         {
             // 多いときは間を飛ばして ManualAiMax 枚にする（最初と最後は入れる）
             string problem = ImageAi.Problem(s);
@@ -7408,17 +7493,457 @@ namespace WorkLog
                     using (Bitmap fit = WorkLog.Shots.Fit(b, WorkLog.Shots.ManualAiWidth)) WorkLog.Shots.SaveJpeg(fit, jpg, 80);
                     string t = x.Title;
                     foreach (string w in s.MaskWords) if (w.Length > 0) t = t.Replace(w, "＊＊");
-                    items.Add(new KeyValuePair<string, string>("画像" + int.Parse(x.No) + ": " + x.Time + " [" + x.Proc + "] " + t + (x.Text.Length > 0 ? "\n画面の文字: " + x.Text : ""), jpg));
+                    items.Add(new KeyValuePair<string, string>("画像" + int.Parse(x.No) + ": " + (x.Sec >= 0 ? ManualRec.Mmss(x.Sec) : x.Time) + " [" + x.Proc + "] " + t +
+                        (x.Action.Length > 0 ? "\n操作: " + x.Action + (x.Action.StartsWith("クリック") || x.Action.StartsWith("右クリック") ? "（赤い丸がクリックした所）" : "") : "") +
+                        (x.Text.Length > 0 ? "\n画面の文字: " + x.Text : ""), jpg));
                 }
                 string prompt =
-                    "次の画面の画像（操作した順）から、ほかの人が同じ作業をできる手順書を作ってください。題の案: " + title + "\n" +
+                    "次の画面の画像（操作した順）と操作の記録から、ほかの人が同じ作業をできる手順書を作ってください。題の案: " + title + "\n" +
+                    (summary.Trim().Length > 0 ? "\n作業した人による作業の概要（いちばん大事な手がかり。手順の流れと目的はこれに合わせる）:\n" + summary.Trim() + "\n\n" : "") +
+                    (history.Length > 0 ? "操作の記録（録画の始めからの時刻・操作・押した部品・[アプリ] ウィンドウ。文字入力は回数だけ）:\n" + history + "\n" : "") +
                     "出力は次の形だけ（ほかの文は書かない）:\n<題>手順書の題</題>\n<概要>この手順でできること（1〜3文）</概要>\n" +
                     "<手順 画像=\"番号\">見出し（短く）\n説明（何をどうするか。1〜4文。画面の項目名は「」で囲む）</手順>\n…\n" +
-                    "決まり:\n・1つの手順に画像は1枚。同じような画面・関係のない画面は省いてよい\n" +
+                    "決まり:\n・1つの手順に画像は1枚。同じような画面・関係のない画面・操作の間違いややり直しは省いてよい\n" +
+                    "・画像の赤い丸はクリックした所。操作の記録の部品の名前（「」）を使って、どこを押すか具体的に書く\n" +
                     "・人名・メールアドレス・顧客名などは書かない\n\n画像:";
                 return Parse(ClaudeCli.AskImages(prompt, items, s, DateTime.Today.ToString("yyyy-MM-dd"), "（マニュアル " + items.Count + "枚）", s.Model), title);
             }
             finally { try { Directory.Delete(tmp, true); } catch { } }
+        }
+    }
+
+    // ---- マニュアル作成の録画と操作の記録（0.29.0）----
+    // 動画: 前面のウィンドウがある画面を 2 コマ/秒で撮り、マウスの矢印とクリックの印を描いて、MJPEG の AVI に書く（同じ画面が続くコマは中身を書かない）
+    // 操作: クリック（押したところの部品の名前）・ドラッグ・スクロール・ショートカットキー・文字入力の文字数（打った文字そのものは残さない）を 操作.tsv に書く
+    // クリックしたときは、そのウィンドウを撮ってクリックした所に印を付け、手順書の画像にも使う
+    static class ManualRec
+    {
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr mod, uint thread);
+        [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr h);
+        [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr h, int code, IntPtr w, IntPtr l);
+        [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string name);
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+        [DllImport("user32.dll")] static extern bool GetCursorInfo(ref CURSORINFO ci);
+        [DllImport("user32.dll")] static extern bool GetIconInfo(IntPtr h, out ICONINFO ii);
+        [DllImport("user32.dll")] static extern bool DrawIconEx(IntPtr hdc, int x, int y, IntPtr icon, int w, int h, int step, IntPtr brush, int flags);
+        [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr h);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        delegate IntPtr HookProc(int code, IntPtr w, IntPtr l);
+        [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
+        [StructLayout(LayoutKind.Sequential)] struct CURSORINFO { public int cbSize, flags; public IntPtr hCursor; public POINT pt; }
+        [StructLayout(LayoutKind.Sequential)] struct ICONINFO { public bool fIcon; public int xHotspot, yHotspot; public IntPtr hbmMask, hbmColor; }
+        [StructLayout(LayoutKind.Sequential)] struct MSLL { public POINT pt; public uint mouseData, flags, time; public IntPtr extra; }
+        [StructLayout(LayoutKind.Sequential)] struct KBLL { public uint vk, scan, flags, time; public IntPtr extra; }
+
+        public const int Fps = 2, MaxWidth = 1280, MaxMinutes = 120;
+        public const long MaxBytes = 900L * 1024 * 1024;   // AVI（1.0）の大きさの上限より小さく
+        public const string VideoName = "操作の動画.avi", LogName = "操作.tsv";
+
+        class Ev { public DateTime At; public string Kind; public int X, Y, Vk; public bool Ctrl, Alt, Shift; }
+
+        static IntPtr mouseHook, keyHook;
+        static HookProc mouseProc, keyProc;   // 消されないように持っておく
+        static readonly Queue<Ev> events = new Queue<Ev>();
+        static readonly List<KeyValuePair<DateTime, Point>> clicks = new List<KeyValuePair<DateTime, Point>>();   // 動画に描くクリックの印
+        static Thread videoThread, workThread;
+        static volatile bool stopping;
+        static string root;
+        public static DateTime Started;
+        public static bool On { get { return root != null; } }
+
+        public static void Start(string dir)
+        {
+            if (On) return;
+            root = dir;
+            Started = DateTime.Now;
+            stopping = false;
+            lock (events) events.Clear();
+            lock (clicks) clicks.Clear();
+            File.WriteAllText(Path.Combine(root, LogName), "秒\t操作\t内容\tアプリ\tタイトル\r\n", new UTF8Encoding(true));
+            try
+            {
+                mouseProc = MouseHook;
+                keyProc = KeyHook;
+                IntPtr mod = GetModuleHandle(null);
+                mouseHook = SetWindowsHookEx(14, mouseProc, mod, 0);   // WH_MOUSE_LL
+                keyHook = SetWindowsHookEx(13, keyProc, mod, 0);       // WH_KEYBOARD_LL
+            }
+            catch (Exception ex) { Core.Error("操作の記録", ex.Message); }
+            videoThread = new Thread(VideoLoop) { IsBackground = true, Name = "録画" };
+            videoThread.Start();
+            workThread = new Thread(WorkLoop) { IsBackground = true, Name = "操作の記録" };
+            workThread.Start();
+        }
+
+        public static void Stop()
+        {
+            if (!On) return;
+            try { if (mouseHook != IntPtr.Zero) UnhookWindowsHookEx(mouseHook); if (keyHook != IntPtr.Zero) UnhookWindowsHookEx(keyHook); } catch { }
+            mouseHook = keyHook = IntPtr.Zero;
+            stopping = true;
+            if (videoThread != null) videoThread.Join(10000);
+            if (workThread != null) workThread.Join(15000);
+            root = null;
+        }
+
+        // ---- 入力のフック（すぐ返す。重い処理は WorkLoop で）----
+        static Point downAt;
+        static DateTime downTime;
+
+        static IntPtr MouseHook(int code, IntPtr w, IntPtr l)
+        {
+            try
+            {
+                if (code >= 0)
+                {
+                    int msg = w.ToInt32();
+                    var m = (MSLL)Marshal.PtrToStructure(l, typeof(MSLL));
+                    var p = new Point(m.pt.X, m.pt.Y);
+                    DateTime now = DateTime.Now;
+                    if (msg == 0x201) { downAt = p; downTime = now; }                          // 左ボタンを押した
+                    else if (msg == 0x202)                                                      // 離した: 動いていればドラッグ、でなければクリック
+                    {
+                        bool drag = Math.Abs(p.X - downAt.X) + Math.Abs(p.Y - downAt.Y) > 12;
+                        Put(new Ev { At = downTime, Kind = drag ? "drag" : "click", X = downAt.X, Y = downAt.Y, Vk = drag ? p.X * 100000 + p.Y : 0 });
+                        lock (clicks) clicks.Add(new KeyValuePair<DateTime, Point>(now, downAt));
+                    }
+                    else if (msg == 0x204) { Put(new Ev { At = now, Kind = "rclick", X = p.X, Y = p.Y }); lock (clicks) clicks.Add(new KeyValuePair<DateTime, Point>(now, p)); }
+                    else if (msg == 0x20A) Put(new Ev { At = now, Kind = "wheel", X = p.X, Y = p.Y });
+                }
+            }
+            catch { }
+            return CallNextHookEx(mouseHook, code, w, l);
+        }
+
+        static IntPtr KeyHook(int code, IntPtr w, IntPtr l)
+        {
+            try
+            {
+                int msg = w.ToInt32();
+                if (code >= 0 && (msg == 0x100 || msg == 0x104))
+                {
+                    var k = (KBLL)Marshal.PtrToStructure(l, typeof(KBLL));
+                    Put(new Ev { At = DateTime.Now, Kind = "key", Vk = (int)k.vk, Ctrl = GetAsyncKeyState(0x11) < 0, Alt = GetAsyncKeyState(0x12) < 0, Shift = GetAsyncKeyState(0x10) < 0 });
+                }
+            }
+            catch { }
+            return CallNextHookEx(keyHook, code, w, l);
+        }
+
+        static void Put(Ev e) { lock (events) { if (events.Count < 5000) events.Enqueue(e); } }
+
+        // キーの名前（ショートカットと、Enter などの決まったキーだけ。文字は残さない）。null なら文字入力として数える
+        public static string KeyName(int vk, bool ctrl, bool alt, bool shift)
+        {
+            if (vk == 0x10 || vk == 0x11 || vk == 0x12 || vk == 0xA0 || vk == 0xA1 || vk == 0xA2 || vk == 0xA3 || vk == 0xA4 || vk == 0xA5 || vk == 0x5B || vk == 0x5C) return "";   // 修飾キーだけ
+            string name;
+            if (vk >= 0x41 && vk <= 0x5A) name = ((char)vk).ToString();
+            else if (vk >= 0x30 && vk <= 0x39) name = ((char)vk).ToString();
+            else if (vk >= 0x70 && vk <= 0x7B) name = "F" + (vk - 0x6F);
+            else
+                switch (vk)
+                {
+                    case 0x0D: name = "Enter"; break;
+                    case 0x09: name = "Tab"; break;
+                    case 0x1B: name = "Esc"; break;
+                    case 0x2E: name = "Delete"; break;
+                    case 0x08: name = "BackSpace"; break;
+                    case 0x20: name = "Space"; break;
+                    case 0x25: name = "←"; break;
+                    case 0x26: name = "↑"; break;
+                    case 0x27: name = "→"; break;
+                    case 0x28: name = "↓"; break;
+                    case 0x21: name = "PageUp"; break;
+                    case 0x22: name = "PageDown"; break;
+                    case 0x24: name = "Home"; break;
+                    case 0x23: name = "End"; break;
+                    default: name = null; break;
+                }
+            if (ctrl || alt) return name == null ? "" : (ctrl ? "Ctrl+" : "") + (alt ? "Alt+" : "") + (shift ? "Shift+" : "") + name;
+            if (vk == 0x0D || vk == 0x09 || vk == 0x1B || vk == 0x2E || (vk >= 0x70 && vk <= 0x7B)) return name;
+            return null;   // 文字・矢印・BackSpace など: 文字入力として数える
+        }
+
+        // ---- 操作の記録（クリックした部品の名前を調べ、クリックしたウィンドウを撮る）----
+        static void WorkLoop()
+        {
+            string lastProc = "", lastTitle = "";
+            int typed = 0, wheel = 0;
+            DateTime typedAt = DateTime.MinValue, wheelAt = DateTime.MinValue, lastShot = DateTime.MinValue;
+            Action flush = () =>
+            {
+                if (typed > 0) { Write(typedAt, "入力", "文字入力 " + typed + " 回", lastProc, lastTitle); typed = 0; }
+                if (wheel > 0) { Write(wheelAt, "スクロール", "スクロール " + wheel + " 回", lastProc, lastTitle); wheel = 0; }
+            };
+            while (true)
+            {
+                Ev e = null;
+                lock (events) if (events.Count > 0) e = events.Dequeue();
+                if (e == null)
+                {
+                    if ((typed > 0 && DateTime.Now - typedAt > TimeSpan.FromSeconds(3)) || (wheel > 0 && DateTime.Now - wheelAt > TimeSpan.FromSeconds(3))) flush();
+                    if (stopping) { flush(); return; }
+                    Thread.Sleep(100);
+                    continue;
+                }
+                try
+                {
+                    string proc, title;
+                    IntPtr h = Window(out proc, out title);
+                    if (proc.Equals("WorkLog", StringComparison.OrdinalIgnoreCase)) continue;   // 作業ログ自身の画面（終えるときの操作など）は残さない
+                    if (proc != lastProc || title != lastTitle) { flush(); lastProc = proc; lastTitle = title; }
+                    if (e.Kind == "key")
+                    {
+                        string name = KeyName(e.Vk, e.Ctrl, e.Alt, e.Shift);
+                        if (name == null) { if (typed == 0) typedAt = e.At; typed++; }
+                        else if (name.Length > 0) { flush(); Write(e.At, "キー", name, proc, title); }
+                    }
+                    else if (e.Kind == "wheel") { if (wheel == 0) wheelAt = e.At; wheel++; }
+                    else
+                    {
+                        flush();
+                        string part = Element(e.X, e.Y);
+                        string what = e.Kind == "click" ? "クリック" : e.Kind == "rclick" ? "右クリック" : "ドラッグ";
+                        Write(e.At, what, part, proc, title);
+                        // クリックしたウィンドウを撮る（1.5秒に1枚まで）
+                        if (e.Kind != "drag" && e.At - lastShot >= TimeSpan.FromSeconds(1.5))
+                        {
+                            lastShot = e.At;
+                            Shots.ManualClickShot(h, new Point(e.X, e.Y), what + (part.Length > 0 ? " " + part : ""), proc, title, e.At);
+                        }
+                    }
+                }
+                catch (Exception ex) { Core.Error("操作の記録", ex.Message); }
+            }
+        }
+
+        static IntPtr Window(out string proc, out string title)
+        {
+            IntPtr h = GetForegroundWindow();
+            var sb = new StringBuilder(512);
+            GetWindowText(h, sb, 512);
+            title = sb.ToString().Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' ').Trim();
+            uint pid;
+            GetWindowThreadProcessId(h, out pid);
+            try { using (var p = Process.GetProcessById((int)pid)) proc = p.ProcessName; } catch { proc = ""; }
+            return h;
+        }
+
+        static void Write(DateTime at, string kind, string detail, string proc, string title)
+        {
+            string r = root;
+            if (r == null) return;
+            foreach (string w in Settings.Get().MaskWords) if (w.Length > 0) { title = title.Replace(w, "＊＊"); detail = detail.Replace(w, "＊＊"); }
+            File.AppendAllText(Path.Combine(r, LogName), string.Join("\t", ((int)(at - Started).TotalSeconds).ToString(), kind, (detail ?? "").Replace('\t', ' '), proc, title) + "\r\n", new UTF8Encoding(false));
+        }
+
+        // マウスの下の部品の名前（UI Automation を名前で呼ぶ。例:「ボタン「印刷」」）。わからなければ空
+        static Type tAE, tPoint;
+        static string Element(int x, int y)
+        {
+            try
+            {
+                if (tAE == null)
+                {
+                    tAE = Type.GetType("System.Windows.Automation.AutomationElement, UIAutomationClient, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35");
+                    tPoint = Type.GetType("System.Windows.Point, WindowsBase, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35");
+                }
+                if (tAE == null || tPoint == null) return "";
+                object el = tAE.GetMethod("FromPoint").Invoke(null, new[] { Activator.CreateInstance(tPoint, (double)x, (double)y) });
+                if (el == null) return "";
+                object cur = tAE.GetProperty("Current").GetValue(el, null);
+                string name = Convert.ToString(cur.GetType().GetProperty("Name").GetValue(cur, null)).Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' ').Trim();
+                string type = Convert.ToString(cur.GetType().GetProperty("LocalizedControlType").GetValue(cur, null)).Trim();
+                if (name.Length > 60) name = name.Substring(0, 60) + "…";
+                if (name.Length == 0) return type;
+                return (type.Length > 0 ? type : "") + "「" + name + "」";
+            }
+            catch { return ""; }
+        }
+
+        // ---- 録画 ----
+        static void VideoLoop()
+        {
+            Rectangle prim = Screen.PrimaryScreen.Bounds;
+            int w = Math.Min(MaxWidth, prim.Width) / 2 * 2;
+            int hgt = (int)Math.Round(w * prim.Height / (double)prim.Width) / 2 * 2;
+            AviWriter avi = null;
+            try
+            {
+                avi = new AviWriter(Path.Combine(root, VideoName), w, hgt, Fps);
+                var tick = Stopwatch.StartNew();
+                long frame = 0;
+                byte[] prev = null;
+                while (!stopping)
+                {
+                    long due = frame * 1000 / Fps;
+                    long wait = due - tick.ElapsedMilliseconds;
+                    if (wait > 0) { Thread.Sleep((int)Math.Min(wait, 200)); continue; }
+                    frame++;
+                    if (tick.ElapsedMilliseconds > due + 2000) { avi.Write(null); continue; }   // 遅れたコマは前のコマのまま
+                    if (avi.Bytes > MaxBytes || tick.Elapsed > TimeSpan.FromMinutes(MaxMinutes)) { avi.Write(null); continue; }
+                    using (Bitmap f = Frame(w, hgt))
+                    {
+                        if (f == null) { avi.Write(null); continue; }
+                        byte[] th = Shots.Thumb(f);
+                        bool marks;
+                        lock (clicks) { clicks.RemoveAll(c => DateTime.Now - c.Key > TimeSpan.FromSeconds(1)); marks = clicks.Count > 0; }
+                        if (!marks && Shots.Same(prev, th)) { avi.Write(null); continue; }
+                        prev = th;
+                        using (var ms = new MemoryStream())
+                        {
+                            SaveJpeg(f, ms, 60);
+                            avi.Write(ms.ToArray());
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Core.Error("録画", ex.Message); }
+            finally { if (avi != null) try { avi.Close(); } catch (Exception ex) { Core.Error("録画", ex.Message); } }
+        }
+
+        static void SaveJpeg(Bitmap b, Stream s, long q)
+        {
+            System.Drawing.Imaging.ImageCodecInfo codec = System.Drawing.Imaging.ImageCodecInfo.GetImageEncoders().First(c => c.FormatID == System.Drawing.Imaging.ImageFormat.Jpeg.Guid);
+            using (var ps = new System.Drawing.Imaging.EncoderParameters(1))
+            {
+                ps.Param[0] = new System.Drawing.Imaging.EncoderParameter(System.Drawing.Imaging.Encoder.Quality, q);
+                b.Save(s, codec, ps);
+            }
+        }
+
+        // 前面のウィンドウがある画面を撮り、矢印とクリックの印を描いて w×h に収める
+        static Bitmap Frame(int w, int h)
+        {
+            IntPtr fg = GetForegroundWindow();
+            Rectangle sc = (fg != IntPtr.Zero ? Screen.FromHandle(fg) : Screen.PrimaryScreen).Bounds;
+            using (var full = new Bitmap(sc.Width, sc.Height, System.Drawing.Imaging.PixelFormat.Format24bppRgb))
+            {
+                using (Graphics g = Graphics.FromImage(full))
+                {
+                    try { g.CopyFromScreen(sc.Location, Point.Empty, sc.Size); } catch { return null; }
+                    var ci = new CURSORINFO { cbSize = Marshal.SizeOf(typeof(CURSORINFO)) };
+                    if (GetCursorInfo(ref ci) && ci.flags == 1)
+                    {
+                        ICONINFO ii;
+                        int hx = 0, hy = 0;
+                        if (GetIconInfo(ci.hCursor, out ii))
+                        {
+                            hx = ii.xHotspot; hy = ii.yHotspot;
+                            if (ii.hbmMask != IntPtr.Zero) DeleteObject(ii.hbmMask);
+                            if (ii.hbmColor != IntPtr.Zero) DeleteObject(ii.hbmColor);
+                        }
+                        IntPtr hdc = g.GetHdc();
+                        try { DrawIconEx(hdc, ci.pt.X - sc.X - hx, ci.pt.Y - sc.Y - hy, ci.hCursor, 0, 0, 0, IntPtr.Zero, 3); }
+                        finally { g.ReleaseHdc(hdc); }
+                    }
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    lock (clicks)
+                        foreach (var c in clicks)
+                        {
+                            double age = (DateTime.Now - c.Key).TotalSeconds;
+                            int r = 14 + (int)(age * 20);
+                            using (var pen = new Pen(Color.FromArgb((int)Math.Max(60, 230 - age * 170), 230, 40, 40), 4))
+                                g.DrawEllipse(pen, c.Value.X - sc.X - r, c.Value.Y - sc.Y - r, r * 2, r * 2);
+                        }
+                }
+                var o = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+                using (Graphics g = Graphics.FromImage(o))
+                {
+                    g.Clear(Color.Black);
+                    g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                    double k = Math.Min(w / (double)sc.Width, h / (double)sc.Height);
+                    int dw = (int)(sc.Width * k), dh = (int)(sc.Height * k);
+                    g.DrawImage(full, (w - dw) / 2, (h - dh) / 2, dw, dh);
+                }
+                return o;
+            }
+        }
+
+        // 操作.tsv を AI に渡す文にする（多いときは間を省く）
+        public static string HistoryText(string dir, int maxLines)
+        {
+            string p = Path.Combine(dir, LogName);
+            if (!File.Exists(p)) return "";
+            List<string> lines = Core.ReadText(p).Split('\n').Skip(1).Select(l => l.TrimEnd('\r')).Where(l => l.Length > 0).ToList();
+            var b = new StringBuilder();
+            int step = Math.Max(1, (int)Math.Ceiling(lines.Count / (double)maxLines));
+            for (int i = 0; i < lines.Count; i += step)
+            {
+                string[] c = lines[i].Split('\t');
+                if (c.Length < 5) continue;
+                int sec;
+                int.TryParse(c[0], out sec);
+                b.Append(Mmss(sec) + " " + c[1] + (c[2].Length > 0 ? " " + c[2] : "") + " [" + c[3] + "] " + c[4] + "\n");
+            }
+            return b.ToString();
+        }
+
+        public static string Mmss(double sec) { int s = Math.Max(0, (int)sec); return (s / 60).ToString("00") + ":" + (s % 60).ToString("00"); }
+    }
+
+    // MJPEG の AVI を書く（AVI 1.0。中身のないコマは、前のコマを続けて見せる）
+    class AviWriter
+    {
+        readonly FileStream fs;
+        readonly BinaryWriter w;
+        readonly int width, height, fps;
+        readonly List<long[]> index = new List<long[]>();   // 位置（movi から）・大きさ
+        long moviPos, totalFramesPos, lengthPos, maxSize;
+        public long Bytes { get { return fs.Length; } }
+
+        public AviWriter(string path, int width, int height, int fps)
+        {
+            this.width = width; this.height = height; this.fps = fps;
+            fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+            w = new BinaryWriter(fs);
+            Fourcc("RIFF"); w.Write(0); Fourcc("AVI ");
+            Fourcc("LIST"); w.Write(4 + 8 + 56 + 8 + 4 + 8 + 56 + 8 + 40); Fourcc("hdrl");
+            Fourcc("avih"); w.Write(56);
+            w.Write(1000000 / fps); w.Write(0); w.Write(0); w.Write(0x10);   // AVIF_HASINDEX
+            totalFramesPos = fs.Position; w.Write(0);
+            w.Write(0); w.Write(1); w.Write(width * height * 3); w.Write(width); w.Write(height);
+            w.Write(0); w.Write(0); w.Write(0); w.Write(0);
+            Fourcc("LIST"); w.Write(4 + 8 + 56 + 8 + 40); Fourcc("strl");
+            Fourcc("strh"); w.Write(56);
+            Fourcc("vids"); Fourcc("MJPG"); w.Write(0); w.Write((short)0); w.Write((short)0); w.Write(0);
+            w.Write(1); w.Write(fps); w.Write(0);
+            lengthPos = fs.Position; w.Write(0);
+            w.Write(width * height * 3); w.Write(-1); w.Write(0);
+            w.Write((short)0); w.Write((short)0); w.Write((short)width); w.Write((short)height);
+            Fourcc("strf"); w.Write(40);
+            w.Write(40); w.Write(width); w.Write(height); w.Write((short)1); w.Write((short)24); Fourcc("MJPG");
+            w.Write(width * height * 3); w.Write(0); w.Write(0); w.Write(0); w.Write(0);
+            Fourcc("LIST"); w.Write(0); moviPos = fs.Position; Fourcc("movi");
+        }
+
+        void Fourcc(string s) { w.Write(Encoding.ASCII.GetBytes(s)); }
+
+        // jpeg が null なら中身のないコマ（前のコマのまま）
+        public void Write(byte[] jpeg)
+        {
+            long at = fs.Position - moviPos;
+            int n = jpeg == null ? 0 : jpeg.Length;
+            Fourcc("00dc"); w.Write(n);
+            if (n > 0) { w.Write(jpeg); if (n % 2 == 1) w.Write((byte)0); }
+            index.Add(new[] { at, n });
+            if (n > maxSize) maxSize = n;
+        }
+
+        public void Close()
+        {
+            long moviEnd = fs.Position;
+            Fourcc("idx1"); w.Write(index.Count * 16);
+            foreach (long[] e in index) { Fourcc("00dc"); w.Write(e[1] > 0 ? 0x10 : 0); w.Write((int)e[0]); w.Write((int)e[1]); }
+            long end = fs.Position;
+            fs.Position = 4; w.Write((int)(end - 8));
+            fs.Position = moviPos - 4; w.Write((int)(moviEnd - moviPos));
+            fs.Position = totalFramesPos; w.Write(index.Count);
+            fs.Position = lengthPos; w.Write(index.Count);
+            w.Flush();
+            fs.Close();
         }
     }
 
@@ -7492,14 +8017,14 @@ namespace WorkLog
                 Entry(z, "_rels/.rels", Rels(new[] { new[] { "rId1", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument", "word/document.xml" } }));
                 var body = new StringBuilder();
                 body.Append(Para(doc.Title, 40, true, "1F4E79"));
-                if (doc.Summary.Length > 0) body.Append(Para(doc.Summary, 22, false, null));
+                if (Manual.SummaryText(doc).Length > 0) body.Append(Para(Manual.SummaryText(doc), 22, false, null));
                 var rels = new List<string[]>();
                 const long maxW = 5760720, maxH = 4320000;   // 幅 16cm・高さ 12cm まで
                 int n = 0;
                 foreach (Manual.Step s in doc.Steps)
                 {
                     n++;
-                    body.Append(Para(n + ". " + s.Head, 28, true, "1F4E79"));
+                    body.Append(Para(n + ". " + Manual.HeadText(s), 28, true, "1F4E79"));
                     if (s.Body.Length > 0) body.Append(Para(s.Body, 22, false, null));
                     string rel = "rIdImg" + n, media = "image" + n + ".png";
                     EntryFile(z, "word/media/" + media, images[s.Image]);
@@ -7608,7 +8133,7 @@ namespace WorkLog
                 Entry(z, "ppt/slides/_rels/slide1.xml.rels", Rels(new[] { layoutRel }));
                 Entry(z, "ppt/slides/slide1.xml", Slide(
                     TextBox(2, "題", M, 2000000, SlideW - 2 * M, 1200000, doc.Title, 4000, true, "1F4E79") +
-                    TextBox(3, "概要", M, 3300000, SlideW - 2 * M, 1800000, doc.Summary + "\n\n手順: " + doc.Steps.Count, 2000, false, "404040")));
+                    TextBox(3, "概要", M, 3300000, SlideW - 2 * M, 1800000, Manual.SummaryText(doc) + "\n\n手順: " + doc.Steps.Count, 2000, false, "404040")));
                 int n = 0;
                 foreach (Manual.Step s in doc.Steps)
                 {
@@ -7624,7 +8149,7 @@ namespace WorkLog
                     long cx = (long)(sz.Width * k), cy = (long)(sz.Height * k);
                     long textX = M + boxW + 250000;
                     Entry(z, "ppt/slides/slide" + slide + ".xml", Slide(
-                        TextBox(2, "見出し", M, 300000, SlideW - 2 * M, 750000, n + ". " + s.Head, 2800, true, "1F4E79") +
+                        TextBox(2, "見出し", M, 300000, SlideW - 2 * M, 750000, n + ". " + Manual.HeadText(s), 2800, true, "1F4E79") +
                         Picture(3, "rId2", M, top, cx, cy) +
                         TextBox(4, "説明", textX, top, SlideW - textX - M, boxH, s.Body, 1600, false, "262626")));
                 }
@@ -8403,6 +8928,33 @@ namespace WorkLog
             eq("使用量の計測: 日ごと", string.Join(" | ", ud.Select(d => d.Date + " " + d.Calls + "回 " + d.Tokens + " " + Math.Round(d.Eq))), "2026-01-05 2回 33000 15000 | 2026-01-04 1回 6000 2000");
             eq("使用量の計測: 枠の逆算", UsageMeter.Limit(10000, 20, 30) + " " + UsageMeter.Limit(10000, 30, 30), "100000 0");
 
+            // マニュアル作成の録画（0.29.0）: AVI の部品・キーの名前（打った文字は残さない）・操作の記録の読み方・見出しの動画の時刻
+            string avi = Path.Combine(Core.Dir, "test.avi");
+            var aw = new AviWriter(avi, 64, 48, 2);
+            using (var fb = new Bitmap(64, 48))
+            using (var ms = new MemoryStream())
+            {
+                using (Graphics g = Graphics.FromImage(fb)) g.Clear(Color.SteelBlue);
+                fb.Save(ms, System.Drawing.Imaging.ImageFormat.Jpeg);
+                aw.Write(ms.ToArray());
+                aw.Write(null);
+                aw.Write(ms.ToArray());
+            }
+            aw.Close();
+            byte[] ab = File.ReadAllBytes(avi);
+            eq("録画: AVI の形", Encoding.ASCII.GetString(ab, 0, 4) + " " + Encoding.ASCII.GetString(ab, 8, 4) + " " + (BitConverter.ToInt32(ab, 4) + 8 == ab.Length) + " " + BitConverter.ToInt32(ab, 48) + " " +
+                (Encoding.ASCII.GetString(ab).IndexOf("idx1") > 0), "RIFF AVI  True 3 True");
+            eq("録画: キーの名前", string.Join(" ", new[] {
+                ManualRec.KeyName(0x53, true, false, false), ManualRec.KeyName(0x0D, false, false, false), ManualRec.KeyName(0x41, false, false, false) ?? "(文字)",
+                ManualRec.KeyName(0x11, true, false, false) == "" ? "(修飾)" : "?", ManualRec.KeyName(0x74, false, false, false), ManualRec.KeyName(0x5A, true, false, true) }),
+                "Ctrl+S Enter (文字) (修飾) F5 Ctrl+Shift+Z");
+            string mroot = Path.Combine(Core.Dir, "manual_rec");
+            Directory.CreateDirectory(mroot);
+            File.WriteAllText(Path.Combine(mroot, ManualRec.LogName), "秒\t操作\t内容\tアプリ\tタイトル\r\n5\tクリック\tボタン「印刷」\tEXCEL\t見積.xlsx - Excel\r\n75\tキー\tCtrl+S\tEXCEL\t見積.xlsx - Excel\r\n", new UTF8Encoding(true));
+            eq("録画: 操作の記録", ManualRec.HistoryText(mroot, 100).Replace("\n", " | "), "00:05 クリック ボタン「印刷」 [EXCEL] 見積.xlsx - Excel | 01:15 キー Ctrl+S [EXCEL] 見積.xlsx - Excel | ");
+            eq("録画: 見出しの動画の時刻", Manual.HeadText(new Manual.Step { Head = "印刷する", Time = "01:15" }) + " / " + Manual.SummaryText(new Manual.Doc { Summary = "見積を印刷", Video = ManualRec.VideoName }).Replace("\n", " | "),
+                "印刷する（動画 01:15） / 見積を印刷 | 動画: 操作の動画.avi（手順の時刻は動画の時刻）");
+
             // 表の列の幅（0.28.1）: 中身に合わせる列もドラッグで変えられる・変えた幅を次に開いたときも使う
             Func<int[]> showGrid = null;
             int[] firstW = null;
@@ -8640,6 +9192,21 @@ namespace WorkLog
                 }
                 catch (Exception ex) { ocr = "（使えません）" + ex.ToString(); }
                 Core.WriteText(Path.Combine(args[1], "ocr.txt"), ocr);
+                // 録画を3秒試す（できた動画は rec.avi。結果は rec.txt。使えなくても失敗にしない）
+                string recResult;
+                try
+                {
+                    string rd = Path.Combine(args[1], "rec");
+                    Directory.CreateDirectory(rd);
+                    ManualRec.Start(rd);
+                    Thread.Sleep(3000);
+                    ManualRec.Stop();
+                    string v = Path.Combine(rd, ManualRec.VideoName);
+                    recResult = File.Exists(v) ? "動画 " + new FileInfo(v).Length + " バイト" : "動画なし";
+                    if (File.Exists(v)) File.Copy(v, Path.Combine(args[1], "rec.avi"), true);
+                }
+                catch (Exception ex) { recResult = "（使えません）" + ex; }
+                Core.WriteText(Path.Combine(args[1], "rec.txt"), recResult);
                 return 0;
             }
 
